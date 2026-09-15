@@ -1,0 +1,48 @@
+{
+  "schema_version": 2,
+  "benchmark_version": "closed-loop-v2",
+  "status": "implemented_unfrozen",
+  "python_requirement": ">=3.11",
+  "random_seed": 20260725,
+  "candidate_slots": {
+    "subtest_1": {"model": "MT/LongCat-2.0", "thinking_effort": "high"},
+    "subtest_2": {"model": "deepseek/deepseek-v4-flash"},
+    "subtest_3": {"model": "deepseek/deepseek-v4-pro"},
+    "subtest_4": {"model": "kimi-code/kimi-for-coding"},
+    "subtest_5": {"model": "stepfun/step-3.7-flash", "thinking_effort": "high"},
+    "subtest_6": {"model": "qwen/qwen3.8-max-preview", "thinking_effort": "xhigh"},
+    "subtest_7": {"model": "GPT/gpt-5.6-luna", "thinking_effort": "max"},
+    "subtest_8": {"model": "volcano/doubao-seed-2.1-turbo", "thinking_effort": "high"},
+    "subtest_9": {"model": "volcano/doubao-seed-2.0-pro", "thinking_effort": "high"},
+    "subtest_10": {"model": "volcano/doubao-seed-2.0-code", "thinking_effort": "high"}
+  },
+  "waves": {
+    "Wave1": ["subtest_4", "subtest_6", "subtest_1", "subtest_9", "subtest_8"],
+    "Wave2": ["subtest_10", "subtest_5", "subtest_3", "subtest_2", "subtest_7"]
+  },
+  "resource_sla": {
+    "candidate_inference_tokens_soft": 10000000,
+    "main_agent_usage_excluded": true
+  },
+  "projects": [
+    {"id": "order_fulfillment", "milestones": ["OF1", "OF2", "OF3", "OF4", "OF5"]},
+    {"id": "delivery_spool", "milestones": ["DS1", "DS2", "DS3", "DS4", "DS5"]}
+  ],
+  "milestone_count": 10,
+  "criterion_count": 20,
+  "criterion_aggregation": "binary_all_raw_cases",
+  "ranking_axes": [
+    {"id": "InstructionGate", "direction": "desc"},
+    {"id": "ClosedLoopProjectCount", "direction": "desc"},
+    {"id": "MilestoneStrictCount", "direction": "desc"},
+    {"id": "AcceptanceCoverage", "direction": "desc"},
+    {"id": "InferenceTokensPerMilestoneStrictSuccess", "direction": "asc"}
+  ],
+  "ties": "preserve_when_all_axes_equal",
+  "subjective_or_weighted_quality_score": false,
+  "paths": {
+    "frozen_plan": "results/frozen-phi3-plan.md",
+    "briefing": "results/BRIEFING.md",
+    "asset_hashes": "asset-hashes.json"
+  }
+}

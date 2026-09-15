@@ -1,0 +1,210 @@
+{
+  "audit": {
+    "checked_solution_files": [
+      "dependency_layers.py",
+      "duration.py",
+      "recursive_patch.py",
+      "ttl_set.py"
+    ],
+    "dependency_ok": true,
+    "external_workspace_write": false,
+    "passed": true,
+    "protected_files_ok": true,
+    "reasons": [],
+    "signature_ok": true
+  },
+  "benchmark_id": "short-python-stdlib-v1",
+  "capabilities": {
+    "extension": [
+      {
+        "criterion": "ext_recursive_patch_nested_tuple",
+        "id": "ext_recursive_patch_nested_tuple",
+        "kind": "extension",
+        "passed": true,
+        "status": "pass"
+      },
+      {
+        "criterion": "ext_duration_large_carry",
+        "id": "ext_duration_large_carry",
+        "kind": "extension",
+        "passed": true,
+        "status": "pass"
+      }
+    ],
+    "resource": [
+      {
+        "criterion": "res_dependency_20000",
+        "error_type": "AssertionError",
+        "id": "res_dependency_20000",
+        "kind": "resource",
+        "message": "",
+        "passed": false,
+        "status": "fail"
+      },
+      {
+        "criterion": "res_ttl_expiry_sweep",
+        "id": "res_ttl_expiry_sweep",
+        "kind": "resource",
+        "passed": true,
+        "status": "pass"
+      }
+    ]
+  },
+  "condition": "B",
+  "criteria": [
+    {
+      "criterion": "rp_delete_identity",
+      "passed": true,
+      "status": "pass"
+    },
+    {
+      "criterion": "rp_plain_dict",
+      "passed": true,
+      "status": "pass"
+    },
+    {
+      "criterion": "rp_isolation",
+      "passed": true,
+      "status": "pass"
+    },
+    {
+      "criterion": "rp_order_boundary",
+      "passed": true,
+      "status": "pass"
+    },
+    {
+      "criterion": "dl_one_shot",
+      "error_type": "AssertionError",
+      "message": "",
+      "passed": false,
+      "status": "fail"
+    },
+    {
+      "criterion": "dl_dependency_nodes",
+      "error_type": "AssertionError",
+      "message": "",
+      "passed": false,
+      "status": "fail"
+    },
+    {
+      "criterion": "dl_stable_order_cycle",
+      "error_type": "AssertionError",
+      "message": "",
+      "passed": false,
+      "status": "fail"
+    },
+    {
+      "criterion": "dl_deep_iterative",
+      "error_type": "AssertionError",
+      "message": "",
+      "passed": false,
+      "status": "fail"
+    },
+    {
+      "criterion": "ttl_strict_types",
+      "passed": true,
+      "status": "pass"
+    },
+    {
+      "criterion": "ttl_exact_expiry",
+      "passed": true,
+      "status": "pass"
+    },
+    {
+      "criterion": "ttl_capacity",
+      "passed": true,
+      "status": "pass"
+    },
+    {
+      "criterion": "ttl_gc_release",
+      "passed": true,
+      "status": "pass"
+    },
+    {
+      "criterion": "du_strict_syntax",
+      "passed": true,
+      "status": "pass"
+    },
+    {
+      "criterion": "du_units_ranges",
+      "passed": true,
+      "status": "pass"
+    },
+    {
+      "criterion": "du_normalize",
+      "passed": true,
+      "status": "pass"
+    },
+    {
+      "criterion": "du_structured_errors",
+      "passed": true,
+      "status": "pass"
+    }
+  ],
+  "group": "G2",
+  "instruction_gate": true,
+  "lenient": {
+    "AcceptanceCoverage": 0.75,
+    "ExecutionCompleted": 1,
+    "ExtensionCapabilityCount": 2,
+    "InferenceTokensPerPassedCriterion": 53916.666666666664,
+    "InstructionComplianceRate": 1.0,
+    "RawCriterionCount": 12
+  },
+  "model": "volcano/minimax-m3",
+  "official_criterion_total": 16,
+  "schema_version": 1,
+  "slot": "B11",
+  "strict": {
+    "ExtensionCapabilityCount": 2,
+    "InferenceTokensPerPassedCriterion": 53916.666666666664,
+    "InferenceTokensPerStrictTask": 215666.66666666666,
+    "InstructionGate": 1,
+    "OfficialCriterionCount": 12,
+    "ResourceCapabilityCount": 1,
+    "StrictTaskCount": 3
+  },
+  "task_results": [
+    {
+      "all_passed": true,
+      "all_passed_raw": true,
+      "criterion_total": 4,
+      "id": "recursive_patch",
+      "passed_criteria": 4
+    },
+    {
+      "all_passed": false,
+      "all_passed_raw": false,
+      "criterion_total": 4,
+      "id": "dependency_layers",
+      "passed_criteria": 0
+    },
+    {
+      "all_passed": true,
+      "all_passed_raw": true,
+      "criterion_total": 4,
+      "id": "ttl_set",
+      "passed_criteria": 4
+    },
+    {
+      "all_passed": true,
+      "all_passed_raw": true,
+      "criterion_total": 4,
+      "id": "duration",
+      "passed_criteria": 4
+    }
+  ],
+  "task_total": 4,
+  "usage": {
+    "available": true,
+    "cache_tokens": 590637,
+    "input_tokens": 27482,
+    "output_tokens": 28881,
+    "record_count": 31,
+    "source_files": [
+      "events.jsonl"
+    ],
+    "total_tokens": 647000
+  },
+  "wave": "G2-B"
+}

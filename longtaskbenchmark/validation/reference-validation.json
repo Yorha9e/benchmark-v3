@@ -1,0 +1,464 @@
+{
+  "criteria": {
+    "passed": 20,
+    "total": 20
+  },
+  "mutants": [
+    {
+      "criterion": "OF4-C2",
+      "detected": true,
+      "diagnostic": "Ran 1 test; FAILED (failures=1)",
+      "id": "order_inventory_oversell",
+      "status": "detected"
+    },
+    {
+      "criterion": "OF2-C2",
+      "detected": true,
+      "diagnostic": "Ran 1 test; FAILED (failures=3)",
+      "id": "order_create_idempotency_ignored",
+      "status": "detected"
+    },
+    {
+      "criterion": "OF3-C2",
+      "detected": true,
+      "diagnostic": "Ran 1 test; FAILED (failures=1)",
+      "id": "order_wrong_state_error",
+      "status": "detected"
+    },
+    {
+      "criterion": "OF5-C1",
+      "detected": true,
+      "diagnostic": "Ran 1 test; FAILED (failures=1)",
+      "id": "order_cli_bad_stock_result",
+      "status": "detected"
+    },
+    {
+      "criterion": "DS1-C2",
+      "detected": true,
+      "diagnostic": "Ran 1 test; FAILED (failures=1)",
+      "id": "spool_duplicate_overwrite",
+      "status": "detected"
+    },
+    {
+      "criterion": "DS3-C1",
+      "detected": true,
+      "diagnostic": "Ran 1 test; FAILED (failures=3, errors=1)",
+      "id": "spool_token_ignored",
+      "status": "detected"
+    },
+    {
+      "criterion": "DS3-C2",
+      "detected": true,
+      "diagnostic": "Ran 1 test; FAILED (failures=1)",
+      "id": "spool_backoff_ignored",
+      "status": "detected"
+    },
+    {
+      "criterion": "DS4-C1",
+      "detected": true,
+      "diagnostic": "Ran 1 test; FAILED (failures=1)",
+      "id": "spool_recover_ignored",
+      "status": "detected"
+    },
+    {
+      "criterion": "DS5-C1",
+      "detected": true,
+      "diagnostic": "Ran 1 test; FAILED (failures=6)",
+      "id": "spool_non_atomic_state_write",
+      "status": "detected"
+    },
+    {
+      "criterion": "DS1-C1",
+      "detected": true,
+      "diagnostic": "Ran 1 test; FAILED (failures=2)",
+      "id": "spool_corruption_reset",
+      "status": "detected"
+    },
+    {
+      "criterion": "DS2-C2",
+      "detected": true,
+      "diagnostic": "concurrency oracle: ready=6/6, winners=6, asserted_winners=6, message_ids=['only-message'], attempts=[1, 1, 1, 1, 1, 1]; multiple winners with lost attempt updates",
+      "id": "spool_no_lock_double_claim",
+      "status": "detected"
+    }
+  ],
+  "normalized_consistent": true,
+  "overall_passed": true,
+  "reference_runs": [
+    {
+      "criteria": [
+        {
+          "criterion": "OF1-C1",
+          "executed": true,
+          "passed": true,
+          "returncode": 0,
+          "status": "passed",
+          "target": "closed_loop_v2.evaluator.test_order_fulfillment.OrderPersistenceTests.test_schema_initialize_and_reopen",
+          "tests_run": 1
+        },
+        {
+          "criterion": "OF1-C2",
+          "executed": true,
+          "passed": true,
+          "returncode": 0,
+          "status": "passed",
+          "target": "closed_loop_v2.evaluator.test_order_fulfillment.OrderPersistenceTests.test_input_and_dependency_validation",
+          "tests_run": 1
+        },
+        {
+          "criterion": "OF2-C1",
+          "executed": true,
+          "passed": true,
+          "returncode": 0,
+          "status": "passed",
+          "target": "closed_loop_v2.evaluator.test_order_fulfillment.OrderCreationTests.test_multi_sku_reservation_is_atomic",
+          "tests_run": 1
+        },
+        {
+          "criterion": "OF2-C2",
+          "executed": true,
+          "passed": true,
+          "returncode": 0,
+          "status": "passed",
+          "target": "closed_loop_v2.evaluator.test_order_fulfillment.OrderCreationTests.test_create_idempotency_and_conflict",
+          "tests_run": 1
+        },
+        {
+          "criterion": "OF3-C1",
+          "executed": true,
+          "passed": true,
+          "returncode": 0,
+          "status": "passed",
+          "target": "closed_loop_v2.evaluator.test_order_fulfillment.OrderPaymentTests.test_payment_idempotency_conflicts_and_amount",
+          "tests_run": 1
+        },
+        {
+          "criterion": "OF3-C2",
+          "executed": true,
+          "passed": true,
+          "returncode": 0,
+          "status": "passed",
+          "target": "closed_loop_v2.evaluator.test_order_fulfillment.OrderPaymentTests.test_explicit_state_machine",
+          "tests_run": 1
+        },
+        {
+          "criterion": "OF4-C1",
+          "executed": true,
+          "passed": true,
+          "returncode": 0,
+          "status": "passed",
+          "target": "closed_loop_v2.evaluator.test_order_fulfillment.OrderInventoryTests.test_cancel_releases_once_and_shipped_cannot_cancel",
+          "tests_run": 1
+        },
+        {
+          "criterion": "OF4-C2",
+          "executed": true,
+          "passed": true,
+          "returncode": 0,
+          "status": "passed",
+          "target": "closed_loop_v2.evaluator.test_order_fulfillment.OrderInventoryTests.test_two_instances_cannot_oversell",
+          "tests_run": 1
+        },
+        {
+          "criterion": "OF5-C1",
+          "executed": true,
+          "passed": true,
+          "returncode": 0,
+          "status": "passed",
+          "target": "closed_loop_v2.evaluator.test_order_cli.OrderCliTests.test_all_commands_emit_one_json_line",
+          "tests_run": 1
+        },
+        {
+          "criterion": "OF5-C2",
+          "executed": true,
+          "passed": true,
+          "returncode": 0,
+          "status": "passed",
+          "target": "closed_loop_v2.evaluator.test_order_cli.OrderCliTests.test_error_codes_exit_codes_and_persistence",
+          "tests_run": 1
+        },
+        {
+          "criterion": "DS1-C1",
+          "executed": true,
+          "passed": true,
+          "returncode": 0,
+          "status": "passed",
+          "target": "closed_loop_v2.evaluator.test_delivery_spool.SpoolPersistenceTests.test_initialize_reopen_and_fail_closed",
+          "tests_run": 1
+        },
+        {
+          "criterion": "DS1-C2",
+          "executed": true,
+          "passed": true,
+          "returncode": 0,
+          "status": "passed",
+          "target": "closed_loop_v2.evaluator.test_delivery_spool.SpoolPersistenceTests.test_canonical_payload_idempotency_and_limits",
+          "tests_run": 1
+        },
+        {
+          "criterion": "DS2-C1",
+          "executed": true,
+          "passed": true,
+          "returncode": 0,
+          "status": "passed",
+          "target": "closed_loop_v2.evaluator.test_delivery_spool.SpoolClaimTests.test_claim_order_attempt_and_token_privacy",
+          "tests_run": 1
+        },
+        {
+          "criterion": "DS2-C2",
+          "executed": true,
+          "passed": true,
+          "returncode": 0,
+          "status": "passed",
+          "target": "closed_loop_v2.evaluator.test_delivery_spool.SpoolClaimTests.test_concurrent_claim_has_single_winner",
+          "tests_run": 1
+        },
+        {
+          "criterion": "DS3-C1",
+          "executed": true,
+          "passed": true,
+          "returncode": 0,
+          "status": "passed",
+          "target": "closed_loop_v2.evaluator.test_delivery_spool.SpoolOutcomeTests.test_ack_and_fail_require_exact_token",
+          "tests_run": 1
+        },
+        {
+          "criterion": "DS3-C2",
+          "executed": true,
+          "passed": true,
+          "returncode": 0,
+          "status": "passed",
+          "target": "closed_loop_v2.evaluator.test_delivery_spool.SpoolOutcomeTests.test_retry_delay_and_dead_transition",
+          "tests_run": 1
+        },
+        {
+          "criterion": "DS4-C1",
+          "executed": true,
+          "passed": true,
+          "returncode": 0,
+          "status": "passed",
+          "target": "closed_loop_v2.evaluator.test_delivery_spool.SpoolRecoveryTests.test_recover_boundary_and_idempotency",
+          "tests_run": 1
+        },
+        {
+          "criterion": "DS4-C2",
+          "executed": true,
+          "passed": true,
+          "returncode": 0,
+          "status": "passed",
+          "target": "closed_loop_v2.evaluator.test_delivery_spool.SpoolRecoveryTests.test_reopen_get_and_sorted_list",
+          "tests_run": 1
+        },
+        {
+          "criterion": "DS5-C1",
+          "executed": true,
+          "passed": true,
+          "returncode": 0,
+          "status": "passed",
+          "target": "closed_loop_v2.evaluator.test_spool_atomicity.SpoolAtomicityTests.test_failpoints_cleanup_and_old_or_new_state",
+          "tests_run": 1
+        },
+        {
+          "criterion": "DS5-C2",
+          "executed": true,
+          "passed": true,
+          "returncode": 0,
+          "status": "passed",
+          "target": "closed_loop_v2.evaluator.test_spool_cli.SpoolCliTests.test_cli_protocol_and_root_boundary",
+          "tests_run": 1
+        }
+      ],
+      "passed": 20,
+      "run": 1,
+      "total": 20
+    },
+    {
+      "criteria": [
+        {
+          "criterion": "OF1-C1",
+          "executed": true,
+          "passed": true,
+          "returncode": 0,
+          "status": "passed",
+          "target": "closed_loop_v2.evaluator.test_order_fulfillment.OrderPersistenceTests.test_schema_initialize_and_reopen",
+          "tests_run": 1
+        },
+        {
+          "criterion": "OF1-C2",
+          "executed": true,
+          "passed": true,
+          "returncode": 0,
+          "status": "passed",
+          "target": "closed_loop_v2.evaluator.test_order_fulfillment.OrderPersistenceTests.test_input_and_dependency_validation",
+          "tests_run": 1
+        },
+        {
+          "criterion": "OF2-C1",
+          "executed": true,
+          "passed": true,
+          "returncode": 0,
+          "status": "passed",
+          "target": "closed_loop_v2.evaluator.test_order_fulfillment.OrderCreationTests.test_multi_sku_reservation_is_atomic",
+          "tests_run": 1
+        },
+        {
+          "criterion": "OF2-C2",
+          "executed": true,
+          "passed": true,
+          "returncode": 0,
+          "status": "passed",
+          "target": "closed_loop_v2.evaluator.test_order_fulfillment.OrderCreationTests.test_create_idempotency_and_conflict",
+          "tests_run": 1
+        },
+        {
+          "criterion": "OF3-C1",
+          "executed": true,
+          "passed": true,
+          "returncode": 0,
+          "status": "passed",
+          "target": "closed_loop_v2.evaluator.test_order_fulfillment.OrderPaymentTests.test_payment_idempotency_conflicts_and_amount",
+          "tests_run": 1
+        },
+        {
+          "criterion": "OF3-C2",
+          "executed": true,
+          "passed": true,
+          "returncode": 0,
+          "status": "passed",
+          "target": "closed_loop_v2.evaluator.test_order_fulfillment.OrderPaymentTests.test_explicit_state_machine",
+          "tests_run": 1
+        },
+        {
+          "criterion": "OF4-C1",
+          "executed": true,
+          "passed": true,
+          "returncode": 0,
+          "status": "passed",
+          "target": "closed_loop_v2.evaluator.test_order_fulfillment.OrderInventoryTests.test_cancel_releases_once_and_shipped_cannot_cancel",
+          "tests_run": 1
+        },
+        {
+          "criterion": "OF4-C2",
+          "executed": true,
+          "passed": true,
+          "returncode": 0,
+          "status": "passed",
+          "target": "closed_loop_v2.evaluator.test_order_fulfillment.OrderInventoryTests.test_two_instances_cannot_oversell",
+          "tests_run": 1
+        },
+        {
+          "criterion": "OF5-C1",
+          "executed": true,
+          "passed": true,
+          "returncode": 0,
+          "status": "passed",
+          "target": "closed_loop_v2.evaluator.test_order_cli.OrderCliTests.test_all_commands_emit_one_json_line",
+          "tests_run": 1
+        },
+        {
+          "criterion": "OF5-C2",
+          "executed": true,
+          "passed": true,
+          "returncode": 0,
+          "status": "passed",
+          "target": "closed_loop_v2.evaluator.test_order_cli.OrderCliTests.test_error_codes_exit_codes_and_persistence",
+          "tests_run": 1
+        },
+        {
+          "criterion": "DS1-C1",
+          "executed": true,
+          "passed": true,
+          "returncode": 0,
+          "status": "passed",
+          "target": "closed_loop_v2.evaluator.test_delivery_spool.SpoolPersistenceTests.test_initialize_reopen_and_fail_closed",
+          "tests_run": 1
+        },
+        {
+          "criterion": "DS1-C2",
+          "executed": true,
+          "passed": true,
+          "returncode": 0,
+          "status": "passed",
+          "target": "closed_loop_v2.evaluator.test_delivery_spool.SpoolPersistenceTests.test_canonical_payload_idempotency_and_limits",
+          "tests_run": 1
+        },
+        {
+          "criterion": "DS2-C1",
+          "executed": true,
+          "passed": true,
+          "returncode": 0,
+          "status": "passed",
+          "target": "closed_loop_v2.evaluator.test_delivery_spool.SpoolClaimTests.test_claim_order_attempt_and_token_privacy",
+          "tests_run": 1
+        },
+        {
+          "criterion": "DS2-C2",
+          "executed": true,
+          "passed": true,
+          "returncode": 0,
+          "status": "passed",
+          "target": "closed_loop_v2.evaluator.test_delivery_spool.SpoolClaimTests.test_concurrent_claim_has_single_winner",
+          "tests_run": 1
+        },
+        {
+          "criterion": "DS3-C1",
+          "executed": true,
+          "passed": true,
+          "returncode": 0,
+          "status": "passed",
+          "target": "closed_loop_v2.evaluator.test_delivery_spool.SpoolOutcomeTests.test_ack_and_fail_require_exact_token",
+          "tests_run": 1
+        },
+        {
+          "criterion": "DS3-C2",
+          "executed": true,
+          "passed": true,
+          "returncode": 0,
+          "status": "passed",
+          "target": "closed_loop_v2.evaluator.test_delivery_spool.SpoolOutcomeTests.test_retry_delay_and_dead_transition",
+          "tests_run": 1
+        },
+        {
+          "criterion": "DS4-C1",
+          "executed": true,
+          "passed": true,
+          "returncode": 0,
+          "status": "passed",
+          "target": "closed_loop_v2.evaluator.test_delivery_spool.SpoolRecoveryTests.test_recover_boundary_and_idempotency",
+          "tests_run": 1
+        },
+        {
+          "criterion": "DS4-C2",
+          "executed": true,
+          "passed": true,
+          "returncode": 0,
+          "status": "passed",
+          "target": "closed_loop_v2.evaluator.test_delivery_spool.SpoolRecoveryTests.test_reopen_get_and_sorted_list",
+          "tests_run": 1
+        },
+        {
+          "criterion": "DS5-C1",
+          "executed": true,
+          "passed": true,
+          "returncode": 0,
+          "status": "passed",
+          "target": "closed_loop_v2.evaluator.test_spool_atomicity.SpoolAtomicityTests.test_failpoints_cleanup_and_old_or_new_state",
+          "tests_run": 1
+        },
+        {
+          "criterion": "DS5-C2",
+          "executed": true,
+          "passed": true,
+          "returncode": 0,
+          "status": "passed",
+          "target": "closed_loop_v2.evaluator.test_spool_cli.SpoolCliTests.test_cli_protocol_and_root_boundary",
+          "tests_run": 1
+        }
+      ],
+      "passed": 20,
+      "run": 2,
+      "total": 20
+    }
+  ],
+  "reference_score": "20/20"
+}

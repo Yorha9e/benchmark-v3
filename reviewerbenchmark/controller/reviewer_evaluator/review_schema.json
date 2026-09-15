@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "reviewer_evaluator/review_schema.json",
+  "title": "Independent B11 tie-break review",
+  "description": "Advisory human or LLM evidence for an unresolved deterministic tie. This record cannot modify deterministic ranking scores.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "candidate_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "boundary_correctness": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 2
+    },
+    "complexity_resource": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 2
+    },
+    "graph_semantics": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 2
+    },
+    "evidence": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "file": {"type": "string", "minLength": 1},
+          "line_start": {"type": "integer", "minimum": 1},
+          "line_end": {"type": "integer", "minimum": 1},
+          "reason": {"type": "string", "minLength": 1}
+        },
+        "required": ["file", "line_start", "line_end", "reason"]
+      }
+    },
+    "confidence": {
+      "type": "string",
+      "enum": ["high", "medium", "low"]
+    }
+  },
+  "required": [
+    "candidate_id",
+    "boundary_correctness",
+    "complexity_resource",
+    "graph_semantics",
+    "evidence",
+    "confidence"
+  ]
+}

@@ -1,0 +1,58 @@
+{
+  "schema_version": 2,
+  "criterion_count": 20,
+  "milestone_count": 10,
+  "aggregation": "a criterion passes only when its entire named unittest passes",
+  "projects": [
+    {
+      "id": "order_fulfillment",
+      "milestones": [
+        {"id": "OF1", "capability_id": "order.persistence_contract", "criteria": [
+          {"id": "OF1-C1", "capability_id": "order.schema_reopen", "unittest": "closed_loop_v2.evaluator.test_order_fulfillment.OrderPersistenceTests.test_schema_initialize_and_reopen"},
+          {"id": "OF1-C2", "capability_id": "order.validation", "unittest": "closed_loop_v2.evaluator.test_order_fulfillment.OrderPersistenceTests.test_input_and_dependency_validation"}
+        ]},
+        {"id": "OF2", "capability_id": "order.atomic_create", "criteria": [
+          {"id": "OF2-C1", "capability_id": "order.multi_sku_atomic_reservation", "unittest": "closed_loop_v2.evaluator.test_order_fulfillment.OrderCreationTests.test_multi_sku_reservation_is_atomic"},
+          {"id": "OF2-C2", "capability_id": "order.create_idempotency", "unittest": "closed_loop_v2.evaluator.test_order_fulfillment.OrderCreationTests.test_create_idempotency_and_conflict"}
+        ]},
+        {"id": "OF3", "capability_id": "order.payment_state", "criteria": [
+          {"id": "OF3-C1", "capability_id": "order.payment_idempotency", "unittest": "closed_loop_v2.evaluator.test_order_fulfillment.OrderPaymentTests.test_payment_idempotency_conflicts_and_amount"},
+          {"id": "OF3-C2", "capability_id": "order.state_machine", "unittest": "closed_loop_v2.evaluator.test_order_fulfillment.OrderPaymentTests.test_explicit_state_machine"}
+        ]},
+        {"id": "OF4", "capability_id": "order.inventory_concurrency", "criteria": [
+          {"id": "OF4-C1", "capability_id": "order.cancel_release", "unittest": "closed_loop_v2.evaluator.test_order_fulfillment.OrderInventoryTests.test_cancel_releases_once_and_shipped_cannot_cancel"},
+          {"id": "OF4-C2", "capability_id": "order.no_oversell", "unittest": "closed_loop_v2.evaluator.test_order_fulfillment.OrderInventoryTests.test_two_instances_cannot_oversell"}
+        ]},
+        {"id": "OF5", "capability_id": "order.cli", "criteria": [
+          {"id": "OF5-C1", "capability_id": "order.cli_happy_path", "unittest": "closed_loop_v2.evaluator.test_order_cli.OrderCliTests.test_all_commands_emit_one_json_line"},
+          {"id": "OF5-C2", "capability_id": "order.cli_errors", "unittest": "closed_loop_v2.evaluator.test_order_cli.OrderCliTests.test_error_codes_exit_codes_and_persistence"}
+        ]}
+      ]
+    },
+    {
+      "id": "delivery_spool",
+      "milestones": [
+        {"id": "DS1", "capability_id": "spool.durable_schema", "criteria": [
+          {"id": "DS1-C1", "capability_id": "spool.initialize_corruption", "unittest": "closed_loop_v2.evaluator.test_delivery_spool.SpoolPersistenceTests.test_initialize_reopen_and_fail_closed"},
+          {"id": "DS1-C2", "capability_id": "spool.canonical_idempotency", "unittest": "closed_loop_v2.evaluator.test_delivery_spool.SpoolPersistenceTests.test_canonical_payload_idempotency_and_limits"}
+        ]},
+        {"id": "DS2", "capability_id": "spool.claim", "criteria": [
+          {"id": "DS2-C1", "capability_id": "spool.claim_order_token_privacy", "unittest": "closed_loop_v2.evaluator.test_delivery_spool.SpoolClaimTests.test_claim_order_attempt_and_token_privacy"},
+          {"id": "DS2-C2", "capability_id": "spool.no_double_claim", "unittest": "closed_loop_v2.evaluator.test_delivery_spool.SpoolClaimTests.test_concurrent_claim_has_single_winner"}
+        ]},
+        {"id": "DS3", "capability_id": "spool.delivery_outcomes", "criteria": [
+          {"id": "DS3-C1", "capability_id": "spool.token_authorization", "unittest": "closed_loop_v2.evaluator.test_delivery_spool.SpoolOutcomeTests.test_ack_and_fail_require_exact_token"},
+          {"id": "DS3-C2", "capability_id": "spool.retry_dead", "unittest": "closed_loop_v2.evaluator.test_delivery_spool.SpoolOutcomeTests.test_retry_delay_and_dead_transition"}
+        ]},
+        {"id": "DS4", "capability_id": "spool.recovery_reads", "criteria": [
+          {"id": "DS4-C1", "capability_id": "spool.recover_boundary", "unittest": "closed_loop_v2.evaluator.test_delivery_spool.SpoolRecoveryTests.test_recover_boundary_and_idempotency"},
+          {"id": "DS4-C2", "capability_id": "spool.reopen_get_list", "unittest": "closed_loop_v2.evaluator.test_delivery_spool.SpoolRecoveryTests.test_reopen_get_and_sorted_list"}
+        ]},
+        {"id": "DS5", "capability_id": "spool.atomic_cli", "criteria": [
+          {"id": "DS5-C1", "capability_id": "spool.atomic_replace_failpoints", "unittest": "closed_loop_v2.evaluator.test_spool_atomicity.SpoolAtomicityTests.test_failpoints_cleanup_and_old_or_new_state"},
+          {"id": "DS5-C2", "capability_id": "spool.cli_root_boundary", "unittest": "closed_loop_v2.evaluator.test_spool_cli.SpoolCliTests.test_cli_protocol_and_root_boundary"}
+        ]}
+      ]
+    }
+  ]
+}

@@ -1,0 +1,209 @@
+{
+  "schema_version": 1,
+  "benchmark_id": "reviewer-b11-debug-v1-package",
+  "purpose": "Reusable static package for single-model B11 dependency_layers debugging and reviewer evaluation.",
+  "public_root": "public-template/",
+  "controller_root": "controller/",
+  "public_assets": [
+    "public-template/TASKS.md",
+    "public-template/DEBUG-TASK.md",
+    "public-template/public_smoke_tests.py",
+    "public-template/solutions/"
+  ],
+  "hidden_controller_assets": [
+    "controller/scoring/",
+    "controller/reviewer_evaluator/",
+    "controller/short/"
+  ],
+  "scoring_dimensions": [
+    "instruction_gate",
+    "official_criteria_16",
+    "resource_capabilities_2",
+    "extension_capabilities_2",
+    "supplemental_checks_8",
+    "strict_and_lenient_rankings"
+  ],
+  "execution": {
+    "fresh_workspace_per_model": true,
+    "results_outside_package": true,
+    "token_usage": "record_unavailable_if_not_exposed"
+  },
+  "excluded_assets": [
+    "historical results",
+    "leaderboards",
+    "reviews",
+    "score summaries",
+    "timing events",
+    "provider failure logs",
+    "__pycache__/",
+    "*.pyc",
+    ".pytest_cache/"
+  ],
+  "files": [
+    {
+      "path": "controller/reviewer_evaluator/__init__.py",
+      "bytes": 193,
+      "sha256": "ed44a7b6d5d3d54c82b4d12d1bf76b5a187df35afcde1473d21daf5aba677b56"
+    },
+    {
+      "path": "controller/reviewer_evaluator/checks.py",
+      "bytes": 9020,
+      "sha256": "965a18ab9745207858de085e02f64d191edc299eb374974c7fd15ed834b9c8cc"
+    },
+    {
+      "path": "controller/reviewer_evaluator/rank.py",
+      "bytes": 10036,
+      "sha256": "984d4874ce00d0773280b86cbe04621a0eefd31f394873ef4d678e203ff6deba"
+    },
+    {
+      "path": "controller/reviewer_evaluator/review_schema.json",
+      "bytes": 1478,
+      "sha256": "5f6954cd5d762ed52bd27e96ada903440bc2a053d45da868b3aaca6cdc9402df"
+    },
+    {
+      "path": "controller/reviewer_evaluator/runner.py",
+      "bytes": 15337,
+      "sha256": "ca06dae740ccfd3405730deac8d0511053c5de58be2ab3143c2e4eb913472c2f"
+    },
+    {
+      "path": "controller/reviewer_evaluator/validate.py",
+      "bytes": 16833,
+      "sha256": "a2932e0c69bb8931d777589c44c4bdfc017efb60fdf9f373d415b68d35e9c7a8"
+    },
+    {
+      "path": "controller/scoring/SCORING.md",
+      "bytes": 3422,
+      "sha256": "37f455c69f49854f3a6b117d6fd0a8e2563584e82d97d64233ac23188af57497"
+    },
+    {
+      "path": "controller/short/evaluator/checks.py",
+      "bytes": 8641,
+      "sha256": "fde5dbfeff85f70285de5aade3ff62f22658e8d9356042d01e2504ce52d37d63"
+    },
+    {
+      "path": "controller/short/evaluator/criterion_runner.py",
+      "bytes": 1824,
+      "sha256": "085828ada6e9dd8ac33ab646db506c256e92223a18416687492696a474de14aa"
+    },
+    {
+      "path": "controller/short/evaluator/instruction_audit.py",
+      "bytes": 8647,
+      "sha256": "8248a622ed60466ab4d43554acc361c1be3928fec5178f8e4c4c4bd21b711471"
+    },
+    {
+      "path": "controller/short/harness/common.py",
+      "bytes": 10476,
+      "sha256": "79588ea6767d29189e6b453e2737d2d9b59a10373b0183b665547084155f62c3"
+    },
+    {
+      "path": "controller/short/harness/evaluate.py",
+      "bytes": 10087,
+      "sha256": "db9a68d00f3cf68ffafdc157ee9a1213d7ecb08abfa2703bfd6712c8d6e0b62a"
+    },
+    {
+      "path": "controller/short/manifest.json",
+      "bytes": 6264,
+      "sha256": "dd7a8f450acad88c607eaa4e9aaaf12d9c10b49c6f5212e35462f5971e37f83a"
+    },
+    {
+      "path": "controller/short/validation/reference/instruction_ack.json",
+      "bytes": 142,
+      "sha256": "4745ddd38774a4a9a74b9885e77b1db0b2b495b63585f174e3838b7a39a086a8"
+    },
+    {
+      "path": "controller/short/validation/reference/solutions/dependency_layers.py",
+      "bytes": 1863,
+      "sha256": "d102718ba947c24401b990e8b78120ba06bd5bcc5de9dd4790fc0c1f90758f06"
+    },
+    {
+      "path": "controller/short/validation/reference/solutions/duration.py",
+      "bytes": 2386,
+      "sha256": "09030ba5944219dd481ea00eb9eb90ce9d6b6fdcf7dfa3fd16e18244efe5d693"
+    },
+    {
+      "path": "controller/short/validation/reference/solutions/recursive_patch.py",
+      "bytes": 926,
+      "sha256": "fa2a7a43a63d7a552729656532e414eaf53ba25b2d6daed12c3c960f45597616"
+    },
+    {
+      "path": "controller/short/validation/reference/solutions/ttl_set.py",
+      "bytes": 1892,
+      "sha256": "c12377715a26fadbc563a7f45347675eb3fc1c9492927d9ff8efd7bce80f5eb5"
+    },
+    {
+      "path": "controller/short/validation/reference/usage.json",
+      "bytes": 72,
+      "sha256": "314d3ea846bd2e237648908647f60afec22b6f12140ccb3a7a687c1fde910196"
+    },
+    {
+      "path": "protocol/B11-bug-report.json",
+      "bytes": 4648,
+      "sha256": "9a89adbf14edd0cde0ddd49428b684c19f6ea76a0b183bba84309792982ffc61"
+    },
+    {
+      "path": "protocol/DEBUG-TASK.md",
+      "bytes": 2114,
+      "sha256": "f252958f7ecd90d9d54bbe58dd3ecc44b9d7ec43d1354feaa8027bc2aebe2c57"
+    },
+    {
+      "path": "protocol/frozen-phi3-plan.md",
+      "bytes": 11606,
+      "sha256": "082b20ebb2f974cfb6b4b5e673d55bdb5cda9fae3bd48d49a4c45fc8f0a8fbe9"
+    },
+    {
+      "path": "protocol/public_smoke_tests.py",
+      "bytes": 1067,
+      "sha256": "8a56ae200f50993de8f1f7f302ee8258dab37758b1cf39089ca6cef39e73fc65"
+    },
+    {
+      "path": "protocol/supplemental_debug_checks.py",
+      "bytes": 5285,
+      "sha256": "918f30b5e459861184d9a5dd9c0da6fd5fefbf9098360d472dc6c5374438a431"
+    },
+    {
+      "path": "protocol/TASKS.md",
+      "bytes": 3394,
+      "sha256": "2281b5578e0dc5f8cb1e19eeaab53e91d3b4ca745027abcdd8f6d8af2f34ff3c"
+    },
+    {
+      "path": "public-template/DEBUG-TASK.md",
+      "bytes": 2114,
+      "sha256": "f252958f7ecd90d9d54bbe58dd3ecc44b9d7ec43d1354feaa8027bc2aebe2c57"
+    },
+    {
+      "path": "public-template/public_smoke_tests.py",
+      "bytes": 1067,
+      "sha256": "8a56ae200f50993de8f1f7f302ee8258dab37758b1cf39089ca6cef39e73fc65"
+    },
+    {
+      "path": "public-template/solutions/dependency_layers.py",
+      "bytes": 4300,
+      "sha256": "b2fd2e1bad815f358df1d994544d6c775c66765e8f33610fc1e7cb3052a67874"
+    },
+    {
+      "path": "public-template/solutions/duration.py",
+      "bytes": 4699,
+      "sha256": "97916f6a3e01e3f3677027fcef90da86974f0c989f345cd6a1c71d19d90eb90e"
+    },
+    {
+      "path": "public-template/solutions/recursive_patch.py",
+      "bytes": 1815,
+      "sha256": "0790d4e9651cff91d3e05bbf38682ab2298484b15e4ce3325c954ce1337c0c97"
+    },
+    {
+      "path": "public-template/solutions/ttl_set.py",
+      "bytes": 3379,
+      "sha256": "1af39f8255aaf0ca67cef1e83e37f6f093590d444ba50bbc70cd39fe2ae75a53"
+    },
+    {
+      "path": "public-template/TASKS.md",
+      "bytes": 3394,
+      "sha256": "2281b5578e0dc5f8cb1e19eeaab53e91d3b4ca745027abcdd8f6d8af2f34ff3c"
+    },
+    {
+      "path": "README.md",
+      "bytes": 3619,
+      "sha256": "fd7530a23fa0a8a3773d514df19e56ba1ef403dddcdcf95da8b5f60f0cf74cc3"
+    }
+  ]
+}

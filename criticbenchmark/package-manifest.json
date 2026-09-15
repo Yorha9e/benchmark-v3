@@ -1,0 +1,163 @@
+{
+  "schema_version": 1,
+  "benchmark_id": "critic-model-select-v1-package",
+  "purpose": "Reusable static package for single-round serial Critic review of two blind candidate inputs.",
+  "source_protocol": "critic-model-select-v1",
+  "public_candidate_files": [
+    "TASKS.md",
+    "public_smoke_tests.py",
+    "dependency_layers.py"
+  ],
+  "scoring_dimensions": {
+    "recall": {
+      "max_points": 50,
+      "breakdown": {
+        "GT1": 30,
+        "GT2": 10,
+        "GT3": 10
+      }
+    },
+    "precision": {
+      "max_points": 20
+    },
+    "depth": {
+      "max_points": 15
+    },
+    "speed": {
+      "max_points": 10
+    },
+    "format": {
+      "max_points": 5
+    }
+  },
+  "execution": {
+    "rounds_per_model": 1,
+    "cells_per_model": 2,
+    "candidate_order": [
+      "candidate-A",
+      "candidate-B"
+    ],
+    "dispatch": "strictly_serial",
+    "wall_clock_source": "agent_task_metadata.started_at_to_ended_at",
+    "token_usage": "unavailable_and_not_scored",
+    "new_runs": "must_be_written_outside_this_package"
+  },
+  "controller_assets": [
+    "scoring/",
+    "evaluator/"
+  ],
+  "excluded_assets": [
+    "reviews/*.json",
+    "score-summary.json",
+    "timing-events.json",
+    "old leaderboards",
+    "historical workspaces",
+    "provider failure logs",
+    "__pycache__/",
+    "*.pyc",
+    ".pytest_cache/",
+    "subtest_15 short A17/B17 results"
+  ],
+  "files": [
+    {
+      "path": "evaluator/reviewer_evaluator/__init__.py",
+      "bytes": 193,
+      "sha256": "ed44a7b6d5d3d54c82b4d12d1bf76b5a187df35afcde1473d21daf5aba677b56"
+    },
+    {
+      "path": "evaluator/reviewer_evaluator/checks.py",
+      "bytes": 9020,
+      "sha256": "965a18ab9745207858de085e02f64d191edc299eb374974c7fd15ed834b9c8cc"
+    },
+    {
+      "path": "evaluator/reviewer_evaluator/rank.py",
+      "bytes": 10036,
+      "sha256": "984d4874ce00d0773280b86cbe04621a0eefd31f394873ef4d678e203ff6deba"
+    },
+    {
+      "path": "evaluator/reviewer_evaluator/review_schema.json",
+      "bytes": 1478,
+      "sha256": "5f6954cd5d762ed52bd27e96ada903440bc2a053d45da868b3aaca6cdc9402df"
+    },
+    {
+      "path": "evaluator/reviewer_evaluator/runner.py",
+      "bytes": 15337,
+      "sha256": "ca06dae740ccfd3405730deac8d0511053c5de58be2ab3143c2e4eb913472c2f"
+    },
+    {
+      "path": "evaluator/reviewer_evaluator/validate.py",
+      "bytes": 16833,
+      "sha256": "a2932e0c69bb8931d777589c44c4bdfc017efb60fdf9f373d415b68d35e9c7a8"
+    },
+    {
+      "path": "protocol/DEBUG-TASK.md",
+      "bytes": 2114,
+      "sha256": "f252958f7ecd90d9d54bbe58dd3ecc44b9d7ec43d1354feaa8027bc2aebe2c57"
+    },
+    {
+      "path": "protocol/frozen-phi3-plan.md",
+      "bytes": 11606,
+      "sha256": "082b20ebb2f974cfb6b4b5e673d55bdb5cda9fae3bd48d49a4c45fc8f0a8fbe9"
+    },
+    {
+      "path": "protocol/public_smoke_tests.py",
+      "bytes": 1067,
+      "sha256": "8a56ae200f50993de8f1f7f302ee8258dab37758b1cf39089ca6cef39e73fc65"
+    },
+    {
+      "path": "protocol/supplemental_debug_checks.py",
+      "bytes": 5285,
+      "sha256": "918f30b5e459861184d9a5dd9c0da6fd5fefbf9098360d472dc6c5374438a431"
+    },
+    {
+      "path": "protocol/TASKS.md",
+      "bytes": 3394,
+      "sha256": "2281b5578e0dc5f8cb1e19eeaab53e91d3b4ca745027abcdd8f6d8af2f34ff3c"
+    },
+    {
+      "path": "public-inputs/candidate-A/dependency_layers.py",
+      "bytes": 4323,
+      "sha256": "f2845dd57514105ab3701efa600ef3059c7f58db4b74a944c0858085d13491c9"
+    },
+    {
+      "path": "public-inputs/candidate-A/public_smoke_tests.py",
+      "bytes": 1067,
+      "sha256": "8a56ae200f50993de8f1f7f302ee8258dab37758b1cf39089ca6cef39e73fc65"
+    },
+    {
+      "path": "public-inputs/candidate-A/TASKS.md",
+      "bytes": 3394,
+      "sha256": "2281b5578e0dc5f8cb1e19eeaab53e91d3b4ca745027abcdd8f6d8af2f34ff3c"
+    },
+    {
+      "path": "public-inputs/candidate-B/dependency_layers.py",
+      "bytes": 5290,
+      "sha256": "e948dec3717a2f3c0331bda617000e602417728f47131a9c888ac8be2410ffd9"
+    },
+    {
+      "path": "public-inputs/candidate-B/public_smoke_tests.py",
+      "bytes": 1067,
+      "sha256": "8a56ae200f50993de8f1f7f302ee8258dab37758b1cf39089ca6cef39e73fc65"
+    },
+    {
+      "path": "public-inputs/candidate-B/TASKS.md",
+      "bytes": 3394,
+      "sha256": "2281b5578e0dc5f8cb1e19eeaab53e91d3b4ca745027abcdd8f6d8af2f34ff3c"
+    },
+    {
+      "path": "README.md",
+      "bytes": 4184,
+      "sha256": "930adfbcc6b14c70affdfb559abe2589d84d1fab627d7c89c76d153a57ab1bc6"
+    },
+    {
+      "path": "scoring/manifest.json",
+      "bytes": 2492,
+      "sha256": "24616c147d857127ea5c182c7e470df107a4a8e4d5c1c846891fb374bbe0ea2d"
+    },
+    {
+      "path": "scoring/SCORING.md",
+      "bytes": 2594,
+      "sha256": "433f8e776195fa2290f58ccc51fabf1be08dcee50a435dd839874cff0ed56f2a"
+    }
+  ]
+}

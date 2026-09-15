@@ -1,0 +1,115 @@
+{
+  "schema_version": 1,
+  "benchmark_id": "short-python-stdlib-v1",
+  "status": {
+    "calibration": "completed_non_counted",
+    "freeze": "frozen"
+  },
+  "language": "python",
+  "standard_library_only": true,
+  "conditions": {
+    "A": ["A01", "A02", "A03", "A04", "A05", "A06", "A07", "A08", "A09", "A10", "A11", "A12", "A13", "A14", "A15"],
+    "B": ["B01", "B02", "B03", "B04", "B05", "B06", "B07", "B08", "B09", "B10", "B11", "B12", "B13", "B14", "B15"]
+  },
+  "candidates": [
+    {"slot": "A01", "expected_model": "MT/LongCat-2.0", "group": "G1"},
+    {"slot": "A02", "expected_model": "deepseek/deepseek-v4-flash", "group": "G1"},
+    {"slot": "A03", "expected_model": "deepseek/deepseek-v4-pro", "group": "G1"},
+    {"slot": "A04", "expected_model": "kimi-code/kimi-for-coding", "group": "G1"},
+    {"slot": "A05", "expected_model": "stepfun/step-3.7-flash", "group": "G1"},
+    {"slot": "A06", "expected_model": "qwen/qwen3.8-max-preview", "group": "G1"},
+    {"slot": "A07", "expected_model": "GPT/gpt-5.6-luna", "group": "G1"},
+    {"slot": "A08", "expected_model": "volcano/doubao-seed-2.1-turbo", "group": "G2"},
+    {"slot": "A09", "expected_model": "volcano/doubao-seed-2.0-pro", "group": "G2"},
+    {"slot": "A10", "expected_model": "volcano/doubao-seed-2.0-code", "group": "G2"},
+    {"slot": "A11", "expected_model": "volcano/minimax-m3", "group": "G2"},
+    {"slot": "A12", "expected_model": "mimo/mimo-v2.5-pro", "group": "G2"},
+    {"slot": "A13", "expected_model": "mimo/mimo-v2.5", "group": "G2"},
+    {"slot": "A14", "expected_model": "volcano/glm-5.2", "group": "G2"},
+    {"slot": "B01", "expected_model": "MT/LongCat-2.0", "group": "G1"},
+    {"slot": "B02", "expected_model": "deepseek/deepseek-v4-flash", "group": "G1"},
+    {"slot": "B03", "expected_model": "deepseek/deepseek-v4-pro", "group": "G1"},
+    {"slot": "B04", "expected_model": "kimi-code/kimi-for-coding", "group": "G1"},
+    {"slot": "B05", "expected_model": "stepfun/step-3.7-flash", "group": "G1"},
+    {"slot": "B06", "expected_model": "qwen/qwen3.8-max-preview", "group": "G1"},
+    {"slot": "B07", "expected_model": "GPT/gpt-5.6-luna", "group": "G1"},
+    {"slot": "B08", "expected_model": "volcano/doubao-seed-2.1-turbo", "group": "G2"},
+    {"slot": "B09", "expected_model": "volcano/doubao-seed-2.0-pro", "group": "G2"},
+    {"slot": "B10", "expected_model": "volcano/doubao-seed-2.0-code", "group": "G2"},
+    {"slot": "B11", "expected_model": "volcano/minimax-m3", "group": "G2"},
+    {"slot": "B12", "expected_model": "mimo/mimo-v2.5-pro", "group": "G2"},
+    {"slot": "B13", "expected_model": "mimo/mimo-v2.5", "group": "G2"},
+    {"slot": "B14", "expected_model": "volcano/glm-5.2", "group": "G2"},
+    {"slot": "A15", "expected_model": "composer/composer-2.5", "group": "G3"},
+    {"slot": "B15", "expected_model": "composer/composer-2.5", "group": "G3"}
+  ],
+  "waves": [
+    {"id": "G1-A", "condition": "A", "slots": ["A01", "A02", "A03", "A04", "A05", "A06", "A07"]},
+    {"id": "G2-B", "condition": "B", "slots": ["B08", "B09", "B10", "B11", "B12", "B13", "B14", "B15"]},
+    {"id": "G1-B", "condition": "B", "slots": ["B01", "B02", "B03", "B04", "B05", "B06", "B07"]},
+    {"id": "G2-A", "condition": "A", "slots": ["A08", "A09", "A10", "A11", "A12", "A13", "A14", "A15"]}
+  ],
+  "instruction_gate": {
+    "ack_file": "instruction_ack.json",
+    "required_text": "I followed TASKS.md and changed only solution files.",
+    "required_tasks_field": "completed_tasks"
+  },
+  "tasks": [
+    {"id": "recursive_patch", "file": "recursive_patch.py", "criteria": ["rp_delete_identity", "rp_plain_dict", "rp_isolation", "rp_order_boundary"]},
+    {"id": "dependency_layers", "file": "dependency_layers.py", "criteria": ["dl_one_shot", "dl_dependency_nodes", "dl_stable_order_cycle", "dl_deep_iterative"]},
+    {"id": "ttl_set", "file": "ttl_set.py", "criteria": ["ttl_strict_types", "ttl_exact_expiry", "ttl_capacity", "ttl_gc_release"]},
+    {"id": "duration", "file": "duration.py", "criteria": ["du_strict_syntax", "du_units_ranges", "du_normalize", "du_structured_errors"]}
+  ],
+  "capabilities": {
+    "extension": [
+      {"id": "ext_recursive_patch_nested_tuple", "task": "recursive_patch", "file": "recursive_patch.py", "probe": "ext_recursive_patch_nested_tuple"},
+      {"id": "ext_duration_large_carry", "task": "duration", "file": "duration.py", "probe": "ext_duration_large_carry"}
+    ],
+    "resource": [
+      {"id": "res_dependency_20000", "task": "dependency_layers", "file": "dependency_layers.py", "probe": "res_dependency_20000"},
+      {"id": "res_ttl_expiry_sweep", "task": "ttl_set", "file": "ttl_set.py", "probe": "res_ttl_expiry_sweep"}
+    ]
+  },
+  "resource_sla": {
+    "inference_tokens_soft": 500000,
+    "fresh_tokens_soft": 100000,
+    "output_tokens_soft": 60000,
+    "planner_tokens_soft": 300000,
+    "formal_cells": 30,
+    "calibration_cells_max": 3
+  },
+  "paths": {
+    "public_tasks": "TASKS.md",
+    "template": "template",
+    "evaluator": "evaluator",
+    "runs": "runs",
+    "results": "results"
+  },
+  "ranking_axes": {
+    "strict": [
+      {"name": "InstructionGate", "direction": "high"},
+      {"name": "StrictTaskCount", "direction": "high"},
+      {"name": "OfficialCriterionCount", "direction": "high"},
+      {"name": "ExtensionCapabilityCount", "direction": "high"},
+      {"name": "ResourceCapabilityCount", "direction": "high"},
+      {"name": "InferenceTokensPerStrictTask", "direction": "low"},
+      {"name": "InferenceTokensPerPassedCriterion", "direction": "low"}
+    ],
+    "lenient": [
+      {"name": "ExecutionCompleted", "direction": "high"},
+      {"name": "RawCriterionCount", "direction": "high"},
+      {"name": "AcceptanceCoverage", "direction": "high"},
+      {"name": "InstructionComplianceRate", "direction": "high"},
+      {"name": "ExtensionCapabilityCount", "direction": "high"},
+      {"name": "InferenceTokensPerPassedCriterion", "direction": "low"}
+    ]
+  },
+  "isolation": {"criterion_timeout_seconds": 5, "max_output_bytes": 65536},
+  "freeze": {
+    "exclude_roots": ["runs", "results"],
+    "include_files": ["results/frozen-phi3-plan.md"],
+    "exclude_names": ["asset-hashes.json"],
+    "exclude_dir_names": ["__pycache__"],
+    "exclude_suffixes": [".pyc", ".pyo"]
+  }
+}

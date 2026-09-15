@@ -1,0 +1,63 @@
+{
+  "run_id": "critic-model-select-v1",
+  "purpose": "select best critic model among subtest_1..subtest_14 + phi_2; subtest_14 is excluded if both cells remain provider-failed",
+  "protocol": "single-round read-only critic review; strict serial dispatch; agent task metadata wall-clock timing; candidate-A/B calls do not overlap",
+  "targets": {
+    "candidate-A": "reviewer/runs/debug-subagent-v1/round-2/subtest_12 (buggy)",
+    "candidate-B": "reviewer/runs/debug-subagent-v1/round-1/subtest_7 (correctness-clean)"
+  },
+  "ground_truth": {
+    "GT1": {
+      "target": "candidate-A",
+      "kind": "correctness",
+      "weight": 30,
+      "desc": "cross-hashability equal-value dedup miss: hashable and unhashable registries never cross-compared, equal values get distinct node ids (hidden check cross_hashability)"
+    },
+    "GT2": {
+      "target": "candidate-A",
+      "kind": "resource",
+      "weight": 10,
+      "desc": "O(N^2) linear scan registry for unhashable values"
+    },
+    "GT3": {
+      "target": "candidate-B",
+      "kind": "resource",
+      "weight": 10,
+      "desc": "O(N^2) cross-registry scans between hashable and unhashable domains"
+    }
+  },
+  "false_positive_rule": "any claimed defect not in GT is empirically re-verified by parent before classification; unconfirmable => FP; near-duplicate confirmed findings collapse to one GT hit",
+  "critic_slots": [
+    "subtest_1",
+    "subtest_2",
+    "subtest_3",
+    "subtest_4",
+    "subtest_5",
+    "subtest_6",
+    "subtest_7",
+    "subtest_8",
+    "subtest_9",
+    "subtest_10",
+    "subtest_11",
+    "subtest_12",
+    "subtest_13",
+    "subtest_14",
+    "phi_2"
+  ],
+  "self_review_flags": {
+    "subtest_12": "reviews own artifact candidate-A",
+    "subtest_7": "reviews own artifact candidate-B"
+  },
+  "inputs_sha256": {
+    "candidate-A": {
+      "dependency_layers.py": "f2845dd57514105ab3701efa600ef3059c7f58db4b74a944c0858085d13491c9",
+      "public_smoke_tests.py": "8a56ae200f50993de8f1f7f302ee8258dab37758b1cf39089ca6cef39e73fc65",
+      "TASKS.md": "2281b5578e0dc5f8cb1e19eeaab53e91d3b4ca745027abcdd8f6d8af2f34ff3c"
+    },
+    "candidate-B": {
+      "dependency_layers.py": "e948dec3717a2f3c0331bda617000e602417728f47131a9c888ac8be2410ffd9",
+      "public_smoke_tests.py": "8a56ae200f50993de8f1f7f302ee8258dab37758b1cf39089ca6cef39e73fc65",
+      "TASKS.md": "2281b5578e0dc5f8cb1e19eeaab53e91d3b4ca745027abcdd8f6d8af2f34ff3c"
+    }
+  }
+}
