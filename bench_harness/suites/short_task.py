@@ -1,0 +1,968 @@
+"""Next-gen short-task suite: micro-engines with hard resource oracles.
+
+Three tasks (12 assertions, 4 per task), each scored by running the model's
+``solution.py`` inside a fresh child interpreter via
+:class:`~benchmark_v3.bench_harness.core.runner.ProcessRunner`:
+
+1. ``varint_parser`` — streaming protobuf-style Varint decoder with a
+   :class:`~benchmark_v3.bench_harness.core.memory_probe.MemoryProbe`
+   oracle (``tracemalloc`` peak <= 4 MiB on a ~7 MiB wire stream).
+2. ``timing_wheel`` — hashed timing-wheel timer driver (amortised O(1)
+   tick, multi-round deadlines, skew-free firing, cancel semantics).
+3. ``lexer_state_machine`` — flat lexer plus recursive macro expander
+   with depth limiting and error recovery (never raises on bad input,
+   except ``ValueError`` for cyclic/over-deep macros).
+
+Every task: one child process, one 10 s timeout (SPEC: timeouts are
+functional failures, elapsed time itself is pure telemetry). Task briefs
+(``TASK.md``) state observable behaviour and resource limits only — no
+implementation hints.
+"""
+
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+from typing import Any
+
+from benchmark_v3.bench_harness.core.runner import ProcessRunner
+from benchmark_v3.bench_harness.core.types import AgentTrajectory, MilestoneResult
+from benchmark_v3.bench_harness.suites.base import SuiteAdapter, mk_milestone
+
+__all__ = ["ShortTaskSuite", "SHORT_TASK_TIMEOUT", "run_task_checks"]
+
+#: Per-task child-process timeout (seconds). Exceeding it fails the task's
+#: assertions; the elapsed time itself never affects the score.
+SHORT_TASK_TIMEOUT = 10.0
+
+#: tracemalloc peak budget for the varint streaming check (4 MiB).
+VARINT_MEMORY_LIMIT = 4 * 1024 * 1024
+
+#: Fixed evaluation seed (deterministic CI; pass another seed to re-sample).
+EVAL_SEED = 1337
+
+
+# ---------------------------------------------------------------------------
+# Task briefs (behavioural contracts only)
+# ---------------------------------------------------------------------------
+
+TASK_BRIEFS: dict[str, dict[str, str]] = {
+    "varint_parser": {
+        "title": "Zero-copy streaming Varint parser",
+        "brief": (
+            "Implement `solution.py` with:\n"
+            "- `encode_varint(value: int) -> bytes`: protobuf-style base-128 "
+            "varint for 0 <= value < 2**64 (raise ValueError outside range).\n"
+            "- `iter_values(chunks: Iterable[bytes]) -> Iterator[int]`: lazily "
+            "decode values across arbitrary chunk splits (1-byte splits must "
+            "work; empty chunks are ignored). Raise ValueError on truncated "
+            "or overlong (>10 byte / non-canonical) input.\n"
+            "RESOURCE LIMIT: decoding a multi-MiB stream while consuming the "
+            "iterator incrementally must peak at <= 4 MiB traced memory."
+        ),
+    },
+    "timing_wheel": {
+        "title": "Hashed timing-wheel timer driver",
+        "brief": (
+            "Implement `solution.py` with class `TimingWheel(tick_ms=10, "
+            "wheel_size=256)` exposing:\n"
+            "- `schedule(delay: int, payload) -> int`: fire `payload` at tick "
+            "`now + max(1, delay)` (`delay >= 0`; delay 0 and delay 1 both "
+            "fire on the next tick). Returns a timer id.\n"
+            "- `cancel(timer_id) -> bool`: True iff a pending timer was "
+            "removed (unknown/already-fired ids -> False).\n"
+            "- `tick() -> list`: advance one tick, return due payloads in "
+            "FIFO order.\n"
+            "- `now() -> int`, `pending() -> int`.\n"
+            "PERF LIMIT: scheduling tens of thousands of timers and ticking "
+            "thousands of times must finish in a few seconds (amortised O(1) "
+            "tick; a full scan per tick will time out)."
+        ),
+    },
+    "lexer_state_machine": {
+        "title": "Lexer state machine with nested macro expansion",
+        "brief": (
+            "Implement `solution.py` with:\n"
+            "- `tokenize(source: str) -> list[tuple[str, str]]`: emit "
+            "('IDENT', ...), ('INT', ...), ('STRING', ...) (escapes \\\\ \\\" "
+            "\\n \\t), ('SYM', ch) for single-char symbols, "
+            "('MACRO_OPEN', '#['), and ('ERROR', reason). Skip whitespace and "
+            "`//` line comments. `#` not starting `#[` is an ERROR token. "
+            "Unclosed strings/macros emit ERROR and recovery continues; "
+            "`tokenize` never raises on bad input.\n"
+            "- `expand(tokens, env: dict[str, list[tuple]]) -> list[tuple]`: "
+            "recursively splice `#[NAME]` with `env[NAME]` (nested macros "
+            "expand depth-first, `]`-matched). Unknown names / unclosed "
+            "macros emit ERROR tokens. Depth > 64 or cycles raise ValueError."
+        ),
+    },
+}
+
+STARTER_SOLUTION = '''"""Starter skeleton — implement the API described in TASK.md."""
+
+# varint_parser -----------------------------------------------------------
+def encode_varint(value):
+    raise NotImplementedError
+
+
+def iter_values(chunks):
+    raise NotImplementedError
+    yield  # make this a generator
+
+
+# timing_wheel ------------------------------------------------------------
+class TimingWheel:
+    def __init__(self, tick_ms=10, wheel_size=256):
+        raise NotImplementedError
+
+    def schedule(self, delay, payload):
+        raise NotImplementedError
+
+    def cancel(self, timer_id):
+        raise NotImplementedError
+
+    def tick(self):
+        raise NotImplementedError
+
+    def now(self):
+        raise NotImplementedError
+
+    def pending(self):
+        raise NotImplementedError
+
+
+# lexer_state_machine -----------------------------------------------------
+def tokenize(source):
+    raise NotImplementedError
+
+
+def expand(tokens, env):
+    raise NotImplementedError
+'''
+
+
+# ---------------------------------------------------------------------------
+# Child check scripts (run with: python -c SCRIPT <workspace> <seed>)
+# ---------------------------------------------------------------------------
+
+_CHILD_PREAMBLE = """
+import json, sys, tracemalloc, random
+ws, seed = sys.argv[1], int(sys.argv[2])
+sys.path.insert(0, ws)
+out = {"assertions": [], "peak_bytes": 0}
+def record(aid, passed, detail=""):
+    out["assertions"].append({"id": aid, "passed": bool(passed), "detail": str(detail)})
+def finish():
+    print(json.dumps(out), flush=True)
+"""
+
+_CHILD_IMPORT = """
+try:
+    import solution
+except Exception as exc:
+    for aid in ("a1", "a2", "a3", "a4"):
+        record(aid, False, "import solution failed: %r" % (exc,))
+    finish()
+    sys.exit(0)
+"""
+
+_VARINT_CHECK = _CHILD_PREAMBLE + _CHILD_IMPORT + """
+rng = random.Random(seed)
+vals = [0, 1, 127, 128, 300, 16384, 2**32 - 1, 2**63 - 1, 2**64 - 1]
+vals += [rng.randrange(0, 2**64) for _ in range(400)]
+wire = b"".join(solution.encode_varint(v) for v in vals)
+
+# a1: roundtrip correctness under random chunk splits
+try:
+    chunks = []
+    i = 0
+    while i < len(wire):
+        j = min(len(wire), i + rng.randint(1, 37))
+        chunks.append(wire[i:j])
+        i = j
+    got = list(solution.iter_values(iter(chunks)))
+    record("a1", got == vals, "decoded %d/%d values" % (len(got), len(vals)))
+except Exception as exc:
+    record("a1", False, "roundtrip raised %r" % (exc,))
+
+# a2: chunk-boundary robustness (1-byte splits, empty chunks, empty stream)
+try:
+    one = [wire[k:k+1] for k in range(len(wire))]
+    one[0:0] = [b"", b""]
+    ok = list(solution.iter_values(iter(one))) == vals
+    ok = ok and list(solution.iter_values(iter([]))) == []
+    ok = ok and list(solution.iter_values(iter([b"", b""]))) == []
+    record("a2", ok, "1-byte splits + empty input")
+except Exception as exc:
+    record("a2", False, "boundary raised %r" % (exc,))
+
+# a3: memory oracle — ~7MiB wire, incremental consumption, peak <= 4MiB
+try:
+    N = 800000
+    def _gen():
+        buf = bytearray()
+        for k in range(N):
+            buf += solution.encode_varint((k * 2654435761) % (2**63))
+            if len(buf) >= 65536:
+                yield bytes(buf)
+                buf = bytearray()
+        if buf:
+            yield bytes(buf)
+    tracemalloc.start()
+    count, xorsum = 0, 0
+    for v in solution.iter_values(_gen()):
+        count += 1
+        xorsum ^= v
+    _, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    out["peak_bytes"] = peak
+    expect = 0
+    for k in range(N):
+        expect ^= (k * 2654435761) % (2**63)
+    ok = count == N and xorsum == expect and peak <= MEMLIMIT_BYTES
+    record("a3", ok, "count=%d peak=%.2fMiB" % (count, peak / 1048576.0))
+except Exception as exc:
+    try:
+        tracemalloc.stop()
+    except Exception:
+        pass
+    record("a3", False, "memory probe raised %r" % (exc,))
+
+# a4: malformed input handling
+try:
+    bad = 0
+    try:
+        list(solution.iter_values(iter([solution.encode_varint(300)[:-1]])))
+    except ValueError:
+        bad += 1
+    try:
+        list(solution.iter_values(iter([b"\\x80" * 11])))
+    except ValueError:
+        bad += 1
+    try:
+        solution.encode_varint(-1)
+    except (ValueError, OverflowError):
+        bad += 1
+    try:
+        solution.encode_varint(2**64)
+    except (ValueError, OverflowError):
+        bad += 1
+    record("a4", bad == 4, "%d/4 malformed cases rejected" % bad)
+except Exception as exc:
+    record("a4", False, "malformed probe raised %r" % (exc,))
+finish()
+""".replace("MEMLIMIT_BYTES", str(VARINT_MEMORY_LIMIT))
+
+_WHEEL_CHECK = _CHILD_PREAMBLE + _CHILD_IMPORT + """
+import time
+W = solution.TimingWheel
+
+# a1: firing accuracy (incl. multi-round deadlines + FIFO order)
+try:
+    w = W(tick_ms=10, wheel_size=16)
+    due = {}
+    due[w.schedule(0, "z0")] = 1
+    due[w.schedule(1, "one")] = 1
+    due[w.schedule(2, "two")] = 2
+    due[w.schedule(5, "five")] = 5
+    due[w.schedule(16, "round1")] = 16
+    due[w.schedule(19, "round1+3")] = 19
+    due[w.schedule(40, "far")] = 40
+    a = w.schedule(3, "first3")
+    b = w.schedule(3, "second3")
+    fired = {}
+    for _ in range(60):
+        for p in w.tick():
+            fired.setdefault(p, w.now())
+    ok = (fired.get("z0") == 1 and fired.get("one") == 1 and fired.get("two") == 2
+          and fired.get("five") == 5
+          and fired.get("round1") == 16 and fired.get("round1+3") == 19
+          and fired.get("far") == 40 and fired.get("first3") == 3
+          and fired.get("second3") == 3)
+    record("a1", ok, "fired=%r" % (fired,))
+except Exception as exc:
+    record("a1", False, "accuracy raised %r" % (exc,))
+
+# a2: cancel semantics
+try:
+    w = W(tick_ms=10, wheel_size=16)
+    tid = w.schedule(2, "bye")
+    c1 = w.cancel(tid) is True
+    c2 = w.cancel(999999) is False
+    seen = []
+    for _ in range(5):
+        seen += w.tick()
+    c3 = "bye" not in seen
+    t2 = w.schedule(1, "fire")
+    w.tick()
+    c4 = w.cancel(t2) is False
+    record("a2", c1 and c2 and c3 and c4, "cancel flags %r" % ([c1, c2, c3, c4],))
+except Exception as exc:
+    record("a2", False, "cancel raised %r" % (exc,))
+
+# a3: tick efficiency (hashed wheel, amortised O(1) per tick)
+try:
+    w = W(tick_ms=10, wheel_size=256)
+    rng2 = random.Random(seed)
+    for k in range(60000):
+        w.schedule(rng2.randrange(1, 5000), k)
+    t0 = time.monotonic()
+    n = 0
+    for _ in range(5000):
+        n += len(w.tick())
+    dt = time.monotonic() - t0
+    ok = n == 60000 and dt < 3.0
+    record("a3", ok, "fired=%d in %.2fs" % (n, dt))
+except Exception as exc:
+    record("a3", False, "efficiency raised %r" % (exc,))
+
+# a4: clock edges (monotonic now, pending, periodic re-arm)
+try:
+    w = W(tick_ms=10, wheel_size=8)
+    ok = w.now() == 0 and w.pending() == 0
+    w.schedule(2, "x")
+    ok = ok and w.pending() == 1
+    w.tick()
+    ok = ok and w.now() == 1 and w.pending() == 1
+    got = w.tick()
+    ok = ok and got == ["x"] and w.now() == 2 and w.pending() == 0
+    hits = []
+    nxt = w.schedule(7, "p")
+    for _ in range(70):
+        for p in w.tick():
+            if p == "p":
+                hits.append(w.now())
+                if len(hits) < 10:
+                    w.schedule(7, "p")
+    ok = ok and hits == [9 + 7 * k for k in range(10)]
+    try:
+        w.schedule(-1, "neg")
+        ok = False
+    except (ValueError, TypeError):
+        pass
+    record("a4", ok, "periodic hits=%r" % (hits,))
+except Exception as exc:
+    record("a4", False, "edges raised %r" % (exc,))
+finish()
+"""
+
+_LEXER_CHECK = _CHILD_PREAMBLE + _CHILD_IMPORT + """
+import time
+tok, exp = solution.tokenize, solution.expand
+
+# a1: basic token shapes
+try:
+    src = 'let x = 42; // comment\\ns = "a\\\\nb"; #[inc x] # + ( )'
+    got = tok(src)
+    want = [("IDENT", "let"), ("IDENT", "x"), ("SYM", "="), ("INT", "42"),
+            ("SYM", ";"), ("IDENT", "s"), ("SYM", "="), ("STRING", "a\\nb"),
+            ("SYM", ";"), ("MACRO_OPEN", "#["), ("IDENT", "inc"), ("IDENT", "x"),
+            ("SYM", "]"), ("ERROR", "#"), ("SYM", "+"), ("SYM", "("), ("SYM", ")")]
+    record("a1", got == want, "got=%r" % (got,))
+except Exception as exc:
+    record("a1", False, "basic raised %r" % (exc,))
+
+# a2: nested macro expansion
+try:
+    env = {"B": [("INT", "1"), ("SYM", "+"), ("INT", "2")],
+           "A": [("MACRO_OPEN", "#["), ("IDENT", "B"), ("SYM", "]"), ("SYM", "*")],
+           "C": [("MACRO_OPEN", "#["), ("IDENT", "A"), ("SYM", "]")]}
+    got = exp([("MACRO_OPEN", "#["), ("IDENT", "C"), ("SYM", "]"),
+               ("MACRO_OPEN", "#["), ("IDENT", "B"), ("SYM", "]")], env)
+    want = [("INT", "1"), ("SYM", "+"), ("INT", "2"), ("SYM", "*"),
+            ("INT", "1"), ("SYM", "+"), ("INT", "2")]
+    unk = exp([("MACRO_OPEN", "#["), ("IDENT", "NOPE"), ("SYM", "]")], {})
+    ok = got == want and unk == [("ERROR", "unknown-macro:NOPE")]
+    record("a2", ok, "got=%r unk=%r" % (got, unk))
+except Exception as exc:
+    record("a2", False, "macro raised %r" % (exc,))
+
+# a3: error recovery (never raises; ERROR tokens; continues after)
+try:
+    t1 = tok('"unclosed\\nstill = 1;')
+    t2 = tok('ok = 1 @ dear;')
+    t3 = exp([("MACRO_OPEN", "#["), ("IDENT", "A")], {"A": [("INT", "1")]})
+    ok = (t1[0] == ("ERROR", "unterminated-string")
+          and ("IDENT", "still") in t1 and ("INT", "1") in t1
+          and ("ERROR", "@") in t2 and ("IDENT", "dear") in t2
+          and t3 == [("ERROR", "unterminated-macro")])
+    record("a3", ok, "t1=%r t2=%r t3=%r" % (t1, t2, t3))
+except Exception as exc:
+    record("a3", False, "recovery raised %r" % (exc,))
+
+# a4: depth limit + determinism fuzz
+try:
+    cyc = {"A": [("MACRO_OPEN", "#["), ("IDENT", "A"), ("SYM", "]")]}
+    cyc_ok = False
+    try:
+        exp([("MACRO_OPEN", "#["), ("IDENT", "A"), ("SYM", "]")], cyc)
+    except ValueError:
+        cyc_ok = True
+    deep = {}
+    for k in range(80):
+        nxt = "M%d" % (k + 1)
+        deep["M%d" % k] = [("MACRO_OPEN", "#["), ("IDENT", nxt), ("SYM", "]")]
+    deep["M80"] = [("INT", "0")]
+    deep_ok = False
+    try:
+        exp([("MACRO_OPEN", "#["), ("IDENT", "M0"), ("SYM", "]")], deep)
+    except ValueError:
+        deep_ok = True
+    rng3 = random.Random(seed)
+    alpha = "abcdef_ xyz012 // c\\n\\"q\\" 1 2 #[M] @"
+    det = True
+    for _ in range(30):
+        s = "".join(rng3.choice(alpha) for _ in range(rng3.randrange(0, 120)))
+        if tok(s) != tok(s):
+            det = False
+            break
+    big = "x = 1; " * 40000
+    t0 = time.monotonic()
+    tb = tok(big)
+    dt = time.monotonic() - t0
+    ok = cyc_ok and deep_ok and det and len(tb) == 160000 and dt < 2.0
+    record("a4", ok, "cyc=%r deep=%r det=%r big=%.2fs" % (cyc_ok, deep_ok, det, dt))
+except Exception as exc:
+    record("a4", False, "robustness raised %r" % (exc,))
+finish()
+"""
+
+CHECK_SCRIPTS: dict[str, str] = {
+    "varint_parser": _VARINT_CHECK,
+    "timing_wheel": _WHEEL_CHECK,
+    "lexer_state_machine": _LEXER_CHECK,
+}
+
+ASSERTION_NAMES: dict[str, list[str]] = {
+    "varint_parser": [
+        "Varint roundtrip under random chunk splits",
+        "Chunk-boundary robustness (1-byte splits, empty input)",
+        "Memory oracle: streaming peak <= 4MiB on large wire",
+        "Malformed input rejected with ValueError",
+    ],
+    "timing_wheel": [
+        "Firing accuracy incl. multi-round deadlines and FIFO order",
+        "Cancel semantics (pending/unknown/fired)",
+        "Tick efficiency: 60k timers x 5k ticks in < 3s",
+        "Clock edges: monotonic now, pending, periodic re-arm",
+    ],
+    "lexer_state_machine": [
+        "Basic token shapes incl. comments, escapes, stray '#'",
+        "Nested macro expansion with unknown-macro error",
+        "Error recovery without raising (strings, chars, macros)",
+        "Depth limit, cycle detection and determinism fuzz",
+    ],
+}
+
+
+def run_task_checks(
+    task_id: str,
+    workspace_dir: str | Path,
+    seed: int = EVAL_SEED,
+    timeout: float = SHORT_TASK_TIMEOUT,
+) -> dict[str, Any]:
+    """Run one task's 4 assertions in a child interpreter.
+
+    Returns ``{"assertions": [{id, passed, detail}], "peak_bytes": int,
+    "timed_out": bool, "diagnostics": str}``. Never raises on model bugs:
+    missing files, import errors and timeouts become failed assertions.
+    """
+    workspace_dir = Path(workspace_dir)
+    script = CHECK_SCRIPTS[task_id]
+    names = ASSERTION_NAMES[task_id]
+    runner = ProcessRunner(default_timeout=timeout)
+    result = runner.run(
+        [sys.executable, "-c", script, str(workspace_dir), str(seed)],
+        cwd=workspace_dir,
+        timeout=timeout,
+    )
+    if result.timed_out:
+        return {
+            "assertions": [
+                {"id": f"a{i}", "passed": False, "detail": "timeout (>%.0fs)" % timeout}
+                for i in range(1, 5)
+            ],
+            "peak_bytes": 0,
+            "timed_out": True,
+            "diagnostics": (result.stdout + result.stderr)[-2000:],
+        }
+    payload: dict[str, Any] | None = None
+    for line in reversed((result.stdout or "").splitlines()):
+        line = line.strip()
+        if line.startswith("{") and line.endswith("}"):
+            try:
+                payload = json.loads(line)
+                break
+            except ValueError:
+                continue
+    if not payload or not isinstance(payload.get("assertions"), list):
+        diagnostics = ((result.stdout or "") + "\n" + (result.stderr or ""))[-2000:]
+        return {
+            "assertions": [
+                {"id": f"a{i}", "passed": False, "detail": "checker produced no JSON"}
+                for i in range(1, 5)
+            ],
+            "peak_bytes": 0,
+            "timed_out": False,
+            "diagnostics": diagnostics,
+        }
+    by_id = {a.get("id"): a for a in payload["assertions"] if isinstance(a, dict)}
+    assertions = [
+        {
+            "id": f"a{i}",
+            "passed": bool(by_id.get(f"a{i}", {}).get("passed", False)),
+            "detail": str(by_id.get(f"a{i}", {}).get("detail", "")),
+        }
+        for i in range(1, 5)
+    ]
+    _ = names
+    return {
+        "assertions": assertions,
+        "peak_bytes": int(payload.get("peak_bytes", 0) or 0),
+        "timed_out": False,
+        "diagnostics": "",
+    }
+
+
+class ShortTaskSuite(SuiteAdapter):
+    """Micro-engine short tasks with memory oracle and 10 s timeouts."""
+
+    suite_name = "short"
+    TASK_IDS = ("varint_parser", "timing_wheel", "lexer_state_machine")
+
+    def describe_task(self, task_id: str) -> dict[str, Any]:
+        meta = TASK_BRIEFS[task_id]
+        return {"task_id": task_id, **meta}
+
+    def prepare_task(self, task_id: str, workspace_dir: Path) -> None:
+        meta = TASK_BRIEFS[task_id]
+        (workspace_dir / "TASK.md").write_text(
+            "# %s\n\n%s\n" % (meta["title"], meta["brief"]), encoding="utf-8"
+        )
+        solution = workspace_dir / "solution.py"
+        if not solution.exists():
+            solution.write_text(STARTER_SOLUTION, encoding="utf-8")
+
+    def build_prompt(self, task_id: str, workspace_dir: Path) -> str:
+        meta = TASK_BRIEFS[task_id]
+        return (
+            "You are implementing a micro-engine benchmark task: %s.\n\n"
+            "Contract (implement exactly this API in `solution.py`):\n%s\n\n"
+            "Rules: edit ONLY `solution.py` in the workspace; no network; "
+            "no third-party packages; keep per-call work incremental "
+            "(streaming/memory limits are enforced). When done, reply with "
+            "no further tool calls." % (meta["title"], meta["brief"])
+        )
+
+    def evaluate_task(
+        self,
+        task_id: str,
+        workspace_dir: Path,
+        trajectory: AgentTrajectory,  # noqa: ARG002 - hook signature
+    ) -> tuple[list[MilestoneResult], dict[str, Any]]:
+        outcome = run_task_checks(task_id, workspace_dir)
+        names = ASSERTION_NAMES[task_id]
+        milestones = [
+            mk_milestone(
+                "%s_a%d" % (task_id, i),
+                names[i - 1],
+                a["passed"],
+                failure_reason=None if a["passed"] else a["detail"],
+                diagnostics=outcome["diagnostics"] if not a["passed"] else "",
+            )
+            for i, a in enumerate(outcome["assertions"], start=1)
+        ]
+        return milestones, {"peak_memory_bytes": outcome["peak_bytes"]}
+
+
+# ---------------------------------------------------------------------------
+# Reference solutions (used by self-tests as known-good oracles)
+# ---------------------------------------------------------------------------
+
+REFERENCE_SOLUTIONS: dict[str, str] = {
+    "varint_parser": '''
+def encode_varint(value):
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError("int required")
+    if value < 0 or value >= 1 << 64:
+        raise ValueError("out of u64 range")
+    out = bytearray()
+    while True:
+        bits = value & 0x7F
+        value >>= 7
+        if value:
+            out.append(bits | 0x80)
+        else:
+            out.append(bits)
+            return bytes(out)
+
+
+def iter_values(chunks):
+    buf = bytearray()
+    for chunk in chunks:
+        if not chunk:
+            continue
+        buf += chunk
+        pos, n = 0, len(buf)
+        while pos < n:
+            result, shift, i = 0, 0, pos
+            complete = False
+            while i < n:
+                b = buf[i]
+                i += 1
+                if i - pos > 10:
+                    raise ValueError("overlong varint")
+                result |= (b & 0x7F) << shift
+                shift += 7
+                if not b & 0x80:
+                    if shift == 70 and (b & 0x7E):
+                        raise ValueError("varint exceeds u64")
+                    complete = True
+                    break
+                if i - pos == 10:
+                    raise ValueError("overlong varint")
+            if not complete:
+                break
+            yield result
+            pos = i
+        del buf[:pos]
+    if buf:
+        raise ValueError("truncated varint at end of stream")
+''',
+    "timing_wheel": '''
+class TimingWheel:
+    def __init__(self, tick_ms=10, wheel_size=256):
+        if wheel_size <= 0:
+            raise ValueError("wheel_size must be positive")
+        self.tick_ms = tick_ms
+        self.wheel_size = int(wheel_size)
+        self._now = 0
+        self._seq = 0
+        self._buckets = [[] for _ in range(self.wheel_size)]
+        self._live = {}
+
+    def now(self):
+        return self._now
+
+    def pending(self):
+        return len(self._live)
+
+    def schedule(self, delay, payload):
+        if delay is None or delay < 0:
+            raise ValueError("delay must be >= 0")
+        due = self._now + max(1, int(delay))
+        rounds = (due - self._now - 1) // self.wheel_size
+        self._seq += 1
+        tid = self._seq
+        entry = {"id": tid, "rounds": rounds, "payload": payload, "cancelled": False}
+        self._buckets[due % self.wheel_size].append(entry)
+        self._live[tid] = entry
+        return tid
+
+    def cancel(self, timer_id):
+        entry = self._live.pop(timer_id, None)
+        if entry is None:
+            return False
+        entry["cancelled"] = True
+        return True
+
+    def tick(self):
+        self._now += 1
+        bucket = self._buckets[self._now % self.wheel_size]
+        if not bucket:
+            return []
+        fired, keep = [], []
+        for entry in bucket:
+            if entry["cancelled"]:
+                continue
+            if entry["rounds"] <= 0:
+                fired.append(entry)
+            else:
+                entry["rounds"] -= 1
+                keep.append(entry)
+        bucket[:] = keep
+        out = []
+        for entry in fired:
+            if not entry["cancelled"]:
+                self._live.pop(entry["id"], None)
+                out.append(entry["payload"])
+        return out
+''',
+    "lexer_state_machine": '''
+_SYMS = set("()[]{},;=+-*/")
+
+def tokenize(source):
+    toks, i, n = [], 0, len(source)
+    while i < n:
+        c = source[i]
+        if c in " \\t\\r\\n":
+            i += 1
+        elif c == "/" and i + 1 < n and source[i + 1] == "/":
+            while i < n and source[i] != "\\n":
+                i += 1
+        elif c.isalpha() or c == "_":
+            j = i + 1
+            while j < n and (source[j].isalnum() or source[j] == "_"):
+                j += 1
+            toks.append(("IDENT", source[i:j]))
+            i = j
+        elif c.isdigit():
+            j = i + 1
+            while j < n and source[j].isdigit():
+                j += 1
+            toks.append(("INT", source[i:j]))
+            i = j
+        elif c == '"':
+            j = i + 1
+            buf = []
+            closed = False
+            while j < n:
+                d = source[j]
+                if d == "\\\\":
+                    if j + 1 >= n:
+                        break
+                    e = source[j + 1]
+                    buf.append({"n": "\\n", "t": "\\t", '"': '"', "\\\\": "\\\\"}.get(e, e))
+                    j += 2
+                elif d == '"':
+                    closed = True
+                    j += 1
+                    break
+                elif d == "\\n":
+                    break
+                else:
+                    buf.append(d)
+                    j += 1
+            if closed:
+                toks.append(("STRING", "".join(buf)))
+                i = j
+            else:
+                toks.append(("ERROR", "unterminated-string"))
+                while i < n and source[i] != "\\n":
+                    i += 1
+        elif c == "#" and i + 1 < n and source[i + 1] == "[":
+            toks.append(("MACRO_OPEN", "#["))
+            i += 2
+        elif c in _SYMS:
+            toks.append(("SYM", c))
+            i += 1
+        else:
+            toks.append(("ERROR", c))
+            i += 1
+    return toks
+
+
+def expand(tokens, env):
+    out, i, n = [], 0, len(tokens)
+
+    def _splice(idx, depth):
+        if depth > 64:
+            raise ValueError("macro expansion depth exceeded")
+        if idx >= n or tokens[idx][0] != "MACRO_OPEN":
+            raise ValueError("expected macro open")
+        idx += 1
+        if idx >= n or tokens[idx][0] != "IDENT":
+            out.append(("ERROR", "bad-macro-head"))
+            return n
+        name = tokens[idx][1]
+        idx += 1
+        depth_nest = 0
+        end = idx
+        while end < n:
+            k, v = tokens[end]
+            if k == "MACRO_OPEN":
+                depth_nest += 1
+            elif k == "SYM" and v == "]":
+                if depth_nest == 0:
+                    break
+                depth_nest -= 1
+            end += 1
+        if end >= n:
+            out.append(("ERROR", "unterminated-macro"))
+            return n
+        body = env.get(name)
+        if body is None:
+            out.append(("ERROR", "unknown-macro:" + name))
+            return end + 1
+        _expand_list(list(body), depth + 1)
+        return end + 1
+
+    def _expand_list(toks, depth):
+        if depth > 64:
+            raise ValueError("macro expansion depth exceeded")
+        j = 0
+        while j < len(toks):
+            k, v = toks[j]
+            if k == "MACRO_OPEN":
+                sub = toks[j:]
+                saved_out_len = len(out)
+                _ = saved_out_len
+                # splice nested macro inline using shared scanner
+                nonlocal_state = {"tokens": toks, "pos": j}
+                _ = nonlocal_state
+                # manual nested scan over sub list
+                if j + 1 >= len(toks) or toks[j + 1][0] != "IDENT":
+                    out.append(("ERROR", "bad-macro-head"))
+                    # skip to matching ]
+                    nest, q = 0, j + 1
+                    while q < len(toks):
+                        kk, vv = toks[q]
+                        if kk == "MACRO_OPEN":
+                            nest += 1
+                        elif kk == "SYM" and vv == "]":
+                            if nest == 0:
+                                break
+                            nest -= 1
+                        q += 1
+                    j = q + 1
+                    continue
+                nm = toks[j + 1][1]
+                nest, q = 0, j + 2
+                while q < len(toks):
+                    kk, vv = toks[q]
+                    if kk == "MACRO_OPEN":
+                        nest += 1
+                    elif kk == "SYM" and vv == "]":
+                        if nest == 0:
+                            break
+                        nest -= 1
+                    q += 1
+                if q >= len(toks):
+                    out.append(("ERROR", "unterminated-macro"))
+                    j = len(toks)
+                    continue
+                bd = env.get(nm)
+                if bd is None:
+                    out.append(("ERROR", "unknown-macro:" + nm))
+                else:
+                    _expand_list(list(bd), depth + 1)
+                j = q + 1
+            else:
+                out.append((k, v))
+                j += 1
+
+    while i < n:
+        if tokens[i][0] == "MACRO_OPEN":
+            i = _splice(i, 0)
+        else:
+            out.append(tokens[i])
+            i += 1
+    return out
+''',
+}
+
+
+def self_test() -> tuple[int, int]:
+    """Run module self-tests. Returns ``(passed, failed)`` counts."""
+    import tempfile
+
+    from benchmark_v3.bench_harness.suites.base import ScriptedDriver
+
+    counts = [0, 0]
+
+    def check(name: str, cond: bool) -> None:
+        counts[0 if cond else 1] += 1
+        print(f"{'PASS' if cond else 'FAIL'} short::{name}", flush=True)
+
+    suite = ShortTaskSuite()
+    check("task_ids", suite.task_ids() == ["varint_parser", "timing_wheel", "lexer_state_machine"])
+
+    # -- reference solutions pass all 12 assertions --
+    total_pass = 0
+    for task_id, src in REFERENCE_SOLUTIONS.items():
+        with tempfile.TemporaryDirectory(prefix="short-ref-") as tmp:
+            (Path(tmp) / "solution.py").write_text(src, encoding="utf-8")
+            outcome = run_task_checks(task_id, tmp)
+            n_pass = sum(1 for a in outcome["assertions"] if a["passed"])
+            total_pass += n_pass
+            check("ref_%s_%d_of_4" % (task_id, n_pass), n_pass == 4)
+    check("ref_total_12", total_pass == 12)
+
+    # -- memory oracle bites a slurping implementation --
+    slurp = REFERENCE_SOLUTIONS["varint_parser"].replace(
+        "        buf += chunk\n        pos, n = 0, len(buf)",
+        "        buf += chunk\n        pos, n = 0, len(buf)",
+    )
+    slurp_bad = (
+        "def encode_varint(value):\n"
+        "    from io import BytesIO\n"
+        "    if value < 0 or value >= 1 << 64:\n"
+        "        raise ValueError('range')\n"
+        "    out = bytearray()\n"
+        "    while True:\n"
+        "        b = value & 0x7F; value >>= 7\n"
+        "        out.append(b | (0x80 if value else 0))\n"
+        "        if not value:\n"
+        "            return bytes(out)\n"
+        "def iter_values(chunks):\n"
+        "    data = b''.join(chunks)\n"
+        "    out = []\n"
+        "    i = 0\n"
+        "    while i < len(data):\n"
+        "        r, s = 0, 0\n"
+        "        while True:\n"
+        "            b = data[i]; i += 1\n"
+        "            r |= (b & 0x7F) << s; s += 7\n"
+        "            if not b & 0x80:\n"
+        "                break\n"
+        "        out.append(r)\n"
+        "        _pad = bytes(64)\n"
+        "    return iter(out)\n"
+    )
+    _ = slurp
+    with tempfile.TemporaryDirectory(prefix="short-bad-") as tmp:
+        (Path(tmp) / "solution.py").write_text(slurp_bad, encoding="utf-8")
+        outcome = run_task_checks("varint_parser", tmp)
+        by_id = {a["id"]: a for a in outcome["assertions"]}
+        check("slurp_correctness_passes", by_id["a1"]["passed"])
+        check(
+            "slurp_memory_fails",
+            not by_id["a3"]["passed"] and outcome["peak_bytes"] > VARINT_MEMORY_LIMIT,
+        )
+
+    # -- missing solution fails closed with diagnostics --
+    with tempfile.TemporaryDirectory(prefix="short-missing-") as tmp:
+        outcome = run_task_checks("timing_wheel", tmp)
+        check(
+            "missing_fails_closed",
+            all(not a["passed"] for a in outcome["assertions"])
+            and not outcome["timed_out"],
+        )
+
+    # -- full run_session integration via scripted driver --
+    with tempfile.TemporaryDirectory(prefix="short-sess-") as tmp:
+        driver = ScriptedDriver(
+            "scripted",
+            script=[
+                {
+                    "content": "writing reference varint",
+                    "tool_calls": [
+                        {
+                            "id": "c1",
+                            "name": "write",
+                            "arguments": {
+                                "path": "solution.py",
+                                "content": REFERENCE_SOLUTIONS["varint_parser"],
+                            },
+                        }
+                    ],
+                },
+                {"content": "done"},
+            ],
+        )
+        report = suite.run_session("varint_parser", "scripted", driver, tmp)
+        check("session_passes", report.passed and len(report.milestones) == 4)
+        check("peak_recorded", report.peak_memory_bytes > 0)
+
+    return counts[0], counts[1]
+
+
+def main() -> int:
+    passed, failed = self_test()
+    print(f"short_task self-test: {passed} passed, {failed} failed", flush=True)
+    return 0 if failed == 0 else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
