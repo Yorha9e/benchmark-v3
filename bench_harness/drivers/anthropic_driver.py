@@ -177,6 +177,11 @@ class AnthropicDriver(BaseDriver):
                 raise self._map_error(exc) from exc
             result = self.parse_response(response)
             self.account_usage(result.token_usage)
+            if result.truncated and not kwargs.get("_trunc_retry"):
+                # max_tokens hit mid-turn: retry once with a doubled budget.
+                retry_kwargs = dict(kwargs, _trunc_retry=True)
+                retry_kwargs["max_tokens"] = int(create_kwargs.get("max_tokens", self.max_tokens)) * 2
+                return self.chat(messages, tools, system_prompt=system_prompt, **retry_kwargs)
             return result
 
         return self.run_with_retry(_call)
@@ -207,12 +212,14 @@ class AnthropicDriver(BaseDriver):
         else:
             token_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         token_usage.setdefault("reasoning_tokens", 0)
+        truncated = getattr(response, "stop_reason", "") == "max_tokens"
         return DriverResponse(
             content="\n".join(text_parts),
             thought=thought,
             tool_calls=self.normalize_tool_calls(tool_calls),
             token_usage=self.extract_token_usage(token_usage),
             raw=response,
+            truncated=truncated,
         )
 
     def _map_error(self, exc: Exception) -> Exception:

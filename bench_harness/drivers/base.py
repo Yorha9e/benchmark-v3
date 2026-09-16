@@ -54,6 +54,11 @@ class DriverResponse:
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
     token_usage: dict[str, int] = field(default_factory=dict)
     raw: Any = None
+    #: True when the vendor cut generation short on its output budget
+    #: (OpenAI finish_reason=length, Anthropic stop_reason=max_tokens,
+    #: Gemini finishReason=MAX_TOKENS, Responses incomplete_details).
+    #: Drivers retry once with a doubled budget before surfacing this.
+    truncated: bool = False
 
     @property
     def prompt_tokens(self) -> int:
@@ -73,6 +78,7 @@ class DriverResponse:
             "thought": self.thought,
             "tool_calls": [dict(tc) for tc in self.tool_calls],
             "token_usage": dict(self.token_usage),
+            "truncated": self.truncated,
         }
 
 

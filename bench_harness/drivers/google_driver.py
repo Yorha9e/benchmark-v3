@@ -112,6 +112,8 @@ class GoogleGenAIDriver(BaseDriver):
             converted = self.convert_tools(tools)
             if converted:
                 config_args["tools"] = converted
+            if "max_output_tokens" in kwargs:
+                config_args["max_output_tokens"] = kwargs["max_output_tokens"]
 
             sys_instruction, contents = self.convert_messages(messages)
             effective_sys = kwargs.get("system_instruction") or sys_instruction
@@ -125,6 +127,11 @@ class GoogleGenAIDriver(BaseDriver):
                 raise self._map_error(exc) from exc
             result = self.parse_response(response)
             self.account_usage(result.token_usage)
+            if result.truncated and not kwargs.get("_trunc_retry"):
+                # Output budget hit mid-turn: retry once with a doubled budget.
+                retry_kwargs = dict(kwargs, _trunc_retry=True)
+                retry_kwargs["max_output_tokens"] = int(kwargs.get("max_output_tokens", 8192)) * 2
+                return self.chat(messages, tools, **retry_kwargs)
             return result
 
         return self.run_with_retry(_call)
@@ -202,7 +209,11 @@ class GoogleGenAIDriver(BaseDriver):
         tool_calls: list[dict[str, Any]] = []
         text_parts: list[str] = []
         thought = ""
+        truncated = False
         for candidate in getattr(response, "candidates", None) or []:
+            finish = getattr(candidate, "finish_reason", "")
+            if str(getattr(finish, "name", finish)) == "MAX_TOKENS":
+                truncated = True
             content = getattr(candidate, "content", None)
             for part in getattr(content, "parts", None) or []:
                 function_call = getattr(part, "function_call", None)
@@ -234,6 +245,7 @@ class GoogleGenAIDriver(BaseDriver):
             tool_calls=self.normalize_tool_calls(tool_calls),
             token_usage=self.extract_token_usage(token_usage),
             raw=response,
+            truncated=truncated,
         )
 
     def _map_error(self, exc: Exception) -> Exception:

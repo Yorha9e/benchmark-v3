@@ -82,12 +82,23 @@ class OpenAIDriver(BaseDriver):
             if tools:
                 create_kwargs["tools"] = tools
                 create_kwargs["tool_choice"] = kwargs.get("tool_choice", "auto")
+            if "max_completion_tokens" in kwargs:
+                create_kwargs["max_completion_tokens"] = kwargs["max_completion_tokens"]
             try:
                 response = client.chat.completions.create(**create_kwargs)
             except Exception as exc:
                 raise self._map_error(exc) from exc
             result = self.parse_response(response)
             self.account_usage(result.token_usage)
+            if result.truncated and not kwargs.get("_trunc_retry"):
+                # Output budget hit mid-turn (often inside tool-call JSON):
+                # retry once with a doubled budget instead of failing silently.
+                # (This attempt's tokens are already accounted above.)
+                retry_kwargs = dict(kwargs, _trunc_retry=True)
+                retry_kwargs["max_completion_tokens"] = int(
+                    kwargs.get("max_completion_tokens", 8192)
+                ) * 2
+                return self.chat(messages, tools, **retry_kwargs)
             return result
 
         return self.run_with_retry(_call)
@@ -112,12 +123,14 @@ class OpenAIDriver(BaseDriver):
             "total_tokens": getattr(usage, "total_tokens", 0) or 0 if usage else 0,
         }
         token_usage.setdefault("reasoning_tokens", 0)
+        truncated = getattr(choice, "finish_reason", "") == "length"
         return DriverResponse(
             content=message.content or "",
             thought=thought,
             tool_calls=self.normalize_tool_calls(raw_calls),
             token_usage=self.extract_token_usage(token_usage),
             raw=response,
+            truncated=truncated,
         )
 
     def _map_error(self, exc: Exception) -> Exception:

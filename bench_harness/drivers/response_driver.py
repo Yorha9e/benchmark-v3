@@ -200,6 +200,14 @@ class ResponseDriver(BaseDriver):
                 raise self._map_error(exc) from exc
             result = self.parse_response(response)
             self.account_usage(result.token_usage)
+            if result.truncated and not kwargs.get("_trunc_retry"):
+                # Output budget hit mid-turn: retry once with a doubled budget.
+                retry_kwargs = dict(kwargs, _trunc_retry=True)
+                retry_kwargs["max_output_tokens"] = int(
+                    kwargs.get("max_output_tokens", kwargs.get("max_tokens", 8192))
+                ) * 2
+                retry_kwargs.pop("max_tokens", None)
+                return self.chat(messages, tools, **retry_kwargs)
             return result
 
         return self.run_with_retry(_call)
@@ -250,12 +258,15 @@ class ResponseDriver(BaseDriver):
         else:
             token_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         token_usage.setdefault("reasoning_tokens", 0)
+        incomplete = getattr(response, "incomplete_details", None)
+        truncated = getattr(incomplete, "reason", "") == "max_output_tokens"
         return DriverResponse(
             content="\n".join(p for p in text_parts if p),
             thought="\n".join(p for p in thought_parts if p),
             tool_calls=self.normalize_tool_calls(raw_calls),
             token_usage=self.extract_token_usage(token_usage),
             raw=response,
+            truncated=truncated,
         )
 
     def _map_error(self, exc: Exception) -> Exception:
