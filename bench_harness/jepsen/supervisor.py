@@ -253,6 +253,8 @@ class NodeProcess:
                     stderr=subprocess.STDOUT,
                     env=merged_env,
                     text=True,
+                    encoding="utf-8",
+                    errors="replace",
                     **kwargs,
                 )
             self._proc = proc

@@ -52,7 +52,10 @@ def call_gemini_with_retry(
 ) -> dict[str, Any]:
     """调用 Gemini 并解析 functionCall 与文本回复"""
     backoff = 1.0
-    config_args: dict[str, Any] = {"temperature": 0.0}
+    config_args: dict[str, Any] = {
+        "temperature": 0.0,
+        "automatic_function_calling": types.AutomaticFunctionCallingConfig(disable=True),
+    }
     
     if tools:
         config_args["tools"] = convert_json_schema_to_genai_tools(tools)

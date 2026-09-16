@@ -33,6 +33,8 @@ self-tests and offline smoke runs.
 from __future__ import annotations
 
 import json
+import os
+import sys
 import time
 import uuid
 from abc import ABC, abstractmethod
@@ -68,9 +70,77 @@ __all__ = [
 ]
 
 
+#: Hard workspace-boundary notice appended to every suite's initial prompt.
+#: Mirrors the static :func:`_command_escapes_workspace` screen so compliant
+#: models do not burn limited turns on refused calls.
+WORKSPACE_BOUNDARY_NOTICE = (
+    "\n\nWorkspace boundary (hard rule): you may ONLY read, write, and run "
+    "commands inside the current working directory. Paths containing `..`, "
+    "absolute paths (e.g. `/etc/...`, `C:\\...`), home-directory references "
+    "(`~`, `$HOME`), and `file:` URIs are refused with an ERROR and waste one "
+    "of your limited turns. The task is fully self-contained — there is "
+    "nothing useful outside the workspace, do not look for it."
+)
+
+
 def utc_now_iso() -> str:
     """Current UTC time as ``YYYY-MM-DDTHH:MM:SSZ``."""
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+#: Shell metacharacter-adjacent ``..`` segments: ``../``, ``..\``, bare
+#: ``..`` as a path component (``cd ..``, ``cat ../x``). Matched
+#: case-insensitively against the raw command string.
+_PARENT_TRAVERSAL_RE = None  # lazy-compiled (see _command_escapes_workspace)
+
+
+def _command_escapes_workspace(command: str) -> str | None:
+    """Best-effort static screen: does this shell command reach outside cwd?
+
+    Each ``bash`` tool call runs as a fresh, short-lived shell rooted at the
+    task workspace, so per-command screening is sufficient (no persistent
+    ``cd`` state survives between calls). Returns a human-readable reason
+    when the command must be refused, else ``None``.
+
+    Blocked: parent traversal (``..``), absolute POSIX paths, Windows
+    drive/UNC paths, home-directory expansion (``~``, ``$HOME``), and
+    well-known env-var indirection out of the workspace. This is a
+    defense-in-depth screen, not a shell sandbox: exotic bypasses
+    (``$TMPDIR`` tricks, ``/proc`` self-fd games) are out of scope.
+    """
+    import re
+
+    global _PARENT_TRAVERSAL_RE
+    if _PARENT_TRAVERSAL_RE is None:
+        _PARENT_TRAVERSAL_RE = re.compile(
+            r"(^|[\s;|&`$()'\"=<>])\.\.(?=$|[\s;|&`$()'\"=<>/:\\])"
+            r"|[/\\]\.\.(?=$|[/\\])"  # embedded segments: codebase/../../x
+        )
+    text = command or ""
+    if _PARENT_TRAVERSAL_RE.search(text):
+        return "parent-directory traversal (`..`) is not allowed; stay inside the workspace"
+    lowered = text.lower()
+    for marker in ("$home", "${home}", "$userprofile", "%userprofile%", "%home%"):
+        if marker in lowered:
+            return f"home-directory reference ({marker}) is not allowed; stay inside the workspace"
+    if re.search(r"\b(HOME|USERPROFILE)\b", text):
+        return "home-directory reference (HOME/USERPROFILE) is not allowed; stay inside the workspace"
+    # Git escape hatches: re-pointing git at the harness repo would bypass the
+    # GIT_CEILING_DIRECTORIES isolation injected at execution time.
+    if re.search(r"\bgit_ceiling_directories\b|\bgit_dir\b|--git-dir|--work-tree", lowered):
+        return "git repository overrides are not allowed inside the workspace"
+    # `/dev/null`  drains are harmless and idiomatic; exempt before screening.
+    screened = re.sub(r"/dev/null\b", "", text)
+    # Absolute POSIX path, home expansion, or redirect target outside cwd.
+    if re.search(r"(^|[\s;|&`$()'\"=><])(~|/)(?=$|[\s;|&`$()'\"=><]|[\w.~\/])", screened):
+        return "absolute path / home expansion is not allowed; use workspace-relative paths"
+    # Windows drive-letter (C:\, C:/), UNC (\\host) or drive-relative (\dir) paths.
+    if re.search(r"(^|[\s;|&`$()'\"=><])([a-z]:[\\/]|\\\\[\w.]|\\[\w.][\w.]*[\\/])", screened, re.IGNORECASE):
+        return "absolute Windows path is not allowed; use workspace-relative paths"
+    # file: URIs are absolute filesystem references regardless of slashes.
+    if re.search(r"(^|[\s;|&`$()'\"=><])file:(?:[\\/]+|[a-zA-Z]:)", screened, re.IGNORECASE):
+        return "file: URI access outside the workspace is not allowed"
+    return None
 
 
 def mk_milestone(
@@ -309,7 +379,7 @@ class SuiteAdapter(ABC):
         reporter.update(task_id, "running", "prepare: workspace setup")
         workspace = WorkspaceManager(paths.root, "workspace", keep_on_cleanup=True)
         workspace.setup()
-        snapshot = SnapshotManager(workspace.workspace_dir)
+        snapshot = SnapshotManager(paths.root)
         if not resume:
             snapshot.clear()
         elif snapshot.has_snapshot():
@@ -333,10 +403,11 @@ class SuiteAdapter(ABC):
         session_id = f"{self.suite_name}-{task_id}-{uuid.uuid4().hex[:8]}"
         collector = TraceCollector(wire_path=paths.wire_path)
         collector.start_session(session_id, task_id, model_id)
-        snapshot = SnapshotManager(workspace.workspace_dir)
+        snapshot = SnapshotManager(paths.root)
         runner = ProcessRunner(default_timeout=60.0)
 
         prompt = self.build_prompt(task_id, workspace.workspace_dir)
+        prompt = prompt + WORKSPACE_BOUNDARY_NOTICE
         messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
         collector.record_user_turn(prompt)
 
@@ -353,10 +424,8 @@ class SuiteAdapter(ABC):
                     start_turn = int(saved.get("turn_index", 0))
                 except (TypeError, ValueError):
                     start_turn = 0
-                collector.record_user_turn(
-                    f"[resume] replaying stalled turn {start_turn} from snapshot"
-                )
-                reporter.update(task_id, "retry", f"resuming at turn {start_turn}")
+                collector.load_existing_messages(messages)
+                reporter.update(task_id, "retry", f"resuming at turn {start_turn} with full context ({len(messages)} msgs)")
 
         for turn in range(start_turn, self.max_turns):
             # Atomic single-prompt snapshot BEFORE the driver call.
@@ -373,7 +442,11 @@ class SuiteAdapter(ABC):
             try:
                 response = driver.chat(messages, AGENT_TOOLS)
             except Exception as exc:  # driver-level fatal: seal trajectory
-                state.errors.append(f"driver_error: {type(exc).__name__}: {exc}")
+                err_msg = f"driver_error: {type(exc).__name__}: {exc}"
+                state.errors.append(err_msg)
+                reporter.update(task_id, "failed", err_msg, turn=turn)
+                sys.stderr.write(f"\033[31;1m[task-error] {task_id} turn {turn}: {err_msg}\033[0m\n")
+                sys.stderr.flush()
                 break
             usage = BaseDriver.extract_token_usage(response.token_usage)
             state.prompt_tokens += usage.get("prompt_tokens", 0)
@@ -425,6 +498,8 @@ class SuiteAdapter(ABC):
                     for c in response.tool_calls
                 ],
             }
+            if response.thought:
+                assistant_msg["reasoning_content"] = response.thought
             messages.append(assistant_msg)
             for call in response.tool_calls:
                 call_id = str(call.get("id", ""))
@@ -446,6 +521,7 @@ class SuiteAdapter(ABC):
                     {
                         "role": "tool",
                         "tool_call_id": call_id,
+                        "name": tool_name,
                         "content": output,
                     }
                 )
@@ -498,13 +574,32 @@ class SuiteAdapter(ABC):
                 return "OK: edit applied"
             if tool_name == "bash":
                 command = str(arguments.get("command", ""))
+                violation = _command_escapes_workspace(command)
+                if violation is not None:
+                    try:
+                        state.errors.append(f"containment: refused bash ({violation})")
+                    except Exception:
+                        pass
+                    return f"ERROR: {violation}"
                 try:
                     timeout = float(arguments.get("timeout", 30.0) or 30.0)
                 except (TypeError, ValueError):
                     timeout = 30.0
                 timeout = max(1.0, min(timeout, 120.0))
+                # Blind git to the harness repo above the workspace: the ceiling
+                # must be the workspace PARENT (a ceiling equal to cwd does not
+                # stop ascent), so `git log` / `git show <commit>:<path>` cannot
+                # become a read primitive for grading keys outside the sandbox.
+                # NOTE: must be ABSOLUTE — git silently ignores relative
+                # GIT_CEILING_DIRECTORIES entries (the default output layout is
+                # relative, so resolve here, not at the call site).
+                ceiling = str(Path(os.path.abspath(workspace.workspace_dir)).parent)
                 result = runner.run(
-                    command, shell=True, cwd=workspace.workspace_dir, timeout=timeout
+                    command,
+                    shell=True,
+                    cwd=workspace.workspace_dir,
+                    timeout=timeout,
+                    extra_env={"GIT_CEILING_DIRECTORIES": ceiling},
                 )
                 output = (result.stdout or "") + (
                     f"\n[stderr]\n{result.stderr}" if result.stderr else ""

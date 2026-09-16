@@ -246,12 +246,13 @@ def score_audit(
     findings: list[dict[str, Any]] | None,
     codebase: dict[str, str],
     format_ok: bool = True,
+    judge_driver: Any | None = None,
 ) -> dict[str, Any]:
-    """Score parsed findings against ground truth (pure function).
+    """Score parsed findings against ground truth using strict Rubric / Judge model.
 
     ``codebase`` maps filename -> source (used to resolve marker lines).
     Returns ``{recall, bait, depth, format, total, matched, flagged_baits,
-    detail}``. Never raises on ragged input.
+    detail, judge_verdicts, judge_model, provisional}``. Never raises on ragged input.
     """
     findings = findings if isinstance(findings, list) else []
     marker_lines: dict[str, int] = {}
@@ -264,7 +265,7 @@ def score_audit(
         marker_lines[flaw["file"]] = lineno
 
     matched = [False] * len(GROUND_TRUTH)
-    depth_total = 0.0
+    matched_findings: dict[str, dict[str, Any]] = {}
     for finding in findings:
         if not isinstance(finding, dict):
             continue
@@ -272,46 +273,92 @@ def score_audit(
             fline = int(finding.get("line", -1))
         except (TypeError, ValueError):
             continue
+        raw_file = str(finding.get("file", "")).strip().replace("\\", "/")
+        file_name = Path(raw_file).name
         for idx, flaw in enumerate(GROUND_TRUTH):
             if matched[idx]:
                 continue
-            if str(finding.get("file", "")).strip() != flaw["file"]:
+            if file_name != flaw["file"] and raw_file != flaw["file"]:
                 continue
             if abs(fline - marker_lines.get(flaw["file"], 0)) > LINE_TOLERANCE:
                 continue
             if not _category_match(str(finding.get("category", "")), flaw["category_aliases"]):
                 continue
             matched[idx] = True
-            depth_total += _depth_score(finding, flaw["keywords"])
+            matched_findings[flaw["file"]] = finding
             break
 
+    # 提取金标准之外的非主条目以评估酌情加分
+    matched_ids = {id(f) for f in matched_findings.values()}
+    unmatched_candidate_findings = [
+        f for f in findings
+        if isinstance(f, dict)
+        and id(f) not in matched_ids
+        and Path(str(f.get("file", "")).strip().replace("\\", "/")).name not in BAIT_FILES
+    ]
+
+    # 使用独立专家裁判模型 (LLM-as-a-Judge) 或严格 4 级量表启发式复核
+    from benchmark_v3.bench_harness.core.judge import CriticJudgeEvaluator
+
+    judge_evaluator = CriticJudgeEvaluator(judge_driver=judge_driver)
+    depth_res = judge_evaluator.evaluate_findings_depth(matched_findings)
+    depth_total = depth_res["total_depth"]
+
+    novel_res = judge_evaluator.evaluate_novel_findings(unmatched_candidate_findings, codebase)
+    novel_bonus = novel_res["bonus_total"]
+    novel_verdicts = novel_res["novel_verdicts"]
+
     recall = sum(matched) * POINTS_PER_FLAW
+
+    def _is_defect_claim(f: dict[str, Any]) -> bool:
+        sev = str(f.get("severity", "")).strip().lower()
+        cat = str(f.get("category", "")).strip().lower()
+        if sev in ("low", "medium", "high", "critical"):
+            return True
+        if any(k in cat for k in ("vuln", "bug", "defect", "overflow", "race", "collision", "security", "error", "flaw")):
+            return True
+        return False
+
     flagged_baits = sorted(
         {
-            str(f.get("file", "")).strip()
+            Path(str(f.get("file", "")).strip().replace("\\", "/")).name
             for f in findings
-            if isinstance(f, dict) and str(f.get("file", "")).strip() in BAIT_FILES
+            if isinstance(f, dict)
+            and Path(str(f.get("file", "")).strip().replace("\\", "/")).name in BAIT_FILES
+            and _is_defect_claim(f)
         }
     )
     bait = max(0.0, BAIT_POINTS - len(flagged_baits) * POINTS_PER_BAIT)
     fmt = FORMAT_POINTS if format_ok else 0.0
+    total = min(100.0, round(recall + bait + depth_total + fmt + novel_bonus, 2))
     return {
         "recall": round(recall, 2),
         "bait": round(bait, 2),
         "depth": round(depth_total, 2),
         "format": round(fmt, 2),
-        "total": round(recall + bait + depth_total + fmt, 2),
+        "novel_bonus": round(novel_bonus, 2),
+        "novel_verdicts": novel_verdicts,
+        "total": total,
         "matched": sum(matched),
         "flagged_baits": flagged_baits,
-        "detail": "matched %d/4 flaws; baits flagged=%r" % (sum(matched), flagged_baits),
+        "judge_verdicts": depth_res.get("verdicts", {}),
+        "judge_model": depth_res.get("judge_model", "unknown"),
+        "provisional": depth_res.get("provisional", False),
+        "detail": "matched %d/4 flaws (depth=%.1f/20 [%s], bonus=+%.1f); baits flagged=%r" % (
+            sum(matched), depth_total, depth_res.get("judge_model", ""), novel_bonus, flagged_baits
+        ),
     }
 
 
 class CriticSuite(SuiteAdapter):
-    """Blind-audit critic with anti-hallucination bait protection."""
+    """Blind-audit critic with anti-hallucination bait protection and expert judge."""
 
     suite_name = "critic"
     TASK_IDS = ("audit_bundle",)
+
+    def __init__(self, judge_driver: Any | None = None) -> None:
+        super().__init__()
+        self.judge_driver = judge_driver
 
     def describe_task(self, task_id: str) -> dict[str, Any]:
         return {
@@ -404,7 +451,26 @@ class CriticSuite(SuiteAdapter):
             else src
             for name, src in FIXTURES.items()
         }
-        scores = score_audit(findings, codebase, format_ok=format_ok)
+        scores = score_audit(findings, codebase, format_ok=format_ok, judge_driver=self.judge_driver)
+        if "judge_verdicts" in scores:
+            try:
+                (workspace_dir / "judge_verdict.json").write_text(
+                    json.dumps(
+                        {
+                            "judge_model": scores.get("judge_model"),
+                            "provisional": scores.get("provisional"),
+                            "total_depth": scores.get("depth"),
+                            "novel_bonus": scores.get("novel_bonus", 0.0),
+                            "novel_verdicts": scores.get("novel_verdicts", []),
+                            "verdicts": scores.get("judge_verdicts"),
+                        },
+                        indent=2,
+                        ensure_ascii=False,
+                    ),
+                    encoding="utf-8",
+                )
+            except OSError:
+                pass
         if refusal:
             # Tag distinctly; a refusal carries no functional evidence.
             scores = {**scores, "recall": 0.0, "depth": 0.0,

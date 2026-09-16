@@ -1,1 +1,8 @@
 references/repos/
+
+# Local Benchmark TUI Profiles & Run Artifacts (Never commit keys)
+.bench_profiles.json
+bench_runs/
+datasets/
+LATEST_SUMMARY.md
+.bench_judge.json

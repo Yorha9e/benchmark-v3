@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import platform
 import random
 import time
 import uuid
@@ -9,6 +11,19 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
+
+#: Official client User-Agent identifying the SubagentBenchmark Harness.
+DEFAULT_USER_AGENT = os.environ.get(
+    "BENCH_USER_AGENT",
+    f"SubagentBenchmark-Harness/3.0.0 ({platform.system()} {platform.release()}; {platform.machine()}) Python/{platform.python_version()}",
+)
+
+#: Standard professional client headers.
+DEFAULT_HEADERS: dict[str, str] = {
+    "User-Agent": DEFAULT_USER_AGENT,
+    "X-Benchmark-Harness": "SubagentBenchmark/3.0.0",
+    "Accept": "application/json, text/event-stream, */*",
+}
 
 #: HTTP statuses treated as transient (SPEC v3 Section 4).
 TRANSIENT_STATUS_CODES = frozenset({408, 425, 429, 500, 502, 503, 504})
@@ -76,14 +91,17 @@ class BaseDriver(ABC):
         model_id: str,
         api_key: str | None = None,
         base_url: str | None = None,
+        effort: str | None = None,
         max_retries: int = 5,
         base_backoff: float = 1.0,
         max_backoff: float = 60.0,
         sleep_fn: Callable[[float], None] | None = None,
+        **kwargs: Any,
     ) -> None:
         self.model_id = model_id
         self.api_key = api_key
         self.base_url = base_url
+        self.effort = effort.lower() if isinstance(effort, str) else None
         self.max_retries = max_retries
         self.base_backoff = base_backoff
         self.max_backoff = max_backoff
@@ -117,25 +135,42 @@ class BaseDriver(ABC):
 
     def run_with_retry(self, func: Callable[[], DriverResponse]) -> DriverResponse:
         """Execute ``func`` with adaptive retry; tracks ``retry_count``."""
+        import sys
+
         last_error: Exception | None = None
         for attempt in range(self.max_retries):
             try:
                 return func()
-            except PermanentDriverError:
+            except PermanentDriverError as exc:
+                sys.stderr.write(f"\033[31;1m[driver-error] Fatal {type(exc).__name__}: {exc}\033[0m\n")
+                sys.stderr.flush()
                 raise
             except TransientDriverError as exc:
                 last_error = exc
+                self.retry_count += 1
+                delay = self.compute_backoff(attempt, exc.retry_after)
+                status_str = f"HTTP {exc.status_code} " if exc.status_code else ""
+                sys.stderr.write(
+                    f"\033[33;1m[retry {attempt+1}/{self.max_retries}] {status_str}{type(exc).__name__}: {exc} -> sleeping {delay:.1f}s...\033[0m\n"
+                )
+                sys.stderr.flush()
                 if attempt == self.max_retries - 1:
                     break
-                self.retry_count += 1
-                self.sleep_fn(self.compute_backoff(attempt, exc.retry_after))
+                self.sleep_fn(delay)
             except Exception as exc:  # network-level surprises: retry by default
                 last_error = exc
+                self.retry_count += 1
+                delay = self.compute_backoff(attempt)
+                sys.stderr.write(
+                    f"\033[33;1m[retry {attempt+1}/{self.max_retries}] {type(exc).__name__}: {exc} -> sleeping {delay:.1f}s...\033[0m\n"
+                )
+                sys.stderr.flush()
                 if attempt == self.max_retries - 1:
                     break
-                self.retry_count += 1
-                self.sleep_fn(self.compute_backoff(attempt))
+                self.sleep_fn(delay)
         assert last_error is not None
+        sys.stderr.write(f"\033[31;1m[driver-error] Exhausted {self.max_retries} retries. Final failure: {last_error}\033[0m\n")
+        sys.stderr.flush()
         raise last_error
 
     # -- shared helpers --------------------------------------------------------

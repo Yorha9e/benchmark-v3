@@ -12,6 +12,7 @@ import os
 from typing import Any
 
 from benchmark_v3.bench_harness.drivers.base import (
+    DEFAULT_HEADERS,
     BaseDriver,
     DriverResponse,
     PermanentDriverError,
@@ -27,11 +28,12 @@ class OpenAIDriver(BaseDriver):
         model_id: str,
         api_key: str | None = None,
         base_url: str | None = None,
+        effort: str | None = None,
         temperature: float = 0.0,
         client: Any | None = None,
         **kwargs: Any,
     ) -> None:
-        super().__init__(model_id, api_key=api_key, base_url=base_url, **kwargs)
+        super().__init__(model_id, api_key=api_key, base_url=base_url, effort=effort, **kwargs)
         self.temperature = temperature
         self._client = client
 
@@ -39,12 +41,22 @@ class OpenAIDriver(BaseDriver):
         if self._client is not None:
             return self._client
         try:
+            import httpx
             from openai import OpenAI
         except ImportError as exc:
             raise PermanentDriverError(f"openai SDK not installed: {exc}") from exc
+
+        proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY") or os.environ.get("https_proxy") or os.environ.get("http_proxy")
+        http_client = httpx.Client(
+            headers=dict(DEFAULT_HEADERS),
+            proxy=proxy,
+            timeout=httpx.Timeout(120.0, connect=30.0),
+        )
         self._client = OpenAI(
             api_key=self.api_key or os.environ.get("OPENAI_API_KEY", "mock-key"),
             base_url=self.base_url or os.environ.get("OPENAI_BASE_URL"),
+            http_client=http_client,
+            default_headers=dict(DEFAULT_HEADERS),
             max_retries=0,  # retries managed by the harness
         )
         return self._client
@@ -62,6 +74,11 @@ class OpenAIDriver(BaseDriver):
                 "messages": messages,
                 "temperature": kwargs.get("temperature", self.temperature),
             }
+            eff = kwargs.get("reasoning_effort", kwargs.get("effort", self.effort))
+            if eff and eff not in ("none", "off", "disabled"):
+                openai_effort = "high" if eff in ("xhigh", "max") else eff
+                create_kwargs["reasoning_effort"] = openai_effort
+                create_kwargs.pop("temperature", None)
             if tools:
                 create_kwargs["tools"] = tools
                 create_kwargs["tool_choice"] = kwargs.get("tool_choice", "auto")

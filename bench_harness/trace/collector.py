@@ -204,6 +204,66 @@ class TraceCollector:
 
     # -- ingestion ----------------------------------------------------------
 
+    def load_existing_messages(self, messages: list[dict[str, Any]]) -> None:
+        """Reconstitute prior turns from messages list on session resume.
+
+        Ensures that when resuming from an interrupted turn, the exported
+        trajectory and fine-tuning datasets contain the complete multi-turn
+        history from turn 0, including all past thinking chains and tool outputs.
+        """
+        self._require_session()
+        for m in messages:
+            role = m.get("role")
+            if role == "user":
+                self._turns.append(
+                    TrajectoryTurn(
+                        turn_index=len(self._turns),
+                        role="user",
+                        content=str(m.get("content") or ""),
+                    )
+                )
+            elif role == "assistant":
+                thought = str(m.get("reasoning_content") or m.get("thought") or "")
+                raw_calls = m.get("tool_calls", [])
+                calls: list[ToolCallRecord] = []
+                for tc in raw_calls:
+                    fn = tc.get("function", {})
+                    args = fn.get("arguments", {})
+                    if isinstance(args, str):
+                        try:
+                            args = json.loads(args)
+                        except Exception:
+                            args = {}
+                    calls.append(
+                        ToolCallRecord(
+                            call_id=str(tc.get("id", "")),
+                            tool_name=str(fn.get("name", "")),
+                            arguments=args if isinstance(args, dict) else {},
+                        )
+                    )
+                self._turns.append(
+                    TrajectoryTurn(
+                        turn_index=len(self._turns),
+                        role="assistant",
+                        content=str(m.get("content") or ""),
+                        thought=thought,
+                        tool_calls=calls,
+                    )
+                )
+            elif role == "tool":
+                res = ToolResultRecord(
+                    call_id=str(m.get("tool_call_id", "")),
+                    tool_name=str(m.get("name", "")),
+                    stdout=str(m.get("content") or ""),
+                )
+                self._turns.append(
+                    TrajectoryTurn(
+                        turn_index=len(self._turns),
+                        role="tool",
+                        tool_results=[res],
+                    )
+                )
+
     def record_user_turn(self, content: str) -> TrajectoryTurn:
         """Record a ``user`` turn and return it."""
         self._require_session()

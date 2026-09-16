@@ -105,3 +105,163 @@ class ReportManager:
                     flags[i] = False
                     break
         return flags
+
+
+LEADERBOARD_JSON_PATH = Path("bench_runs/leaderboard.json")
+LEADERBOARD_MD_PATH = Path("LEADERBOARD.md")
+
+
+class MasterLeaderboard:
+    """Persistent cross-model master leaderboard manager.
+
+    Maintains `bench_runs/leaderboard.json` and automatically updates
+    the human-readable `LEADERBOARD.md` in the repository root.
+    """
+
+    @classmethod
+    def load_data(cls) -> dict[str, Any]:
+        import json
+        if not LEADERBOARD_JSON_PATH.is_file():
+            return {}
+        try:
+            data = json.loads(LEADERBOARD_JSON_PATH.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    @classmethod
+    def save_data(cls, data: dict[str, Any]) -> None:
+        LEADERBOARD_JSON_PATH.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_json(LEADERBOARD_JSON_PATH, data)
+
+    @classmethod
+    def update_leaderboard(
+        cls,
+        reports: list[EvaluationReport],
+        model_id: str,
+        driver: str,
+        effort: str | None = None,
+        output_dir: Path | None = None,
+        wall_time: float = 0.0,
+    ) -> Path:
+        """Update the master leaderboard with the latest completed run."""
+        if not reports:
+            return LEADERBOARD_MD_PATH
+
+        all_milestones = [m for r in reports for m in r.milestones]
+        total_ms = len(all_milestones)
+        passed_ms = sum(1 for m in all_milestones if m.passed)
+        ms_pct = (passed_ms / total_ms * 100.0) if total_ms else 0.0
+
+        # 归一化综合能力得分 (0~100)
+        norm_scores = [
+            r.final_reward if r.task_id == "audit_bundle" else r.final_reward * 100.0
+            for r in reports
+        ]
+        capability_idx = (sum(norm_scores) / len(norm_scores)) if norm_scores else 0.0
+
+        # 分维度提取均分
+        critic_r = next((r for r in reports if r.task_id == "audit_bundle"), None)
+        critic_score = f"{critic_r.final_reward:.1f}" if critic_r else "-"
+
+        rev_rs = [r for r in reports if r.task_id in ("lock_ordering", "api_drift", "bait_guard")]
+        rev_score = f"{(sum(r.final_reward for r in rev_rs) / len(rev_rs)):.2f}" if rev_rs else "-"
+
+        short_rs = [r for r in reports if r.task_id in ("varint_parser", "timing_wheel", "lexer_state_machine")]
+        short_score = f"{(sum(r.final_reward for r in short_rs) / len(short_rs)):.2f}" if short_rs else "-"
+
+        long_rs = [r for r in reports if r.task_id in ("raft_cluster", "saga_coordinator")]
+        long_score = f"{(sum(r.final_reward for r in long_rs) / len(long_rs)):.2f}" if long_rs else "-"
+
+        total_tokens = sum(r.token_metrics.total_tokens for r in reports)
+
+        entry_key = f"{model_id}@{effort or 'default'}"
+        entry = {
+            "model_id": model_id,
+            "driver": driver,
+            "effort": effort or "default",
+            "capability_index": round(capability_idx, 1),
+            "scoring_points_passed": passed_ms,
+            "scoring_points_total": total_ms,
+            "scoring_points_pct": round(ms_pct, 1),
+            "critic_score": critic_score,
+            "reviewer_score": rev_score,
+            "short_score": short_score,
+            "long_score": long_score,
+            "total_tokens": total_tokens,
+            "wall_time_seconds": round(wall_time, 1),
+            "run_dir": str(output_dir) if output_dir else "",
+            "updated_at": _utc_now_iso(),
+        }
+
+        data = cls.load_data()
+        data[entry_key] = entry
+        cls.save_data(data)
+
+        # 重新生成 LEADERBOARD.md
+        cls.export_markdown(data)
+        return LEADERBOARD_MD_PATH
+
+    @classmethod
+    def export_markdown(cls, data: dict[str, Any] | None = None) -> str:
+        data = data if data is not None else cls.load_data()
+        entries = list(data.values())
+
+        # 排序规则：综合能力指数降序 -> 评分点通过率降序 -> Token 消耗升序 (帕累托高效优先)
+        sorted_entries = sorted(
+            entries,
+            key=lambda x: (
+                x.get("capability_index", 0.0),
+                x.get("scoring_points_pct", 0.0),
+                -x.get("total_tokens", 0),
+            ),
+            reverse=True,
+        )
+
+        medals = ["👑 1", "🥈 2", "🥉 3"]
+        now_str = _utc_now_iso()
+
+        lines = [
+            "# 🏆 Benchmark v3 全维度权威榜单 (Master Leaderboard)",
+            "",
+            f"> **最新更新**: `{now_str}`  ",
+            "> **全量评测维度**: 次世代短任务(30点) · 次世代长任务(20点) · Reviewer调试(12点) · Critic盲审(4点) = **共 66 细粒度评分点**  ",
+            "> **排序规则**: 综合能力指数降序 ➔ 全量评分点通过率降序 ➔ Token 消耗升序 (性价比帕累托优先)",
+            "",
+            "| 排名 | 模型标识 (Model ID) | 驱动 / 思考强度 (Driver / Effort) | 综合能力指数 | 全量评分点通过率 (66点) | Critic 盲审 | Reviewer 调试 | 短任务微引擎 | 长任务混沌 | 总 Token 消耗 | 耗时 | 制品追溯 |",
+            "| :---: | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | ---: | ---: | :---: |",
+        ]
+
+        for i, item in enumerate(sorted_entries):
+            rank_str = medals[i] if i < len(medals) else str(i + 1)
+            m_id = item.get("model_id", "unknown")
+            drv = item.get("driver", "openai")
+            eff = item.get("effort", "default")
+            cap = item.get("capability_index", 0.0)
+            pts_p = item.get("scoring_points_passed", 0)
+            pts_t = item.get("scoring_points_total", 66)
+            pts_pct = item.get("scoring_points_pct", 0.0)
+            c_sc = item.get("critic_score", "-")
+            rev_sc = item.get("reviewer_score", "-")
+            sh_sc = item.get("short_score", "-")
+            lg_sc = item.get("long_score", "-")
+            tokens = item.get("total_tokens", 0)
+            wt = item.get("wall_time_seconds", 0.0)
+            r_dir = item.get("run_dir", "")
+            link = f"[查看日志]({r_dir})" if r_dir else "-"
+
+            lines.append(
+                f"| {rank_str} | **`{m_id}`** | `{drv}` · `{eff}` | **`{cap:.1f} / 100`** | **`{pts_p}/{pts_t}`** (`{pts_pct:.1f}%`) | `{c_sc}` | `{rev_sc}` | `{sh_sc}` | `{lg_sc}` | `{tokens:,}` | `{wt:.1f}s` | {link} |"
+            )
+
+        lines.append("")
+        lines.append("---")
+        lines.append("*由 Benchmark v3 自动化轻量 Harness 驱动，每次评测完成自动增量对齐落盘。*")
+        lines.append("")
+
+        md_content = "\n".join(lines)
+        try:
+            LEADERBOARD_MD_PATH.write_text(md_content, encoding="utf-8")
+        except OSError:
+            pass
+        return md_content

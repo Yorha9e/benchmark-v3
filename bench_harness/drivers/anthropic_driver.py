@@ -11,6 +11,7 @@ import os
 from typing import Any
 
 from benchmark_v3.bench_harness.drivers.base import (
+    DEFAULT_HEADERS,
     BaseDriver,
     DriverResponse,
     PermanentDriverError,
@@ -25,11 +26,13 @@ class AnthropicDriver(BaseDriver):
         self,
         model_id: str,
         api_key: str | None = None,
+        base_url: str | None = None,
+        effort: str | None = None,
         client: Any | None = None,
         max_tokens: int = 4096,
         **kwargs: Any,
     ) -> None:
-        super().__init__(model_id, api_key=api_key, **kwargs)
+        super().__init__(model_id, api_key=api_key, base_url=base_url, effort=effort, **kwargs)
         self.max_tokens = max_tokens
         self._client = client
 
@@ -37,11 +40,22 @@ class AnthropicDriver(BaseDriver):
         if self._client is not None:
             return self._client
         try:
+            import httpx
             from anthropic import Anthropic
         except ImportError as exc:
             raise PermanentDriverError(f"anthropic SDK not installed: {exc}") from exc
+
+        proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY") or os.environ.get("https_proxy") or os.environ.get("http_proxy")
+        http_client = httpx.Client(
+            headers=dict(DEFAULT_HEADERS),
+            proxy=proxy,
+            timeout=httpx.Timeout(120.0, connect=30.0),
+        )
         self._client = Anthropic(
             api_key=self.api_key or os.environ.get("ANTHROPIC_API_KEY", "mock-key"),
+            base_url=self.base_url or os.environ.get("ANTHROPIC_BASE_URL"),
+            http_client=http_client,
+            default_headers=dict(DEFAULT_HEADERS),
             max_retries=0,  # retries managed by the harness
         )
         return self._client
@@ -62,6 +76,70 @@ class AnthropicDriver(BaseDriver):
             )
         return converted
 
+    @staticmethod
+    def convert_messages(messages: list[dict[str, Any]]) -> tuple[str, list[dict[str, Any]]]:
+        """Convert standard messages into Anthropic (system_prompt, messages).
+
+        Preserves:
+        - System prompt extraction to top-level parameter
+        - Claude 3.7 Thinking blocks in assistant turns
+        - Tool use and tool results blocks
+        """
+        import json
+        system_parts: list[str] = []
+        anthropic_msgs: list[dict[str, Any]] = []
+
+        for m in messages:
+            role = m.get("role", "user")
+            content = m.get("content")
+            tool_calls = m.get("tool_calls", [])
+            reasoning = m.get("reasoning_content") or m.get("thought", "")
+
+            if role == "system":
+                if content:
+                    system_parts.append(str(content))
+                continue
+
+            if role == "assistant":
+                content_blocks: list[dict[str, Any]] = []
+                # 回传思考链 (Anthropic 严格要求保留 thinking block)
+                if reasoning:
+                    content_blocks.append({"type": "thinking", "thinking": str(reasoning)})
+                if content:
+                    content_blocks.append({"type": "text", "text": str(content)})
+                for tc in tool_calls:
+                    fn = tc.get("function", {})
+                    args = fn.get("arguments", {})
+                    if isinstance(args, str):
+                        try:
+                            args = json.loads(args)
+                        except Exception:
+                            args = {}
+                    content_blocks.append({
+                        "type": "tool_use",
+                        "id": str(tc.get("id", "")),
+                        "name": str(fn.get("name", "")),
+                        "input": args if isinstance(args, dict) else {},
+                    })
+                anthropic_msgs.append({"role": "assistant", "content": content_blocks})
+
+            elif role == "tool":
+                tool_result_block = {
+                    "type": "tool_result",
+                    "tool_use_id": str(m.get("tool_call_id", "")),
+                    "content": str(content or ""),
+                }
+                # Anthropic 规定上一轮并发的所有 tool_result 必须合并在同一个 user 消息中
+                if anthropic_msgs and anthropic_msgs[-1]["role"] == "user" and isinstance(anthropic_msgs[-1]["content"], list):
+                    anthropic_msgs[-1]["content"].append(tool_result_block)
+                else:
+                    anthropic_msgs.append({"role": "user", "content": [tool_result_block]})
+
+            elif role == "user":
+                anthropic_msgs.append({"role": "user", "content": str(content or "")})
+
+        return "\n\n".join(system_parts), anthropic_msgs
+
     def chat(
         self,
         messages: list[dict[str, Any]],
@@ -71,17 +149,28 @@ class AnthropicDriver(BaseDriver):
     ) -> DriverResponse:
         def _call() -> DriverResponse:
             client = self._get_client()
+            sys_prompt, converted_msgs = self.convert_messages(messages)
             create_kwargs: dict[str, Any] = {
                 "model": self.model_id,
-                "messages": messages,
+                "messages": converted_msgs,
                 "max_tokens": kwargs.get("max_tokens", self.max_tokens),
             }
-            system = kwargs.get("system", system_prompt)
-            if system:
-                create_kwargs["system"] = system
+            effective_system = kwargs.get("system", system_prompt) or sys_prompt
+            if effective_system:
+                create_kwargs["system"] = effective_system
             converted = self.convert_tools(tools)
             if converted:
                 create_kwargs["tools"] = converted
+
+            eff = kwargs.get("thinking_effort", kwargs.get("effort", self.effort))
+            if eff and eff not in ("none", "off", "disabled"):
+                budget_map = {"low": 2048, "medium": 8192, "high": 16384, "xhigh": 32768, "max": 64000}
+                budget = budget_map.get(eff, 8192)
+                create_kwargs["thinking"] = {"type": "enabled", "budget_tokens": budget}
+                current_max = create_kwargs.get("max_tokens", self.max_tokens)
+                create_kwargs["max_tokens"] = max(current_max, budget + 4096)
+                create_kwargs.pop("temperature", None)
+
             try:
                 response = client.messages.create(**create_kwargs)
             except Exception as exc:
