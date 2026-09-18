@@ -12,8 +12,10 @@ Protocol notes (openai SDK >= 1.x, ``responses.create``):
 - ``tools`` use the flat Responses shape
   ``{"type": "function", "name": ..., "description": ..., "parameters": ...}``
   (no ``function`` wrapper unlike Chat Completions).
-- Reasoning budget is ``reasoning={"effort": ...}``; reasoning models reject
-  ``temperature``, which is dropped whenever an effort level is active.
+- Reasoning budget is ``reasoning={"effort": ...}`` with the official enum
+  ``none | minimal | low | medium | high | xhigh | max`` (pass-through).
+  Reasoning models reject ``temperature``, which is dropped whenever an
+  effort level is active.
 - Token budget is ``max_output_tokens`` (``max_tokens`` from callers is
   translated automatically).
 """
@@ -25,23 +27,21 @@ import os
 from typing import Any
 
 from benchmark_v3.bench_harness.drivers.base import (
+    DEFAULT_HEADERS,
     BaseDriver,
     DriverResponse,
     PermanentDriverError,
     TransientDriverError,
+    build_httpx_client,
+    env_proxy,
+    httpx_timeout,
 )
-
-#: Harness effort -> Responses reasoning effort mapping.
-#: The Responses API only accepts low/medium/high (plus minimal on some
-#: tiers); xhigh/max saturate at high, mirroring OpenAIDriver behaviour.
-_EFFORT_MAP = {
-    "low": "low",
-    "medium": "medium",
-    "high": "high",
-    "xhigh": "high",
-    "max": "high",
-}
-
+from benchmark_v3.bench_harness.drivers.effort import responses_reasoning_param
+from benchmark_v3.bench_harness.drivers.stream import (
+    finalize_responses_stream,
+    is_stream_unsupported,
+    looks_like_responses_object,
+)
 
 class ResponseDriver(BaseDriver):
     """Driver for the OpenAI Responses API (``client.responses.create``).
@@ -71,10 +71,15 @@ class ResponseDriver(BaseDriver):
             from openai import OpenAI
         except ImportError as exc:
             raise PermanentDriverError(f"openai SDK not installed: {exc}") from exc
+        timeout = httpx_timeout()
+        http_client = build_httpx_client(env_proxy())
         self._client = OpenAI(
             api_key=self.api_key or os.environ.get("OPENAI_API_KEY", "mock-key"),
             base_url=self.base_url or os.environ.get("OPENAI_BASE_URL"),
-            max_retries=0,
+            http_client=http_client,
+            timeout=timeout,
+            default_headers=dict(DEFAULT_HEADERS),
+            max_retries=0,  # retries managed by the harness
         )
         return self._client
 
@@ -160,12 +165,9 @@ class ResponseDriver(BaseDriver):
         return converted
 
     def _reasoning_param(self, kwargs: dict[str, Any]) -> dict[str, Any] | None:
-        eff = kwargs.get("reasoning_effort", kwargs.get("effort", self.effort))
-        if isinstance(eff, str):
-            eff = eff.lower()
-        if not eff or eff in ("none", "off", "disabled", "default"):
-            return None
-        return {"effort": _EFFORT_MAP.get(eff, "medium")}
+        return responses_reasoning_param(
+            kwargs.get("reasoning_effort", kwargs.get("effort", self.effort))
+        )
 
     def chat(
         self,
@@ -195,7 +197,7 @@ class ResponseDriver(BaseDriver):
             elif "max_tokens" in kwargs:
                 create_kwargs["max_output_tokens"] = kwargs["max_tokens"]
             try:
-                response = client.responses.create(**create_kwargs)
+                response = self._create_response(client, create_kwargs)
             except Exception as exc:
                 raise self._map_error(exc) from exc
             result = self.parse_response(response)
@@ -211,6 +213,26 @@ class ResponseDriver(BaseDriver):
             return result
 
         return self.run_with_retry(_call)
+
+    def _create_response(self, client: Any, create_kwargs: dict[str, Any]) -> Any:
+        """Prefer Responses SSE; assemble to the same object parse_response expects."""
+        responses = client.responses
+        stream_fn = getattr(responses, "stream", None)
+        if callable(stream_fn):
+            try:
+                return finalize_responses_stream(stream_fn(**create_kwargs))
+            except Exception as exc:
+                if not is_stream_unsupported(exc):
+                    raise
+        try:
+            raw = responses.create(**{**create_kwargs, "stream": True})
+        except Exception as exc:
+            if is_stream_unsupported(exc):
+                return responses.create(**create_kwargs)
+            raise
+        if looks_like_responses_object(raw):
+            return raw
+        return finalize_responses_stream(raw)
 
     def parse_response(self, response: Any) -> DriverResponse:
         text_parts: list[str] = []
@@ -274,3 +296,49 @@ class ResponseDriver(BaseDriver):
         if status is not None:
             return self.classify_http_error(status, str(exc))
         return TransientDriverError(f"{type(exc).__name__}: {exc}")
+
+
+def self_test() -> tuple[int, int]:
+    from types import SimpleNamespace
+
+    counts = [0, 0]
+
+    def check(name: str, cond: bool) -> None:
+        counts[0 if cond else 1] += 1
+        print(f"{'PASS' if cond else 'FAIL'} response_driver::{name}", flush=True)
+
+    class _Mgr:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def get_final_response(self):
+            return SimpleNamespace(
+                output=[SimpleNamespace(
+                    type="message",
+                    content=[SimpleNamespace(type="output_text", text="pong")],
+                )],
+                output_text="pong",
+                usage=SimpleNamespace(input_tokens=1, output_tokens=1, total_tokens=2),
+                incomplete_details=None,
+            )
+
+    class _Responses:
+        def stream(self, **kwargs):
+            return _Mgr()
+
+        def create(self, **kwargs):
+            raise AssertionError("non-stream create should not run")
+
+    driver = ResponseDriver("mock", client=SimpleNamespace(responses=_Responses()))
+    result = driver.chat([{"role": "user", "content": "hi"}])
+    check("stream_text", result.content == "pong")
+    check("stream_tokens", result.total_tokens == 2)
+    return counts[0], counts[1]
+
+
+if __name__ == "__main__":
+    passed, failed = self_test()
+    raise SystemExit(0 if failed == 0 else 1)

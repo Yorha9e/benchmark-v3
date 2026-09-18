@@ -1,5 +1,9 @@
 # Reviewer Benchmark Package
 
+> **过渡期标注**：本目录是 `benchmark_v3/` 内保留的对照包，供过渡期并行评测。  
+> v3 独立项目的评测入口是 `bench_harness/`（`bench-run` / TUI），**不读取本目录**。  
+> 不要改动本目录之外的旧包。
+
 这是一个可复用的 Reviewer benchmark 静态包，供后续模型执行 B11 `dependency_layers.py` 初步 debug 任务。包内分为公开测试材料和 controller 侧隐藏评分资产，不包含任何历史模型运行结果或排行榜。
 
 ## 目录结构

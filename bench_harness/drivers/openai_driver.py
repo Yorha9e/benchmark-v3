@@ -17,6 +17,14 @@ from benchmark_v3.bench_harness.drivers.base import (
     DriverResponse,
     PermanentDriverError,
     TransientDriverError,
+    build_httpx_client,
+    env_proxy,
+    httpx_timeout,
+)
+from benchmark_v3.bench_harness.drivers.effort import openai_reasoning_effort
+from benchmark_v3.bench_harness.drivers.stream import (
+    assemble_chat_completion,
+    is_stream_unsupported,
 )
 
 
@@ -41,21 +49,17 @@ class OpenAIDriver(BaseDriver):
         if self._client is not None:
             return self._client
         try:
-            import httpx
             from openai import OpenAI
         except ImportError as exc:
             raise PermanentDriverError(f"openai SDK not installed: {exc}") from exc
 
-        proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY") or os.environ.get("https_proxy") or os.environ.get("http_proxy")
-        http_client = httpx.Client(
-            headers=dict(DEFAULT_HEADERS),
-            proxy=proxy,
-            timeout=httpx.Timeout(120.0, connect=30.0),
-        )
+        timeout = httpx_timeout()
+        http_client = build_httpx_client(env_proxy())
         self._client = OpenAI(
             api_key=self.api_key or os.environ.get("OPENAI_API_KEY", "mock-key"),
             base_url=self.base_url or os.environ.get("OPENAI_BASE_URL"),
             http_client=http_client,
+            timeout=timeout,
             default_headers=dict(DEFAULT_HEADERS),
             max_retries=0,  # retries managed by the harness
         )
@@ -74,10 +78,11 @@ class OpenAIDriver(BaseDriver):
                 "messages": messages,
                 "temperature": kwargs.get("temperature", self.temperature),
             }
-            eff = kwargs.get("reasoning_effort", kwargs.get("effort", self.effort))
-            if eff and eff not in ("none", "off", "disabled"):
-                openai_effort = "high" if eff in ("xhigh", "max") else eff
-                create_kwargs["reasoning_effort"] = openai_effort
+            eff = openai_reasoning_effort(
+                kwargs.get("reasoning_effort", kwargs.get("effort", self.effort))
+            )
+            if eff is not None:
+                create_kwargs["reasoning_effort"] = eff
                 create_kwargs.pop("temperature", None)
             if tools:
                 create_kwargs["tools"] = tools
@@ -85,10 +90,10 @@ class OpenAIDriver(BaseDriver):
             if "max_completion_tokens" in kwargs:
                 create_kwargs["max_completion_tokens"] = kwargs["max_completion_tokens"]
             try:
-                response = client.chat.completions.create(**create_kwargs)
+                response = self._create_completion(client, create_kwargs)
             except Exception as exc:
                 raise self._map_error(exc) from exc
-            result = self.parse_response(response)
+            result = self.parse_response(assemble_chat_completion(response))
             self.account_usage(result.token_usage)
             if result.truncated and not kwargs.get("_trunc_retry"):
                 # Output budget hit mid-turn (often inside tool-call JSON):
@@ -102,6 +107,28 @@ class OpenAIDriver(BaseDriver):
             return result
 
         return self.run_with_retry(_call)
+
+    def _create_completion(self, client: Any, create_kwargs: dict[str, Any]) -> Any:
+        """Prefer SSE streaming; fall back only when the gateway rejects stream."""
+        create = client.chat.completions.create
+        attempts: list[dict[str, Any]] = [
+            {**create_kwargs, "stream": True, "stream_options": {"include_usage": True}},
+            {**create_kwargs, "stream": True},
+        ]
+        last_exc: Exception | None = None
+        for kwargs in attempts:
+            try:
+                return create(**kwargs)
+            except Exception as exc:
+                last_exc = exc
+                if not is_stream_unsupported(exc):
+                    raise
+        try:
+            return create(**create_kwargs)
+        except Exception:
+            if last_exc is not None:
+                raise last_exc
+            raise
 
     def parse_response(self, response: Any) -> DriverResponse:
         choice = response.choices[0]
@@ -154,3 +181,64 @@ class OpenAIDriver(BaseDriver):
         """Build the ``role="tool"`` message returning a tool result."""
         _ = tool_name  # kept for interface symmetry; ChatCompletions keys on the call id
         return {"role": "tool", "tool_call_id": tool_call_id, "content": result_content}
+
+
+def self_test() -> tuple[int, int]:
+    from types import SimpleNamespace
+
+    counts = [0, 0]
+
+    def check(name: str, cond: bool) -> None:
+        counts[0 if cond else 1] += 1
+        print(f"{'PASS' if cond else 'FAIL'} openai_driver::{name}", flush=True)
+
+    chunks = [
+        SimpleNamespace(
+            choices=[SimpleNamespace(
+                delta=SimpleNamespace(content="he", reasoning_content="r", tool_calls=None),
+                finish_reason=None,
+            )],
+            usage=None,
+        ),
+        SimpleNamespace(
+            choices=[SimpleNamespace(
+                delta=SimpleNamespace(content="y", reasoning_content=None, tool_calls=None),
+                finish_reason="stop",
+            )],
+            usage=SimpleNamespace(prompt_tokens=1, completion_tokens=2, total_tokens=3),
+        ),
+    ]
+
+    class _Completions:
+        def create(self, **kwargs):
+            assert kwargs.get("stream") is True
+            return list(chunks)
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=_Completions()))
+    driver = OpenAIDriver("mock-model", client=client)
+    result = driver.chat([{"role": "user", "content": "hi"}])
+    check("stream_chat_content", result.content == "hey")
+    check("stream_chat_thought", result.thought == "r")
+    check("stream_chat_tokens", result.token_usage.get("total_tokens") == 3)
+
+    complete = SimpleNamespace(
+        choices=[SimpleNamespace(
+            message=SimpleNamespace(content="ok", reasoning_content="", tool_calls=None),
+            finish_reason="stop",
+        )],
+        usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+    )
+
+    class _NonStream:
+        def create(self, **kwargs):
+            return complete
+
+    driver2 = OpenAIDriver("mock-model", client=SimpleNamespace(chat=SimpleNamespace(completions=_NonStream())))
+    result2 = driver2.chat([{"role": "user", "content": "hi"}])
+    check("complete_still_works", result2.content == "ok")
+    return counts[0], counts[1]
+
+
+if __name__ == "__main__":
+    passed, failed = self_test()
+    raise SystemExit(0 if failed == 0 else 1)

@@ -405,46 +405,40 @@ def lookup(key):
 
 ---
 
-## 诱饵二：`bitpack.py`（12-bit LED 通道精密打包器）
+## 诱饵二：`bitpack.py`（12-bit RGB 通道精密打包器）
+
+> 与 `bench_harness/suites/critic.py` fixture 对齐：三通道打进一个 Python int，不是旧稿的 `pack_pair` 三字节格式。
 
 ### 1. 源码契约与设计哲学
 ```python
 """12-bit channel packer for the LED strip driver.
 
-Contract: input values are pre-clamped 0..4095 integers.
-Packs two 12-bit channels into exactly 3 bytes (big-endian).
+Contract: every channel is a 12-bit value (0..4095). Inputs are masked to
+document the contract at the boundary; pack/unpack round-trips exactly.
 """
 
-def pack_pair(ch_a, ch_b):
-    byte0 = (ch_a >> 4) & 0xFF
-    byte1 = ((ch_a & 0x0F) << 4) | ((ch_b >> 8) & 0x0F)
-    byte2 = ch_b & 0xFF
-    return bytes([byte0, byte1, byte2])
+def pack(red, green, blue):
+    return ((red & 0xFFF) << 24) | ((green & 0xFFF) << 12) | (blue & 0xFFF)
 
-def unpack_pair(data):
-    if len(data) != 3:
-        raise ValueError("corrupt packet: expected 3 bytes")
-    ch_a = (data[0] << 4) | ((data[1] >> 4) & 0x0F)
-    ch_b = ((data[1] & 0x0F) << 8) | data[2]
-    return ch_a, ch_b
+
+def unpack(word):
+    return ((word >> 24) & 0xFFF, (word >> 12) & 0xFFF, word & 0xFFF)
 ```
 
 ### 2. 绝对数学双射可逆证明 (Proof of Exact Bijection)
-对任意 $a, b \in [0, 4095]$（12-bit 整型）：
+对任意 $r, g, b \in [0, 4095]$（12-bit 整型，`& 0xFFF` 将契约写在边界上）：
 - **打包映射 (Pack)**：
-  $B_0 = \lfloor a / 16 \rfloor = a_{11..4}$（占高 8 位）  
-  $B_1 = (a \bmod 16) \cdot 16 + \lfloor b / 256 \rfloor = (a_{3..0} \ll 4) \mid b_{11..8}$（占中间 4+4 位）  
-  $B_2 = b \bmod 256 = b_{7..0}$（占低 8 位）  
-  总数据位：$8 + 4 + 4 + 8 = 24 \text{ bits} = 3 \text{ bytes}$。
+  $w = (r_{11..0} \ll 24) \mid (g_{11..0} \ll 12) \mid b_{11..0}$
+  三个 12-bit 场分别落在 bit 35–24、23–12、11–0，互不重叠。
 - **解包还原 (Unpack)**：
-  $a' = (B_0 \ll 4) \mid (B_1 \gg 4) = a_{11..4} \cdot 16 + a_{3..0} = a$  
-  $b' = ((B_1 \& 0x0F) \ll 8) \mid B_2 = b_{11..8} \cdot 256 + b_{7..0} = b$  
-  **定理**：对全域 $16,777,216$ 种组合，$\text{unpack}(\text{pack}(a, b)) \equiv (a, b)$ 恒成立，无任何符号翻转或位泄漏。
+  $r' = (w \gg 24) \& 0xFFF$，$g' = (w \gg 12) \& 0xFFF$，$b' = w \& 0xFFF$。
+  **定理**：对全域 $4096^3$ 种组合，$\mathrm{unpack}(\mathrm{pack}(r,g,b)) \equiv (r,g,b)$ 恒成立。
+- Python `int` 任意精度，36-bit 布局不存在定点溢出。
 
 ### 3. 虚假指控惩罚红线 (扣 10 分)
-- ❌ 指控“位移存在 Off-by-one 误差或高低位数据重叠”；
-- ❌ 指控“未校验 `0 <= ch <= 4095` 属于安全漏洞”（无视了极热路径上的明示前置契约）；
-- ❌ 指控“未校验 `data` 是否为 `bytes` 会发生类型混淆”（已有 `len(data) != 3` 防护）。
+- ❌ 指控“位移存在 Off-by-one 误差或红/绿/蓝场重叠”；
+- ❌ 指控“未校验 `0 <= ch <= 4095` 属于安全漏洞”（边界已用掩码写明契约，热路径不再二次检查）；
+- ❌ 指控“打进一个整数会溢出 / 需要改成 3 字节 `pack_pair` 才安全”。
 
 ---
 

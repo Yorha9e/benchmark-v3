@@ -2,7 +2,7 @@
 
 Usage::
 
-    bench-run --suite {short,long,reviewer,critic,all} --model <model_id>
+    bench-run --suite {catalog-key|all} [--suite another] --model <model_id>
         [--driver openai|response|google|anthropic|cli|mock] [--task <task_id>]
         [--resume] [--output <dir>] [--export-sft <path>]
         [--export-dpo <path>] [--quiet]
@@ -44,8 +44,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         prog="bench-run", description="Benchmark v3 unified harness runner.")
     parser.add_argument("-i", "--interactive", action="store_true",
                         help="Launch interactive TUI wizard.")
-    parser.add_argument("--suite", default="all",
-                        choices=["short", "long", "reviewer", "critic", "all"])
+    from benchmark_v3.bench_harness.suites.catalog import CLI_SUITE_CHOICES
+
+    parser.add_argument(
+        "--suite",
+        action="append",
+        choices=list(CLI_SUITE_CHOICES),
+        metavar="KEY",
+        help="Runnable to execute. Repeat to combine in one run "
+             "(default: all A-condition families).",
+    )
     parser.add_argument("--model", required=False, default=None,
                         help="Model id (e.g. k3-max).")
     parser.add_argument("--driver", default="openai",
@@ -55,13 +63,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--api-key", default=None,
                         help="API key for the model under test.")
     parser.add_argument("--effort", default=None,
-                        choices=["none", "low", "medium", "high", "xhigh", "max"],
-                        help="Reasoning effort level (for o1/o3/Claude 3.7/Gemini 2.0).")
+                        choices=["none", "minimal", "low", "medium", "high", "xhigh", "max"],
+                        help="Reasoning effort (protocol-native: none/minimal/low/medium/high/xhigh/max).")
     parser.add_argument("--task", default=None, help="Run a single task id only.")
     parser.add_argument("--resume", action="store_true",
                         help="Replay stalled snapshot turns instead of restarting.")
     parser.add_argument("--output", default=None,
                         help="Output root (default: ./bench_runs/<timestamp>).")
+    parser.add_argument(
+        "--continue-run",
+        action="store_true",
+        help="Resume an L1-paused run in --output: skip tasks that already have "
+             "evaluation.json and keep the saved run_manifest.json queue.",
+    )
     parser.add_argument("--export-sft", default=None, metavar="PATH",
                         help="Export SFT golden JSONL to PATH.")
     parser.add_argument("--export-dpo", default=None, metavar="PATH",
@@ -76,8 +90,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--judge-api-key", default=None,
                         help="API key for the expert judge model.")
     parser.add_argument("--judge-effort", default=None,
-                        choices=["none", "low", "medium", "high", "xhigh", "max"],
+                        choices=["none", "minimal", "low", "medium", "high", "xhigh", "max"],
                         help="Reasoning effort for the expert judge model.")
+    parser.add_argument("--on-regress", default="keep-best",
+                        choices=["keep-best", "overwrite", "ask"],
+                        help="Leaderboard slot policy when a rerun scores below the stored "
+                             "best: keep-best (default), overwrite, or ask interactively.")
     parser.add_argument("--quiet", action="store_true", help="Suppress terminal rendering.")
     return parser
 
@@ -111,15 +129,25 @@ def build_driver(
 
         return AgentCLIDriver(model_id, effort=effort)
     if driver_name == "mock":
-        from benchmark_v3.bench_harness.suites.base import ScriptedDriver
+        from benchmark_v3.bench_harness.suites.base import ScriptedDriver, scripted_finish
 
-        return ScriptedDriver(model_id, effort=effort)
+        # Default mock ends via `finish` so unbounded agent loops cannot hang
+        # offline self-tests after max_turns was removed.
+        return ScriptedDriver(
+            model_id,
+            effort=effort,
+            script=[
+                scripted_finish(
+                    "Mock driver finished without implementing the deliverable."
+                )
+            ],
+        )
     raise ValueError("unknown driver %r" % (driver_name,))
 
 
 def _default_output() -> Path:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    return Path("bench_runs") / stamp
+    return Path("bench_runs") / ("%s-%s" % (stamp, os.getpid()))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -133,7 +161,7 @@ def main(argv: list[str] | None = None) -> int:
 
     from benchmark_v3.bench_harness.core.report import ReportManager
     from benchmark_v3.bench_harness.core.reporter import ProgressReporter
-    from benchmark_v3.bench_harness.suites import SUITE_REGISTRY
+    from benchmark_v3.bench_harness.suites import get_suite, resolve_suite_keys
 
     args = build_arg_parser().parse_args(argv)
     if not args.model:
@@ -144,13 +172,110 @@ def main(argv: list[str] | None = None) -> int:
     output = Path(args.output) if args.output else _default_output()
     output.mkdir(parents=True, exist_ok=True)
 
-    reporter = ProgressReporter(output / "live_status.json", enabled=not args.quiet)
-    suite_names = sorted(SUITE_REGISTRY) if args.suite == "all" else [args.suite]
-    total_tasks = sum(
-        len([t for t in SUITE_REGISTRY[name].TASK_IDS if not args.task or t == args.task])
-        for name in suite_names
+    from benchmark_v3.bench_harness.core.run_manifest import (
+        TaskAbandoned,
+        abandon_incomplete_task,
+        clear_pause_request,
+        load_manifest,
+        mark_task_completed,
+        new_manifest,
+        pause_requested,
+        save_manifest,
+        set_manifest_status,
+        task_is_complete,
+        build_planned_queue,
     )
+
+    # L1 pause: Ctrl+C aborts the *current* task immediately and freezes the run.
+    pause_flag = {"armed": False}
+
+    def _on_sigint(_signum: int, _frame: Any) -> None:  # noqa: ANN401
+        if pause_flag["armed"]:
+            raise KeyboardInterrupt
+        pause_flag["armed"] = True
+        try:
+            from benchmark_v3.bench_harness.core.run_manifest import request_pause
+
+            request_pause(output)
+        except Exception:
+            pass
+        msg = (
+            "\n[pause] Ctrl+C — abandoning the current task (if any) and "
+            f"freezing the run. Prior completed tasks are kept.\n"
+            f"[pause] Sentinel: {output / 'PAUSE.request'}\n"
+            "[pause] Press Ctrl+C again to hard-abort the process.\n"
+        )
+        sys.stderr.write(msg)
+        sys.stderr.flush()
+        raise KeyboardInterrupt
+
+    try:
+        import signal
+
+        signal.signal(signal.SIGINT, _on_sigint)
+    except Exception:
+        pass
+
+    reporter = ProgressReporter(output / "live_status.json", enabled=not args.quiet)
+    suite_names = resolve_suite_keys(args.suite or ["all"])
+    planned = build_planned_queue(suite_names, task_filter=args.task)
+    if args.task and not planned:
+        print("error: unknown task %r for selected suite(s)" % args.task, file=sys.stderr)
+        return 2
+    total_tasks = len(planned)
     reporter.start_session("bench-run/%s" % args.model, total_tasks=total_tasks)
+
+    launch_cfg = {
+        "model": args.model,
+        "model_id": args.model,
+        "driver": args.driver,
+        "effort": args.effort,
+        "suites": list(suite_names),
+        "task": args.task,
+        "resume": bool(args.resume or args.continue_run),
+        "base_url": args.base_url or "",
+        "api_key": args.api_key or "",
+        "judge_model": args.judge_model or "",
+        "judge_driver": args.judge_driver or "",
+        "judge_base_url": args.judge_base_url or "",
+        "judge_api_key": args.judge_api_key or "",
+        "judge_effort": args.judge_effort,
+        "export_sft": args.export_sft or "",
+        "export_dpo": args.export_dpo or "",
+        "on_regress": args.on_regress,
+    }
+
+    existing = load_manifest(output) if (args.continue_run or args.resume) else None
+    if existing and args.continue_run:
+        # Keep original launch credentials/suites; refresh remaining from disk.
+        launch_cfg = {**dict(existing.get("launch") or {}), **{
+            k: v for k, v in launch_cfg.items() if v not in ("", None, [])
+        }}
+        # Prefer suites from existing planned order when CLI didn't narrow.
+        if existing.get("planned") and not args.task and not args.suite:
+            planned = [
+                {"suite": str(i["suite"]), "task_id": str(i["task_id"])}
+                for i in existing["planned"]
+                if isinstance(i, dict) and i.get("suite") and i.get("task_id")
+            ]
+        manifest = new_manifest(output_dir=output, planned=planned, launch=launch_cfg)
+        # Preserve created_at from prior pause.
+        if existing.get("created_at"):
+            manifest["created_at"] = existing["created_at"]
+            save_manifest(output, manifest)
+    else:
+        manifest = new_manifest(output_dir=output, planned=planned, launch=launch_cfg)
+
+    # Drop a leftover sentinel only when explicitly continuing a paused run.
+    if args.continue_run:
+        clear_pause_request(output)
+    if not args.quiet:
+        print(
+            "L1 pause: Ctrl+C (or create %s) abandons the current task and "
+            "keeps prior completed ones."
+            % (output / "PAUSE.request",),
+            flush=True,
+        )
 
     try:
         driver = build_driver(
@@ -162,10 +287,13 @@ def main(argv: list[str] | None = None) -> int:
         )
     except Exception as exc:
         print("error: cannot build driver: %s" % exc, file=sys.stderr)
+        set_manifest_status(output, manifest, "interrupted", reason="driver_build_failed")
         return 2
 
     reports: list[Any] = []
     started = time.monotonic()
+    paused = False
+    pause_reason = ""
 
     judge_driver = None
     judge_model = args.judge_model
@@ -201,49 +329,163 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as exc:
             print("warning: cannot build judge driver: %s; using strict heuristic rubric" % exc, file=sys.stderr)
 
-    for suite_name in suite_names:
-        if suite_name == "critic" and judge_driver is not None:
-            suite = SUITE_REGISTRY[suite_name](judge_driver=judge_driver)
-        else:
-            suite = SUITE_REGISTRY[suite_name]()
-        task_ids = [t for t in suite.task_ids() if not args.task or t == args.task]
-        if args.task and not task_ids:
-            print("error: unknown task %r for suite %s" % (args.task, suite_name),
-                  file=sys.stderr)
-            return 2
-        for task_id in task_ids:
-            reporter.update(task_id, "running", "suite=%s model=%s" % (suite_name, args.model))
+    from benchmark_v3.bench_harness.core.report import MasterLeaderboard
+    _skip_board = args.driver == "mock"
+
+    def _build_regress_ask() -> Any:
+        """questionary 交互确认：新分低于表内最高分时问存不存。"""
+        try:
+            import questionary  # type: ignore
+        except Exception:
+            return None
+        try:
+            import sys as _sys
+            if not _sys.stdin.isatty():
+                return None
+        except Exception:
+            return None
+
+        def _ask(scope: str, old_slot: dict, new_slot: dict) -> bool:
             try:
-                report = suite.run_session(task_id, args.model, driver, output,
-                                           resume=args.resume)
-            except Exception as exc:  # never let one task kill the sweep
-                print("task %s crashed: %r" % (task_id, exc), file=sys.stderr)
-                continue
-            reports.append(report)
-            reporter.complete_task(
-                "%s/%s" % (suite_name, task_id), report.passed,
-                "reward=%s" % (report.final_reward,))
+                from rich.console import Console as _Console
+                from rich.panel import Panel as _Panel
+                _Console().print(_Panel(
+                    f"[bold white]{scope}[/bold white]\n"
+                    f"表内最高分: [green]{old_slot.get('reward')} "
+                    f"({old_slot.get('milestones_passed')}/{old_slot.get('milestones_total')}, "
+                    f"{old_slot.get('total_tokens', 0):,} tokens)[/green]\n"
+                    f"本次得分: [yellow]{new_slot.get('reward')} "
+                    f"({new_slot.get('milestones_passed')}/{new_slot.get('milestones_total')}, "
+                    f"{new_slot.get('total_tokens', 0):,} tokens)[/yellow]",
+                    title="[bold yellow]⚠️ 本次退步：是否覆盖表内最高分？[/bold yellow]",
+                    border_style="yellow",
+                ))
+                ans = questionary.confirm("用本次较低分覆盖表内最高分吗？(选否则保留最高分)", default=False).ask()
+                return bool(ans)
+            except Exception:
+                return False
+
+        return _ask
+
+    ask_fn = _build_regress_ask() if args.on_regress == "ask" else None
+    work_queue = list(manifest.get("remaining") or planned)
+
+    for item in work_queue:
+        suite_name = str(item.get("suite") or "")
+        task_id = str(item.get("task_id") or "")
+        if not suite_name or not task_id:
+            continue
+
+        if pause_requested(output, pause_flag):
+            paused = True
+            pause_reason = "PAUSE.request" if (output / "PAUSE.request").is_file() else "SIGINT"
+            break
+
+        if task_is_complete(output, suite_name, task_id):
+            mark_task_completed(manifest, suite=suite_name, task_id=task_id)
+            save_manifest(output, manifest)
+            reporter.update(task_id, "skip", "already has evaluation.json")
+            continue
+
+        suite = get_suite(
+            suite_name,
+            judge_driver=judge_driver if suite_name == "critic" else None,
+        )
+        reporter.update(task_id, "running", "suite=%s model=%s" % (suite_name, args.model))
+        try:
+            report = suite.run_session(
+                task_id,
+                args.model,
+                driver,
+                output,
+                resume=bool(args.resume or args.continue_run),
+            )
+        except (KeyboardInterrupt, TaskAbandoned) as exc:
+            paused = True
+            if isinstance(exc, TaskAbandoned):
+                pause_reason = str(getattr(exc, "reason", "") or "pause")
+            else:
+                pause_reason = (
+                    "PAUSE.request" if (output / "PAUSE.request").is_file() else "SIGINT"
+                )
+            abandon_incomplete_task(output, suite_name, task_id)
+            # Keep this task in remaining (never mark completed).
+            save_manifest(output, manifest)
+            if not args.quiet:
+                print(
+                    "abandoned in-progress task %s/%s — will retry on continue"
+                    % (suite_name, task_id),
+                    flush=True,
+                )
+            break
+        except Exception as exc:  # never let one task kill the sweep
+            print("task %s crashed: %r" % (task_id, exc), file=sys.stderr)
+            mark_task_completed(manifest, suite=suite_name, task_id=task_id, passed=False)
+            save_manifest(output, manifest)
+            continue
+
+        reports.append(report)
+        mark_task_completed(
+            manifest,
+            suite=suite_name,
+            task_id=task_id,
+            passed=bool(report.passed),
+            reward=float(getattr(report, "final_reward", 0.0) or 0.0),
+        )
+        save_manifest(output, manifest)
+        reporter.complete_task(
+            "%s/%s" % (suite_name, task_id), report.passed,
+            "reward=%s" % (report.final_reward,),
+        )
+
+        # Incremental leaderboard: completed tasks land even if we pause later.
+        try:
+            if not _skip_board:
+                MasterLeaderboard.update_leaderboard(
+                    [report],
+                    model_id=args.model,
+                    driver=args.driver,
+                    effort=args.effort,
+                    output_dir=output,
+                    wall_time=time.monotonic() - started,
+                    on_regress=args.on_regress,
+                    ask_fn=ask_fn,
+                )
+        except Exception as exc:
+            print("warning: failed to update master leaderboard: %s" % exc, file=sys.stderr)
+
+        if pause_requested(output, pause_flag):
+            paused = True
+            pause_reason = "PAUSE.request" if (output / "PAUSE.request").is_file() else "SIGINT"
+            break
 
     manager = ReportManager(output)
     summary = ReportManager.build_summary(reports)
     summary["model_id"] = args.model
     summary["driver"] = args.driver
     summary["wall_time_seconds"] = time.monotonic() - started  # telemetry only
+    summary["paused"] = paused
     manager.save_summary(summary)
 
-    # 自动增量更新全局总榜 (LEADERBOARD.md & bench_runs/leaderboard.json)
-    from benchmark_v3.bench_harness.core.report import MasterLeaderboard
-    try:
-        MasterLeaderboard.update_leaderboard(
-            reports,
-            model_id=args.model,
-            driver=args.driver,
-            effort=args.effort,
-            output_dir=output,
-            wall_time=time.monotonic() - started,
-        )
-    except Exception as exc:
-        print("warning: failed to update master leaderboard: %s" % exc, file=sys.stderr)
+    if paused:
+        set_manifest_status(output, manifest, "paused", reason=pause_reason or "pause")
+        clear_pause_request(output)
+        if not args.quiet:
+            rem = len(manifest.get("remaining") or [])
+            print(
+                "run paused (%s): %d task(s) remaining in %s — continue from TUI "
+                "or: bench-run --continue-run --output %s ..."
+                % (pause_reason or "pause", rem, output, output),
+                flush=True,
+            )
+        reporter.finish("bench-run paused: %d new report(s), %d remaining"
+                        % (len(reports), len(manifest.get("remaining") or [])))
+        if reports:
+            _print_table(reports, output=output, model_id=args.model, driver=args.driver, quiet=args.quiet)
+        return 0
+
+    set_manifest_status(output, manifest, "completed")
+    clear_pause_request(output)
 
     if (args.export_sft or args.export_dpo) and reports:
         _export_datasets(output, reports, args.export_sft, args.export_dpo)
@@ -251,7 +493,12 @@ def main(argv: list[str] | None = None) -> int:
     reporter.finish("bench-run done: %d/%d passed"
                     % (sum(1 for r in reports if r.passed), len(reports)))
     _print_table(reports, output=output, model_id=args.model, driver=args.driver, quiet=args.quiet)
-    return 0 if reports and all(r.passed for r in reports) else (0 if reports else 1)
+    if not _skip_board and reports:
+        _print_post_run_board(reports, quiet=args.quiet)
+    # No new reports (pure continue of already-complete run) → success.
+    if not reports and not (manifest.get("remaining") or []):
+        return 0
+    return 0 if reports and all(r.passed for r in reports) else (0 if not reports else 1)
 
 
 def _export_datasets(output: Path, reports: list[Any],
@@ -283,12 +530,10 @@ def _export_datasets(output: Path, reports: list[Any],
         print("dpo export: %s" % json.dumps(stats))
 
 
-SUITE_SECTIONS = [
-    ("critic", "[Critic] 代码盲审 (Adversarial Code Audit)", "🛡️ Critic 代码盲审", ["audit_bundle"]),
-    ("reviewer", "[Reviewer] 调试修复 (Micro-debugging Range)", "🔧 Reviewer 调试修复", ["lock_ordering", "api_drift", "bait_guard"]),
-    ("short", "[Short] 次世代短任务 · 微引擎 (Micro-Engine)", "⚡ 次世代短任务 · 微引擎", ["varint_parser", "timing_wheel", "lexer_state_machine"]),
-    ("long", "[Long] 次世代长任务 · 分布式混沌 (Distributed Chaos)", "🌐 次世代长任务 · 分布式混沌", ["raft_cluster", "saga_coordinator"]),
-]
+def _suite_sections() -> list[tuple[str, str, str, list[str]]]:
+    from benchmark_v3.bench_harness.suites.catalog import summary_sections
+
+    return summary_sections()
 
 
 def _print_table(
@@ -324,14 +569,16 @@ def _print_table(
     total_reasoning = sum(r.token_metrics.reasoning_tokens for r in reports)
     total_wall_time = sum(r.telemetry.wall_time_seconds for r in reports)
 
-    by_task_id = {r.task_id: r for r in reports}
-
     # 2. 控制台渲染各维度分组表格
     if not quiet:
         console.print()
 
-    for suite_key, cli_title, md_title, tasks in SUITE_SECTIONS:
-        suite_reports = [by_task_id[t] for t in tasks if t in by_task_id]
+    for suite_key, cli_title, md_title, tasks in _suite_sections():
+        want_cond = "b" if suite_key.endswith("_b") else "a"
+        suite_reports = [
+            r for r in reports
+            if r.task_id in tasks and (getattr(r, "condition", "a") or "a") == want_cond
+        ]
         if not suite_reports:
             continue
 
@@ -434,27 +681,48 @@ def _print_table(
         except Exception:
             pass
 
-    # 4. 总体统计面板 (基于全量细粒度评分点与里程碑)
-    all_milestones = [m for r in reports for m in r.milestones]
-    total_scoring_points = len(all_milestones)
-    passed_scoring_points = sum(1 for m in all_milestones if m.passed)
-    points_pass_rate_pct = (passed_scoring_points / total_scoring_points * 100.0) if total_scoring_points else 0.0
+    # 4. 总体统计面板：B 里程碑加进同一总数；综合指数 = 已得 / 总数 × 100。
+    def _run_cond(r) -> str:
+        return getattr(r, "condition", "a") or "a"
 
-    normalized_scores = [
-        r.final_reward if r.task_id == "audit_bundle" else r.final_reward * 100.0
-        for r in reports
-    ]
-    capability_index = (sum(normalized_scores) / len(normalized_scores)) if normalized_scores else 0.0
+    a_reports = [r for r in reports if _run_cond(r) == "a"]
+    all_milestones = [m for r in reports for m in r.milestones]
+    passed_scoring_points = sum(1 for m in all_milestones if m.passed)
+    total_scoring_points = len(all_milestones)
+    points_pass_rate_pct = (passed_scoring_points / total_scoring_points * 100.0) if total_scoring_points else 0.0
+    capability_index = points_pass_rate_pct
 
     tasks_passed = sum(1 for r in reports if r.passed)
     tasks_total = len(reports)
     tasks_pass_rate_pct = (tasks_passed / tasks_total * 100.0) if tasks_total else 0.0
 
+    unique_a = {r.task_id for r in a_reports}
+    unique_pairs = {(r.task_id, _run_cond(r)) for r in reports}
+    try:
+        from benchmark_v3.bench_harness.core.report import MasterLeaderboard as _Board
+        _Board._bind_catalog()
+        covers_all_a = unique_a >= set(_Board.CANONICAL_TASKS)
+    except Exception:
+        covers_all_a = False
+    if len(unique_pairs) == 1:
+        panel_title = "本轮单项评测小结"
+        md_heading = "## 本轮单项评测小结"
+        cap_note = "(本轮已得评分点 / 总数，非正式总榜)"
+    elif covers_all_a:
+        panel_title = "Benchmark v3 全维度评测总评看板"
+        md_heading = "## 📊 全维度总评看板"
+        cap_note = "(已得评分点 / 总数 × 100，A+B 同一池)"
+    else:
+        panel_title = "本轮评测小结"
+        md_heading = "## 本轮评测小结"
+        cap_note = "(本轮已得评分点 / 总数，非正式总榜)"
+
+    points_color = "green" if points_pass_rate_pct >= 50 else "yellow"
     summary_text = (
         f"[bold white]被测模型 (Model):[/bold white] [bold yellow]{model_id}[/bold yellow]  |  "
         f"[bold white]协议驱动 (Driver):[/bold white] [bold cyan]{driver}[/bold cyan]\n"
-        f"[bold white]全量评分点通过率 (Scoring Points):[/bold white] [bold {'green' if points_pass_rate_pct >= 50 else 'yellow'}]{passed_scoring_points} / {total_scoring_points} ({points_pass_rate_pct:.1f}%)[/bold {'green' if points_pass_rate_pct >= 50 else 'yellow'}]\n"
-        f"[bold white]综合能力指数 (Capability Index):[/bold white] [bold cyan]{capability_index:.1f} / 100[/bold cyan] [dim](全维度归一化综合得分)[/dim]\n"
+        f"[bold white]评分点 (Scoring Points):[/bold white] [bold {points_color}]{passed_scoring_points} / {total_scoring_points} ({points_pass_rate_pct:.1f}%)[/bold {points_color}]\n"
+        f"[bold white]综合能力指数 (Capability Index):[/bold white] [bold cyan]{capability_index:.1f} / 100[/bold cyan] [dim]{cap_note}[/dim]\n"
         f"[bold white]大任务全通数 (Completed Tasks):[/bold white] [dim]{tasks_passed} / {tasks_total} ({tasks_pass_rate_pct:.1f}%)[/dim]\n"
         f"[bold white]总 Token 消耗:[/bold white] [bold magenta]{total_tokens:,}[/bold magenta] "
         f"[dim](Prompt: {total_prompt:,} | Completion: {total_completion:,} | Reasoning: {total_reasoning:,})[/dim]\n"
@@ -463,13 +731,13 @@ def _print_table(
     )
 
     if not quiet:
-        console.print(Panel(summary_text, title="[bold green]Benchmark v3 全维度评测总评看板[/bold green]", border_style="bright_blue"))
+        console.print(Panel(summary_text, title=f"[bold green]{panel_title}[/bold green]", border_style="bright_blue"))
         console.print()
 
     # 4. 写入 Markdown 汇总报告
-    md_lines.append("## 📊 全维度总评看板")
-    md_lines.append(f"- **全量评分点通过率 (Scoring Points Pass Rate)**: `{passed_scoring_points} / {total_scoring_points}` (`{points_pass_rate_pct:.1f}%`) *(基于全套件细粒度测试里程碑)*")
-    md_lines.append(f"- **综合能力指数 (Overall Capability Index)**: `{capability_index:.1f} / 100` *(全维度归一化综合得分)*")
+    md_lines.append(md_heading)
+    md_lines.append(f"- **评分点 (Scoring Points)**: `{passed_scoring_points} / {total_scoring_points}` (`{points_pass_rate_pct:.1f}%`) *(A+B 里程碑同一池)*")
+    md_lines.append(f"- **综合能力指数 (Overall Capability Index)**: `{capability_index:.1f} / 100` *{cap_note}*")
     md_lines.append(f"- **全通大任务数 (Completed Task Packages)**: `{tasks_passed} / {tasks_total}` (`{tasks_pass_rate_pct:.1f}%`)")
     md_lines.append(f"- **总 Token 消耗**: `{total_tokens:,}` (Prompt: `{total_prompt:,}` | Completion: `{total_completion:,}` | Reasoning: `{total_reasoning:,}`)")
     md_lines.append(f"- **全流程累计耗时**: `{total_wall_time:.1f}s` (纯遥测指标，不计入得分)")
@@ -486,6 +754,100 @@ def _print_table(
         pass
 
 
+_MEDALS = ["👑 1", "🥈 2", "🥉 3"]
+
+
+def _print_post_run_board(reports: list[Any], quiet: bool = False) -> None:
+    """After the run finishes, print one ranking table derived from leaderboard.json.
+
+    Multi-task runs get the master table. A single (task, condition) run gets
+    that task's sort view of the same JSON — not a separately scored board.
+    """
+    if quiet or not reports:
+        return
+
+    from rich.console import Console
+    from rich.table import Table
+
+    from benchmark_v3.bench_harness.core.report import MasterLeaderboard
+
+    console = Console(legacy_windows=False)
+    unique = {(r.task_id, getattr(r, "condition", "a") or "a") for r in reports}
+
+    if len(unique) == 1:
+        task_id, cond = next(iter(unique))
+        rows = MasterLeaderboard.task_board(task_id, condition=cond)
+        label = task_id if cond == "a" else f"{task_id}@{cond}"
+        table = Table(
+            title=(
+                f"[bold green]分任务榜 · {label}[/bold green]\n"
+                "[dim]同源总榜槽位，按该任务得分排序（非独立计分）[/dim]"
+            ),
+            border_style="green",
+        )
+        table.add_column("排名", style="bold yellow", width=6, justify="center")
+        table.add_column("模型", style="bold white")
+        table.add_column("驱动·强度", style="cyan")
+        table.add_column("该任务得分", justify="right")
+        table.add_column("通过", justify="center")
+        table.add_column("综合指数(同行)", justify="right")
+        table.add_column("Token", justify="right")
+        if not rows:
+            console.print(f"\n[yellow]总榜尚无 `{label}` 槽位，本轮结果已写入 leaderboard.json。[/yellow]\n")
+            return
+        for i, row in enumerate(rows):
+            tokens = row["total_tokens"]
+            table.add_row(
+                _MEDALS[i] if i < 3 else str(i + 1),
+                str(row["model_id"]),
+                f"{row['driver']}·{row['effort']}",
+                MasterLeaderboard.format_slot_reward(task_id, row["reward"]),
+                "✔" if row["passed"] else "✖",
+                f"{row['capability_index']:.1f}",
+                f"{tokens:,}" if tokens is not None else "-",
+            )
+        console.print()
+        console.print(table)
+        console.print()
+        return
+
+    entries = MasterLeaderboard.sorted_entries()
+    table = Table(
+        title=(
+            "[bold green]🏆 全维度权威总榜[/bold green]\n"
+            "[dim]综合指数 = 已得评分点 / 总数；B 里程碑加进同一池（满测 116）[/dim]"
+        ),
+        border_style="yellow",
+    )
+    table.add_column("排名", style="bold yellow", width=6, justify="center")
+    table.add_column("模型", style="bold white")
+    table.add_column("驱动·强度", style="cyan")
+    table.add_column("综合指数", justify="right")
+    table.add_column("评分点", justify="center")
+    table.add_column("覆盖", justify="center")
+    table.add_column("Token", justify="right")
+    if not entries:
+        console.print("\n[yellow]总榜暂无数据。[/yellow]\n")
+        return
+    for i, item in enumerate(entries):
+        cap = float(item.get("capability_index", 0.0) or 0.0)
+        pts_p = item.get("scoring_points_passed", 0)
+        pts_t = item.get("scoring_points_total", 66)
+        tokens = item.get("total_tokens", 0)
+        table.add_row(
+            _MEDALS[i] if i < 3 else str(i + 1),
+            str(item.get("model_id", "?")),
+            f"{item.get('driver', '?')}·{item.get('effort', 'default')}",
+            f"{cap:.1f} / 100",
+            f"{pts_p}/{pts_t}",
+            str(item.get("tasks_covered", "-")),
+            f"{tokens:,}",
+        )
+    console.print()
+    console.print(table)
+    console.print()
+
+
 def self_test() -> tuple[int, int]:
     """Run module self-tests. Returns ``(passed, failed)`` counts."""
     import tempfile
@@ -498,17 +860,38 @@ def self_test() -> tuple[int, int]:
 
     parser = build_arg_parser()
     args = parser.parse_args(["--suite", "critic", "--model", "t",
-                              "--driver", "mock", "--task", "audit_bundle"])
-    check("arg_parse", args.suite == "critic" and args.task == "audit_bundle"
+                              "--driver", "mock", "--task", "audit_bundle",
+                              "--effort", "max"])
+    check("arg_parse", args.suite == ["critic"] and args.task == "audit_bundle"
           and args.model == "t" and not args.resume)
+    cont = parser.parse_args(["--model", "t", "--continue-run", "--output", "x"])
+    check("arg_parse_continue_run", cont.continue_run is True and cont.output == "x")
+    multi = parser.parse_args(["--suite", "short", "--suite", "long", "--model", "t"])
+    check("arg_parse_multi_suite", multi.suite == ["short", "long"])
+    defaulted = parser.parse_args(["--model", "t"])
+    check("arg_parse_suite_default_none", defaulted.suite is None)
+    check("effort_max_choice", args.effort == "max")
+    from benchmark_v3.bench_harness.drivers.effort import openai_reasoning_effort
+    check("effort_max_passthrough", openai_reasoning_effort("max") == "max")
 
     driver = build_driver("mock", "t")
     check("mock_driver", type(driver).__name__ == "ScriptedDriver")
+    from benchmark_v3.bench_harness.suites import get_suite
+    critic_suite = get_suite("critic", judge_driver=driver)
+    check("get_suite_forwards_judge", getattr(critic_suite, "judge_driver", None) is driver)
+    check("get_suite_short_ignores_judge", type(get_suite("short", judge_driver=driver)).__name__ == "ShortTaskSuite")
+    short_b = get_suite("short_b")
+    check("get_suite_short_b", short_b.condition == "b" and short_b.run_key == "short_b")
     try:
         build_driver("nope", "t")
         check("bad_driver_rejected", False)
     except ValueError:
         check("bad_driver_rejected", True)
+
+    from benchmark_v3.bench_harness.core import run_manifest as _rm
+
+    rm_p, rm_f = _rm.self_test()
+    check("run_manifest_module", rm_f == 0 and rm_p > 0)
 
     # -- end-to-end offline sweep (mock writes nothing; pipeline must
     #    complete honestly with atomic reports + dataset exports) --
@@ -519,10 +902,13 @@ def self_test() -> tuple[int, int]:
                      "--output", out, "--quiet",
                      "--export-sft", str(Path(tmp) / "sft.jsonl"),
                      "--export-dpo", str(Path(tmp) / "dpo.jsonl")])
-        check("e2e_exit", code in (0, 1))
+        check("e2e_exit", code == 1)
         check("e2e_evaluation", (Path(out) / "reviewer" / "bait_guard" / "evaluation.json").exists())
         check("e2e_summary", (Path(out) / "summary.json").exists())
         check("e2e_live", (Path(out) / "live_status.json").exists())
+        check("e2e_manifest", (Path(out) / "run_manifest.json").exists())
+        man = json.loads((Path(out) / "run_manifest.json").read_text(encoding="utf-8"))
+        check("e2e_manifest_completed", man.get("status") == "completed")
         check("e2e_sft", (Path(tmp) / "sft.jsonl").exists())
         check("e2e_dpo", (Path(tmp) / "dpo.jsonl").exists())
         try:
@@ -530,6 +916,26 @@ def self_test() -> tuple[int, int]:
             check("e2e_summary_shape", summary.get("n_reports") == 1 and "entries" in summary)
         except (OSError, ValueError):
             check("e2e_summary_shape", False)
+
+        # continue-run should skip already-complete task (exit 0, no crash)
+        code2 = main(["--suite", "reviewer", "--task", "bait_guard",
+                      "--model", "mock-model", "--driver", "mock",
+                      "--output", out, "--quiet", "--continue-run", "--resume"])
+        check("e2e_continue_skip", code2 == 0)
+        man2 = json.loads((Path(out) / "run_manifest.json").read_text(encoding="utf-8"))
+        check("e2e_continue_still_complete", man2.get("status") == "completed")
+
+    # L1 pause before first task via sentinel
+    with tempfile.TemporaryDirectory(prefix="cli-pause-") as tmp:
+        out = Path(tmp) / "runs"
+        out.mkdir(parents=True)
+        (out / "PAUSE.request").write_text("pause\n", encoding="utf-8")
+        code3 = main(["--suite", "reviewer", "--model", "mock-model", "--driver", "mock",
+                      "--output", str(out), "--quiet"])
+        man3 = json.loads((out / "run_manifest.json").read_text(encoding="utf-8"))
+        check("e2e_pause_exit", code3 == 0)
+        check("e2e_pause_status", man3.get("status") == "paused")
+        check("e2e_pause_remaining", len(man3.get("remaining") or []) >= 1)
 
     return counts[0], counts[1]
 

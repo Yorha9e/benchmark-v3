@@ -1,5 +1,9 @@
 # Critic Benchmark Package
 
+> **过渡期标注**：本目录是 `benchmark_v3/` 内保留的对照包，供过渡期并行评测。  
+> v3 独立项目的评测入口是 `bench_harness/`（`bench-run` / TUI），**不读取本目录**。  
+> 不要改动本目录之外的旧包。
+
 这是一个可复用的静态 Critic benchmark 包，用于比较不同 subagent 对两个固定、盲化候选产物进行单轮代码审查的能力。它只保存题目、公开输入、评分协议、控制 manifest、evaluator 和辅助检查脚本；历史运行结果不属于本包。
 
 ## 包含内容

@@ -32,6 +32,14 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+from benchmark_v3.bench_harness.suites.catalog import (
+    DEFAULT_ALL_KEYS,
+    DEFAULT_TUI_KEYS,
+    RUNNABLES,
+    SELECTABLE_KEYS,
+    SUITE_LABELS,
+)
+
 if sys.platform == "win32":
     # 确保 Windows 终端支持 UTF-8 输出，防止 GBK 编码报错
     if hasattr(sys.stdout, "reconfigure"):
@@ -67,6 +75,35 @@ def save_judge_config(config: dict[str, Any]) -> None:
     JUDGE_CONFIG_FILE.write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
+_JUDGE_PROFILE_KEYS = (
+    "judge_model",
+    "judge_driver",
+    "judge_base_url",
+    "judge_api_key",
+    "judge_effort",
+)
+
+
+def global_judge_summary() -> str:
+    """一行摘要，如 ``google -> gemini-x | effort=high``；未配置则空串。"""
+    cfg = load_judge_config()
+    model = str(cfg.get("model") or "").strip()
+    if not model:
+        return ""
+    driver = str(cfg.get("driver") or "").strip() or "?"
+    effort = str(cfg.get("effort") or "").strip()
+    tag = f"{driver} -> {model}"
+    if effort:
+        tag += f" | effort={effort}"
+    return tag
+
+
+def apply_profile_global_judge(config: dict[str, Any]) -> None:
+    """清空任务级裁判字段，运行时回退到 ``.bench_judge.json``。"""
+    for key in _JUDGE_PROFILE_KEYS:
+        config[key] = None if key == "judge_effort" else ""
+
+
 #: 全局裁判表格字段：(key, 显示名, kind, 说明)
 _JUDGE_FIELDS: tuple[tuple[str, str, str, str], ...] = (
     ("enabled", "启用开关", "bool", "关闭=清空全局裁判，回退严格启发式量表"),
@@ -92,7 +129,7 @@ def configure_judge_wizard() -> None:
     nav_push("全局裁判")
     try:
         console.print("\n[bold cyan]>>> 配置默认全局专家裁判模型 (Global Default Judge)[/bold cyan]")
-        console.print("[dim]设置后，所有评测运行将默认自动由该模型对 Critic 盲审深度进行 L1~L4 严格复核，无需每次重复输入。[/dim]\n")
+        console.print("[dim]设置后，所有评测运行将默认自动由该模型对 critic 报告进行 L1~L4 严格复核，无需每次重复输入。[/dim]\n")
 
         working: dict[str, Any] = {
             "enabled": bool(current.get("model")),
@@ -290,33 +327,336 @@ def view_latest_report(back_label: str = "返回主菜单") -> None:
     nav_pop()
 
 
-def view_leaderboard(back_label: str = "返回主菜单") -> None:
-    """在终端中直接用 Rich Markdown 优雅渲染全局权威总榜 LEADERBOARD.md"""
-    nav_push("权威总榜")
-    board_path = Path("LEADERBOARD.md")
-    if not board_path.is_file():
-        console.print("\n[yellow]尚未检测到 LEADERBOARD.md 全局总榜，请先运行一次评测。[/yellow]\n")
-    else:
-        try:
-            content = board_path.read_text(encoding="utf-8")
-            from rich.markdown import Markdown
-
-            console.print()
-            console.print(
-                Panel(
-                    Markdown(content),
-                    title="[bold gold1]🏆 LEADERBOARD.md 全维度权威总榜[/bold gold1]",
-                    border_style="yellow",
-                )
-            )
-            console.print()
-        except Exception as exc:
-            console.print(f"[red]读取总榜失败: {exc}[/red]")
+def _load_master_board() -> Any:
+    """懒加载 MasterLeaderboard（与 cli_main 同款双路径兼容）。"""
     try:
-        questionary.press_any_key_to_continue(f"按任意键{back_label}...").ask()
-    except (KeyboardInterrupt, EOFError):
-        pass
-    nav_pop()
+        from benchmark_v3.bench_harness.core.report import MasterLeaderboard
+    except ImportError:
+        from bench_harness.core.report import MasterLeaderboard
+    return MasterLeaderboard
+
+
+def _board_medals() -> list[str]:
+    return ["👑 1", "🥈 2", "🥉 3"]
+
+
+def render_master_board() -> None:
+    """Render the master ranking from leaderboard.json (same source as MD)."""
+    MasterLeaderboard = _load_master_board()
+    entries = MasterLeaderboard.sorted_entries()
+    console.print()
+    if not entries:
+        console.print("[yellow]总榜暂无数据，请先运行一次评测。[/yellow]\n")
+        return
+    medals = _board_medals()
+    table = Table(
+        title=(
+            "[bold gold1]🏆 全维度权威总榜[/bold gold1]\n"
+            "[dim]综合指数 = 已得评分点 / 总数；B 里程碑加进同一池（满测 116）[/dim]"
+        ),
+        border_style="yellow",
+    )
+    table.add_column("排名", style="bold yellow", width=6, justify="center")
+    table.add_column("模型", style="bold white")
+    table.add_column("驱动·强度", style="cyan")
+    table.add_column("综合指数", justify="right")
+    table.add_column("评分点", justify="center")
+    table.add_column("覆盖", justify="center")
+    table.add_column("Token", justify="right")
+    for i, item in enumerate(entries):
+        cap = float(item.get("capability_index", 0.0) or 0.0)
+        pts_p = item.get("scoring_points_passed", 0)
+        pts_t = item.get("scoring_points_total", 66)
+        tokens = item.get("total_tokens", 0)
+        table.add_row(
+            medals[i] if i < 3 else str(i + 1),
+            str(item.get("model_id", "?")),
+            f"{item.get('driver', '?')}·{item.get('effort', 'default')}",
+            f"{cap:.1f} / 100",
+            f"{pts_p}/{pts_t}",
+            str(item.get("tasks_covered", "-")),
+            f"{tokens:,}",
+        )
+    console.print(table)
+    console.print("[dim]完整 Markdown（含各任务重排表）见 LEADERBOARD.md[/dim]\n")
+
+
+def render_task_board(task_id: str, condition: str = "a") -> None:
+    """Render one task ranking: same JSON, primary key = that task's stored slot."""
+    MasterLeaderboard = _load_master_board()
+    rows = MasterLeaderboard.task_board(task_id, condition=condition)
+    label = task_id if condition == "a" else f"{task_id}@{condition}"
+    nav_push(f"task:{label}")
+    try:
+        console.print()
+        if not rows:
+            console.print(f"[yellow]任务 [{label}] 暂无槽位。跑完该题即入榜。[/yellow]\n")
+        else:
+            table = Table(
+                title=(
+                    f"[bold green]📊 分任务榜 · {label}[/bold green]\n"
+                    "[dim]同源总榜槽位，按该任务得分排序（非独立计分）[/dim]"
+                ),
+                border_style="green",
+            )
+            table.add_column("排名", style="bold yellow", width=6, justify="center")
+            table.add_column("模型", style="bold white")
+            table.add_column("驱动·强度", style="cyan")
+            table.add_column("该任务得分", justify="right")
+            table.add_column("通过", justify="center")
+            table.add_column("综合指数(同行)", justify="right")
+            table.add_column("Token", justify="right")
+            table.add_column("更新时间", style="dim")
+            medals = _board_medals()
+            for i, r in enumerate(rows):
+                tokens = r["total_tokens"]
+                table.add_row(
+                    medals[i] if i < 3 else str(i + 1),
+                    str(r["model_id"]),
+                    f"{r['driver']}·{r['effort']}",
+                    MasterLeaderboard.format_slot_reward(task_id, r["reward"]),
+                    "✔" if r["passed"] else "✖",
+                    f"{r['capability_index']:.1f}",
+                    f"{tokens:,}" if tokens is not None else "-",
+                    str(r.get("updated_at") or "")[:10],
+                )
+            console.print(table)
+            console.print()
+        try:
+            questionary.press_any_key_to_continue("按任意键返回总榜...").ask()
+        except (KeyboardInterrupt, EOFError):
+            pass
+    finally:
+        nav_pop()
+
+
+def render_suite_board(suite: str) -> None:
+    """渲染套件重排榜：同一份总榜 JSON，主键换成该套件已存槽位合计。"""
+    MasterLeaderboard = _load_master_board()
+    rows = MasterLeaderboard.suite_board(suite)
+    scale = "/100" if suite == "critic" else f"/{len(MasterLeaderboard.SUITE_TASKS.get(suite, ()))}"
+    nav_push(f"suite:{suite}")
+    try:
+        console.print()
+        if not rows:
+            console.print(f"[yellow]维度 [{suite}] 暂无数据，新跑一次即入榜。[/yellow]\n")
+        else:
+            table = Table(
+                title=(
+                    f"[bold green]📊 suite board · {suite}（槽位合计 {scale}）[/bold green]\n"
+                    "[dim]同源总榜，按该套件已存槽位求和后重排[/dim]"
+                ),
+                border_style="green",
+            )
+            table.add_column("排名", style="bold yellow", width=6, justify="center")
+            table.add_column("模型", style="bold white")
+            table.add_column("驱动·强度", style="cyan")
+            table.add_column("槽位合计", style="bold green", justify="right")
+            table.add_column("里程碑", justify="center")
+            table.add_column("综合指数(同行)", justify="right")
+            table.add_column("Token", justify="right")
+            table.add_column("更新时间", style="dim")
+            medals = _board_medals()
+            for i, r in enumerate(rows):
+                name = f"{r['model_id']} [dim](legacy)[/dim]" if r.get("legacy") else r["model_id"]
+                cap = r.get("capability_index")
+                cap_s = f"{float(cap):.1f}" if cap is not None else "-"
+                table.add_row(
+                    medals[i] if i < 3 else str(i + 1),
+                    name,
+                    f"{r['driver']}·{r['effort']}",
+                    f"{'✔' if r['passed'] else '✖'} {r['reward']}",
+                    r["milestones"],
+                    cap_s,
+                    f"{r['total_tokens']:,}" if r["total_tokens"] is not None else "-",
+                    str(r["updated_at"])[:10],
+                )
+            console.print(table)
+            console.print()
+        try:
+            questionary.press_any_key_to_continue("按任意键返回总榜...").ask()
+        except (KeyboardInterrupt, EOFError):
+            pass
+    finally:
+        nav_pop()
+
+
+def view_leaderboard(back_label: str = "返回主菜单") -> None:
+    """总榜浏览：总表 + 同源分任务/套件重排钻取。"""
+    MasterLeaderboard = _load_master_board()
+    MasterLeaderboard._bind_catalog()
+    nav_push("权威总榜")
+    try:
+        while True:
+            render_master_board()
+            action = questionary.select(
+                "总榜操作:",
+                choices=[
+                    Choice("📊 按任务查看分榜（同源总榜，按该任务得分排序）", value="task"),
+                    Choice("📊 按套件查看分榜（同源总榜，按该套件槽位合计排序）", value="suite"),
+                    Choice(f"↩ {back_label}", value="back"),
+                ],
+                style=CUSTOM_STYLE,
+            ).ask()
+            if action == "task":
+                data = MasterLeaderboard.load_data()
+                task_choices: list[Choice] = []
+                for task_id in MasterLeaderboard.CANONICAL_TASKS:
+                    n_a = len(MasterLeaderboard.task_board(task_id, data=data, condition="a"))
+                    task_choices.append(
+                        Choice(f"{task_id}  (A, {n_a} 条)", value=(task_id, "a"))
+                    )
+                    n_b = len(MasterLeaderboard.task_board(task_id, data=data, condition="b"))
+                    if n_b:
+                        task_choices.append(
+                            Choice(f"{task_id}@b  (B, {n_b} 条)", value=(task_id, "b"))
+                        )
+                task_choices.append(Choice("↩ 返回总榜", value=None))
+                picked = questionary.select(
+                    "选择任务（排序主键 = 该任务已存槽位）:",
+                    choices=task_choices,
+                    style=CUSTOM_STYLE,
+                ).ask()
+                if picked:
+                    render_task_board(picked[0], picked[1])
+                continue
+            if action == "suite":
+                suite_choices = [
+                    Choice(f"{s} ({len(MasterLeaderboard.SUITE_TASKS.get(s, ()))} tasks)", value=s)
+                    for s in MasterLeaderboard.SUITES
+                ] + [Choice("↩ 返回总榜", value=None)]
+                picked = questionary.select("选择维度:", choices=suite_choices, style=CUSTOM_STYLE).ask()
+                if picked:
+                    render_suite_board(picked)
+                continue
+            return
+    finally:
+        nav_pop()
+
+
+def _delete_run_dir(run_dir: Path) -> bool:
+    """Double-confirmed recursive delete, fenced inside bench_runs.
+
+    Returns True only when the directory was actually removed. Refuses
+    anything outside the ``bench_runs`` tree (symlink/typo safety).
+    """
+    import shutil
+
+    try:
+        target = Path(run_dir).resolve()
+        fence = Path("bench_runs").resolve()
+        if target == fence or fence not in target.parents:
+            console.print(f"[red]拒绝删除：{run_dir} 不在 bench_runs 目录树内。[/red]")
+            return False
+        if not target.is_dir():
+            console.print(f"[red]目录不存在：{run_dir}。[/red]")
+            return False
+    except OSError as exc:
+        console.print(f"[red]路径检查失败：{exc}[/red]")
+        return False
+    sure = questionary.confirm(
+        f"确认彻底删除 {target} 吗？全部日志与轨迹将丢失！",
+        default=False,
+        style=CUSTOM_STYLE,
+    ).ask()
+    if not sure:
+        console.print("[dim]已取消删除。[/dim]")
+        return False
+    try:
+        shutil.rmtree(target)
+    except OSError as exc:
+        console.print(f"[red]删除失败：{exc}[/red]")
+        return False
+    return True
+
+
+def continue_paused_run_picker() -> dict[str, Any] | None:
+    """主菜单：从 bench_runs 中选择一个 L1 暂停/未完成的测评继续跑。"""
+    from benchmark_v3.bench_harness.core.run_manifest import (
+        list_incomplete_runs,
+        manifest_to_launch_config,
+    )
+
+    nav_push("继续未完成")
+    try:
+        runs = list_incomplete_runs()
+        if not runs:
+            console.print(
+                "\n[yellow]当前没有可继续的未完成测评。"
+                "（跑测中 Ctrl+C 会放弃当前题并冻结；或创建 run 目录下的 PAUSE.request）[/yellow]\n"
+            )
+            return None
+
+        choices: list[Choice] = []
+        for item in runs:
+            model = item.get("model_id") or "?"
+            driver = item.get("driver") or "?"
+            effort = item.get("effort")
+            effort_tag = f" | effort={effort}" if effort else ""
+            prog = f"{item.get('completed_n', 0)}/{item.get('planned_n', 0)}"
+            rem = item.get("remaining_n", 0)
+            status = item.get("status") or "?"
+            reason = item.get("pause_reason") or ""
+            reason_tag = f" · {reason}" if reason else ""
+            label = (
+                f"[{status}] {model} [{driver}{effort_tag}]  "
+                f"进度 {prog} · 剩余 {rem}  ·  {item.get('run_dir')}"
+                f"{reason_tag}"
+            )
+            choices.append(Choice(label, value=item["run_dir"]))
+        choices.append(Choice("↩ 返回主菜单", value=None))
+
+        picked = questionary.select(
+            "选择要继续的未完成测评:",
+            choices=choices,
+            style=CUSTOM_STYLE,
+        ).ask()
+        if not picked:
+            return None
+
+        from benchmark_v3.bench_harness.core.run_manifest import (
+            discard_run,
+            load_manifest,
+        )
+
+        manifest = load_manifest(Path(picked))
+        if not manifest:
+            console.print("[red]无法读取 run_manifest.json。[/red]")
+            return None
+        action = questionary.select(
+            f"对 {picked} 执行：",
+            choices=[
+                Choice("▶ 继续跑剩余任务", value="resume"),
+                Choice("🗑 移出列表（保留目录文件，仅不再显示）", value="discard"),
+                Choice("☠ 删除整个 run 目录（含全部日志轨迹，不可恢复）", value="delete"),
+                Choice("↩ 返回", value=None),
+            ],
+            style=CUSTOM_STYLE,
+        ).ask()
+        if action == "discard":
+            if discard_run(Path(picked)):
+                console.print(f"[yellow]✔ 已将 {picked} 移出继续列表（文件保留）。[/yellow]")
+            else:
+                console.print("[red]移出失败：manifest 不存在。[/red]")
+            return None
+        if action == "delete":
+            if _delete_run_dir(Path(picked)):
+                console.print(f"[yellow]✔ 已删除 run 目录 {picked}。[/yellow]")
+            return None
+        if action != "resume":
+            return None
+        config = manifest_to_launch_config(manifest, picked)
+        if not config.get("model"):
+            console.print("[red]manifest 缺少 model，无法继续。[/red]")
+            return None
+        console.print(
+            f"\n[green]✔ 将继续 [/green][bold]{config['model']}[/bold]"
+            f" 于 [cyan]{picked}[/cyan]"
+            f" （剩余 {len(manifest.get('remaining') or [])} 题）\n"
+        )
+        return config
+    finally:
+        nav_pop()
 
 
 def profile_picker() -> dict[str, Any] | None:
@@ -338,6 +678,12 @@ def profile_picker() -> dict[str, Any] | None:
     choices.append(Choice("[+] 新建运行配置 (Create New Configuration)", value=("new", None)))
     if profiles:
         choices.append(Choice("[E] 编辑已有预设 (Edit Existing Profile)", value=("edit", None)))
+
+    from benchmark_v3.bench_harness.core.run_manifest import list_incomplete_runs
+
+    incomplete_n = len(list_incomplete_runs())
+    cont_tag = f" [{incomplete_n} 个未完成]" if incomplete_n else ""
+    choices.append(Choice(f"[C] 继续未完成的测评 (Continue Paused Run){cont_tag}", value=("continue", None)))
 
     global_judge = load_judge_config()
     j_tag = f" [当前: {global_judge['model']} ({global_judge.get('driver')})]" if global_judge.get("model") else " [未配置/默认启发式]"
@@ -361,6 +707,12 @@ def profile_picker() -> dict[str, Any] | None:
     if action == "judge":
         configure_judge_wizard()
         return profile_picker()
+
+    if action == "continue":
+        continued = continue_paused_run_picker()
+        if continued is None:
+            return profile_picker()
+        return continued
 
     if action == "view":
         view_latest_report()
@@ -412,19 +764,19 @@ WIZARD_ABORT_CHOICE = Choice("↩ 放弃本次配置，返回主菜单", value="
 
 
 #: 表格编辑器字段定义：(key, 显示名, 编辑器类型, 补充说明)
-#: kind: driver|text|password|effort|suites|bool|path_opt|judge_driver
+#: kind: driver|text|password|effort|suites|bool|path_opt|judge_driver|judge_model
 _CONFIG_FIELDS: tuple[tuple[str, str, str, str], ...] = (
     ("driver", "协议驱动", "driver", "被测模型协议：openai/response/google/anthropic/cli/mock"),
     ("model", "模型标识", "text", "模型唯一 ID，如 deepseek-chat / gemini-2.0-flash"),
     ("base_url", "Base URL", "text", "留空用官方默认；过长内容选中后展开全文"),
     ("api_key", "API Key", "password", "回车保留原值；展示时脱敏"),
     ("proxy", "网络代理", "text", "留空不走代理，如 http://127.0.0.1:10808"),
-    ("effort", "思考强度", "effort", "low/medium/high/xhigh/max，留空=厂商默认"),
-    ("suites", "评测套件", "suites", "空格多选：short/long/reviewer/critic"),
+    ("effort", "思考强度", "effort", "none/minimal/low/medium/high/xhigh/max，留空=厂商默认"),
+    ("suites", "评测套件", "suites", "空格多选：" + "/".join(SELECTABLE_KEYS)),
     ("resume", "断点续跑", "bool", "崩溃时从单轮快照原地恢复"),
     ("export_sft", "SFT 导出", "path_opt", "选中后可开关 + 修改导出路径"),
     ("export_dpo", "DPO 导出", "path_opt", "选中后可开关 + 修改导出路径"),
-    ("judge_model", "裁判模型", "text", "留空=沿用全局默认裁判；可单独清空"),
+    ("judge_model", "裁判模型", "judge_model", "可选用全局专家裁判，或为本预设单独填写"),
     ("judge_driver", "裁判驱动", "judge_driver", "留空=跟随全局/被测驱动"),
     ("judge_base_url", "裁判 Base URL", "text", "留空=沿用全局或主配置"),
     ("judge_api_key", "裁判 Key", "password", "留空=沿用全局或主配置"),
@@ -441,14 +793,12 @@ _DRIVER_LABELS = {
 }
 
 _EFFORT_LABELS = {
+    "none": "关闭 None", "minimal": "最小 Minimal",
     "low": "低 Low", "medium": "中 Medium", "high": "高 High",
     "xhigh": "超高 XHigh", "max": "极限 Max",
 }
 
-_SUITE_LABELS = {
-    "short": "短任务", "long": "长任务",
-    "reviewer": "Reviewer", "critic": "Critic",
-}
+_SUITE_LABELS = dict(SUITE_LABELS)
 
 
 def _shorten(value: str, width: int = 44) -> str:
@@ -462,7 +812,18 @@ def _field_display(config: dict[str, Any], key: str, kind: str) -> str:
     val = config.get(key)
     if kind == "password":
         return mask_key(val)
+    if kind == "judge_model":
+        if val:
+            return str(val)
+        g_tag = global_judge_summary()
+        if g_tag:
+            return f"[dim cyan](沿用全局专家裁判: {g_tag})[/dim cyan]"
+        return "[dim cyan](未配置/启发式)[/dim cyan]"
     if val is None or val == "" or val == []:
+        if key.startswith("judge_"):
+            g_tag = global_judge_summary()
+            if g_tag:
+                return f"[dim cyan](沿用全局: {g_tag})[/dim cyan]"
         return "[dim cyan](未配置/默认)[/dim cyan]"
     if kind == "driver":
         return f"{val} [dim]({_DRIVER_LABELS.get(str(val), '')})[/dim]"
@@ -488,7 +849,16 @@ def _field_plain(config: dict[str, Any], key: str, kind: str) -> str:
             return "(未配置)"
         s = str(val)
         return s[:3] + "********" + s[-4:] if len(s) > 8 else "*" * len(s)
+    if kind == "judge_model":
+        if val:
+            return str(val)
+        g_tag = global_judge_summary()
+        return f"(沿用全局专家裁判: {g_tag})" if g_tag else "(未配置/启发式)"
     if val is None or val == "" or val == []:
+        if key.startswith("judge_"):
+            g_tag = global_judge_summary()
+            if g_tag:
+                return f"(沿用全局: {g_tag})"
         return "(未配置/默认)"
     if kind == "suites":
         return ",".join(str(s) for s in val)
@@ -510,19 +880,32 @@ def _edit_field_value(config: dict[str, Any], key: str, kind: str, label: str,
     ))
 
     actions = [Choice("✏️  修改该项", value="edit"), Choice("↩ 返回（不改）", value="back")]
-    clearable = kind in ("text", "password", "effort", "path_opt", "judge_driver") and key.startswith(
-        ("judge_", "export_", "base_url", "proxy", "api_key")
+    clearable = kind in ("text", "password", "effort", "path_opt", "judge_driver", "judge_model") and (
+        key.startswith(("judge_", "export_", "base_url", "proxy", "api_key"))
     )
     if clearable:
         actions.insert(1, Choice("🧹 清空该项（恢复默认/沿用全局）", value="clear"))
+    g_tag = global_judge_summary()
+    if key == "judge_model" and g_tag:
+        actions.insert(
+            0,
+            Choice(f"🌐 使用当前全局专家裁判 ({g_tag})", value="use_global"),
+        )
 
     op = questionary.select(f"如何处理 [{label}]?", choices=actions, style=CUSTOM_STYLE).ask()
+    if op == "use_global":
+        apply_profile_global_judge(config)
+        console.print(f"[green]✔ [{label}] 已改为沿用全局专家裁判: {g_tag}[/green]")
+        return True
     if op != "edit" and op != "clear":
         return False
     if op == "clear":
-        config[key] = "" if kind != "effort" else None
-        if kind == "judge_driver":
-            config[key] = ""
+        if key == "judge_model":
+            apply_profile_global_judge(config)
+        else:
+            config[key] = "" if kind != "effort" else None
+            if kind == "judge_driver":
+                config[key] = ""
         console.print(f"[yellow]已清空 [{label}]。[/yellow]")
         return True
 
@@ -546,8 +929,21 @@ def _edit_field_value(config: dict[str, Any], key: str, kind: str, label: str,
             config[key] = new
             return True
         return False
+    if kind == "judge_model":
+        new = questionary.text(
+            "裁判模型标识 (本预设独立配置，留空=沿用全局):",
+            default=str(current or ""),
+            style=CUSTOM_STYLE,
+        ).ask()
+        if new is None:
+            return False
+        config[key] = new.strip()
+        return True
     if kind == "effort":
-        opts = [("", "默认 (Default / None)")] + [(v, _EFFORT_LABELS[v]) for v in ("low", "medium", "high", "xhigh", "max")]
+        opts = [("", "默认 (厂商默认)")] + [
+            (v, _EFFORT_LABELS[v])
+            for v in ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+        ]
         new = questionary.select("思考强度:", choices=[Choice(t, value=v) for v, t in opts],
                                  default=current, style=CUSTOM_STYLE).ask()
         if new is not None:
@@ -557,11 +953,11 @@ def _edit_field_value(config: dict[str, Any], key: str, kind: str, label: str,
     if kind == "suites":
         picked = questionary.checkbox(
             "评测套件 (空格选择):",
-            choices=[Choice(f"{_SUITE_LABELS[s]} ({s})", value=s, checked=s in (current or []))
-                     for s in ("short", "long", "reviewer", "critic")],
+            choices=[Choice(SUITE_LABELS.get(s, s), value=s, checked=s in (current or []))
+                     for s in SELECTABLE_KEYS],
             style=CUSTOM_STYLE).ask() or []
         if not picked:
-            picked = ["short"]
+            picked = [DEFAULT_ALL_KEYS[0]]
         config[key] = picked
         return True
     if kind == "bool":
@@ -760,12 +1156,14 @@ def configure_wizard(
     effort = questionary.select(
         "思考链推理强度 (Reasoning Effort / Thinking Budget):",
         choices=[
-            Choice("默认 / 厂商默认 (Default / None)", value=None),
-            Choice("低 (Low ~1k-2k tokens, 适合轻量调试与快修)", value="low"),
-            Choice("中 (Medium ~4k-8k tokens, 适合常规任务)", value="medium"),
-            Choice("高 (High ~8k-16k tokens, 适合算法与长任务)", value="high"),
-            Choice("超高 (XHigh ~16k-32k tokens, 深度推理与死锁破除)", value="xhigh"),
-            Choice("极限 (Max ~32k-64k tokens, 最大思考预算上限)", value="max"),
+            Choice("默认 / 厂商默认 (omit, vendor default)", value=None),
+            Choice("关闭 (none)", value="none"),
+            Choice("最小 (minimal)", value="minimal"),
+            Choice("低 (low)", value="low"),
+            Choice("中 (medium)", value="medium"),
+            Choice("高 (high)", value="high"),
+            Choice("超高 (xhigh)", value="xhigh"),
+            Choice("极限 (max)", value="max"),
             WIZARD_ABORT_CHOICE,
         ],
         default=default_effort,
@@ -776,23 +1174,20 @@ def configure_wizard(
 
     console.print("\n[bold cyan]>>> 第 3 步：勾选本次运行的评测套件[/bold cyan]")
 
-    default_suites = set(init.get("suites", ["short", "long"]))
+    default_suites = set(init.get("suites", list(DEFAULT_TUI_KEYS)))
     selected_suites = questionary.checkbox(
         "选择要评测的维度 (空格选择，Enter 确认):",
         choices=[
-            Choice("次世代短任务 (零拷贝Varint解析 / 分层时间轮 / 容错Lexer)", value="short", checked="short" in default_suites),
-            Choice("次世代长任务 (三节点Raft脑裂断电 / Saga分布式事务)", value="long", checked="long" in default_suites),
-            Choice("Reviewer 调试靶场 (并发死锁 / 跨模块语义漂移 / 诱饵防误报)", value="reviewer", checked="reviewer" in default_suites),
-            Choice("Critic 代码盲审 (去标签化高危缺陷 / 无锁环形诱饵)", value="critic", checked="critic" in default_suites),
-            WIZARD_ABORT_CHOICE,
-        ],
+            Choice(item.title, value=item.key, checked=item.key in default_suites)
+            for item in RUNNABLES
+        ] + [WIZARD_ABORT_CHOICE],
         style=CUSTOM_STYLE,
     ).ask()
 
     if selected_suites and WIZARD_ABORT in selected_suites:
         return None
     if not selected_suites:
-        selected_suites = ["short"]
+        selected_suites = [DEFAULT_ALL_KEYS[0]]
 
     console.print("\n[bold cyan]>>> 第 4 步：运行容灾与微调数据集导出[/bold cyan]")
 
@@ -832,24 +1227,34 @@ def configure_wizard(
 
     console.print("\n[bold cyan]>>> 第 5 步：配置独立专家裁判模型 (Judge Model for Critic)[/bold cyan]")
     global_judge_cfg = load_judge_config() or {}
-    global_judge_model = global_judge_cfg.get("model", "")
-    use_global_judge = False
-    if global_judge_model and not init.get("judge_model"):
-        g_driver = global_judge_cfg.get("driver", "")
-        g_effort = global_judge_cfg.get("effort", "")
-        use_global_judge = questionary.confirm(
-            f"检测到全局默认裁判 [{g_driver} -> {global_judge_model}"
-            f"{' | effort=' + g_effort if g_effort else ''}]，是否直接沿用 (跳过手动填写)?",
-            default=True,
-            style=CUSTOM_STYLE,
-        ).ask()
+    global_judge_model = str(global_judge_cfg.get("model") or "").strip()
+    g_tag = global_judge_summary()
 
-    has_judge = bool(init.get("judge_model"))
-    enable_judge = questionary.confirm(
-        "是否启用独立专家裁判模型对 Critic 盲审报告进行 L1~L4 深度复核 (防止水军关键词作弊)?",
-        default=has_judge or use_global_judge,
+    judge_mode_choices: list[Choice] = []
+    if g_tag:
+        judge_mode_choices.append(
+            Choice(f"🌐 使用当前全局专家裁判 ({g_tag})", value="global")
+        )
+    judge_mode_choices.extend([
+        Choice("为本配置单独填写裁判模型", value="custom"),
+        Choice("不单独配置（运行时若有全局裁判则自动沿用，否则启发式）", value="inherit"),
+        WIZARD_ABORT_CHOICE,
+    ])
+    if init.get("judge_model"):
+        default_judge_mode = "custom"
+    elif global_judge_model:
+        default_judge_mode = "global"
+    else:
+        default_judge_mode = "inherit"
+
+    judge_mode = questionary.select(
+        "裁判模型来源:",
+        choices=judge_mode_choices,
+        default=default_judge_mode,
         style=CUSTOM_STYLE,
     ).ask()
+    if judge_mode == WIZARD_ABORT or judge_mode is None:
+        return None
 
     judge_model = ""
     judge_driver = ""
@@ -857,10 +1262,9 @@ def configure_wizard(
     judge_api_key = ""
     judge_effort = None
 
-    if enable_judge and use_global_judge and not init.get("judge_model"):
-        # 沿用全局裁判：任务级留空，运行时自动回退到全局配置
-        console.print("[dim]✔ 本次运行将沿用全局默认裁判配置 (见预检清单 [全局默认])。[/dim]")
-    elif enable_judge:
+    if judge_mode == "global":
+        console.print(f"[dim]✔ 本次运行将沿用全局专家裁判: {g_tag}[/dim]")
+    elif judge_mode == "custom":
         judge_driver = questionary.select(
             "裁判模型协议驱动 (Judge Protocol Driver):",
             choices=[
@@ -903,10 +1307,13 @@ def configure_wizard(
         judge_effort = questionary.select(
             "裁判模型思考强度 (Judge Reasoning Effort):",
             choices=[
-                Choice("高 (High - 建议深度思考)", value="high"),
-                Choice("超高 (XHigh)", value="xhigh"),
-                Choice("中 (Medium)", value="medium"),
-                Choice("默认 (Default / None)", value=None),
+                Choice("高 (high)", value="high"),
+                Choice("超高 (xhigh)", value="xhigh"),
+                Choice("极限 (max)", value="max"),
+                Choice("中 (medium)", value="medium"),
+                Choice("最小 (minimal)", value="minimal"),
+                Choice("关闭 (none)", value="none"),
+                Choice("默认 (omit / vendor default)", value=None),
                 WIZARD_ABORT_CHOICE,
             ],
             default=init.get("judge_effort", "high"),
@@ -914,6 +1321,8 @@ def configure_wizard(
         ).ask()
         if judge_effort == WIZARD_ABORT:
             return None
+    else:
+        console.print("[dim]✔ 未单独配置裁判；有全局专家裁判时运行将自动沿用。[/dim]")
 
     config = {
         "driver": driver,
@@ -975,7 +1384,11 @@ def display_launch_card(config: dict[str, Any]) -> bool:
 
     suites_display = ", ".join([f"[bold green]{s}[/bold green]" for s in config.get("suites", [])])
     table.add_row("运行维度 (Suites)", suites_display)
-    table.add_row("断点自愈 (Resume)", "✔ 已开启 (启用 Prompt 快照重放)" if config.get("resume") else "✖ 未开启")
+    table.add_row("断点自愈 (Resume)", "✔ 已开启 (启用 Prompt 快照重放)" if config.get("resume") or config.get("continue_run") else "✖ 未开启")
+    if config.get("continue_run") and config.get("output"):
+        table.add_row("继续未完成", f"[bold yellow]{config['output']}[/bold yellow]")
+    elif config.get("output"):
+        table.add_row("输出目录", str(config["output"]))
 
     global_judge = load_judge_config()
     j_model = config.get("judge_model") or global_judge.get("model")
@@ -1037,15 +1450,18 @@ def launch_harness(config: dict[str, Any]) -> int:
         os.environ["http_proxy"] = proxy
         os.environ["https_proxy"] = proxy
 
-    # 构建 CLI 参数
-    suites = config.get("suites", ["all"])
-    suite_arg = "all" if len(suites) >= 4 else suites[0] if len(suites) == 1 else "all"
+    # 构建 CLI 参数。多选套件并入同一次 CLI 调用，评测结束后才出总表/分任务表。
+    suites = [s for s in config.get("suites", list(DEFAULT_TUI_KEYS)) if s]
+    if not suites:
+        suites = [DEFAULT_ALL_KEYS[0]]
 
-    cli_argv = [
-        "--suite", suite_arg,
+    cli_argv: list[str] = []
+    for s in suites:
+        cli_argv.extend(["--suite", s])
+    cli_argv.extend([
         "--model", config["model"],
         "--driver", driver,
-    ]
+    ])
 
     if base_url:
         cli_argv.extend(["--base-url", base_url])
@@ -1055,8 +1471,15 @@ def launch_harness(config: dict[str, Any]) -> int:
     if config.get("effort"):
         cli_argv.extend(["--effort", config["effort"]])
 
-    if config.get("resume"):
+    # TUI 全程可交互：退步槽位一律弹窗确认（非 TTY 自动回退保留最高分）
+    cli_argv.extend(["--on-regress", "ask"])
+
+    if config.get("resume") or config.get("continue_run"):
         cli_argv.append("--resume")
+    if config.get("continue_run"):
+        cli_argv.append("--continue-run")
+    if config.get("output"):
+        cli_argv.extend(["--output", str(config["output"])])
 
     global_judge = load_judge_config()
     active_j_model = config.get("judge_model") or global_judge.get("model")
@@ -1084,7 +1507,6 @@ def launch_harness(config: dict[str, Any]) -> int:
         Path(config["export_dpo"]).parent.mkdir(parents=True, exist_ok=True)
         cli_argv.extend(["--export-dpo", config["export_dpo"]])
 
-    # 如果选了多个但不是全部，按选中的逐个跑
     try:
         from benchmark_v3.bench_harness.cli import main as cli_main
     except ImportError:
@@ -1092,18 +1514,7 @@ def launch_harness(config: dict[str, Any]) -> int:
 
     console.print("[bold green]✔ 正在初始化执行环境，切入实时评测渲染流...[/bold green]\n")
 
-    if len(suites) > 1 and len(suites) < 4:
-        # 多套件串行执行
-        exit_code = 0
-        for s in suites:
-            sub_argv = list(cli_argv)
-            sub_argv[1] = s
-            code = cli_main(sub_argv)
-            if code != 0:
-                exit_code = code
-        return exit_code
-    else:
-        return cli_main(cli_argv)
+    return cli_main(cli_argv)
 
 
 def run_tui() -> int:

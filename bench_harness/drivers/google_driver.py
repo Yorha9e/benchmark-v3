@@ -19,7 +19,11 @@ from benchmark_v3.bench_harness.drivers.base import (
     DriverResponse,
     PermanentDriverError,
     TransientDriverError,
+    build_httpx_client,
+    env_proxy,
 )
+from benchmark_v3.bench_harness.drivers.effort import gemini_thinking_kwargs
+from benchmark_v3.bench_harness.drivers.stream import is_stream_unsupported, merge_gemini_chunks
 
 
 class GoogleGenAIDriver(BaseDriver):
@@ -46,7 +50,7 @@ class GoogleGenAIDriver(BaseDriver):
             from google import genai
         except ImportError as exc:
             raise PermanentDriverError(f"google-genai SDK not installed: {exc}") from exc
-        proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY") or os.environ.get("https_proxy") or os.environ.get("http_proxy")
+        proxy = env_proxy()
         if proxy:
             os.environ.setdefault("HTTP_PROXY", proxy)
             os.environ.setdefault("HTTPS_PROXY", proxy)
@@ -57,6 +61,10 @@ class GoogleGenAIDriver(BaseDriver):
         effective_base_url = self.base_url or os.environ.get("GEMINI_BASE_URL")
         if effective_base_url:
             http_opts["base_url"] = effective_base_url
+        try:
+            http_opts["httpx_client"] = build_httpx_client(proxy)
+        except Exception:
+            pass
 
         self._client = genai.Client(
             api_key=self.api_key or os.environ.get("GEMINI_API_KEY", "mock-key"),
@@ -101,14 +109,24 @@ class GoogleGenAIDriver(BaseDriver):
                 "temperature": kwargs.get("temperature", self.temperature),
                 "automatic_function_calling": types.AutomaticFunctionCallingConfig(disable=True),
             }
-            eff = kwargs.get("thinking_effort", kwargs.get("effort", self.effort))
-            if eff and eff not in ("none", "off", "disabled"):
-                budget_map = {"low": 1024, "medium": 4096, "high": 8192, "xhigh": 16384, "max": 32768}
-                budget = budget_map.get(eff, 4096)
+            thinking_kwargs = gemini_thinking_kwargs(
+                self.model_id,
+                kwargs.get("thinking_effort", kwargs.get("effort", self.effort)),
+            )
+            if thinking_kwargs:
                 try:
-                    config_args["thinking_config"] = types.ThinkingConfig(thinking_budget=budget)
+                    config_args["thinking_config"] = types.ThinkingConfig(**thinking_kwargs)
                 except Exception:
-                    pass
+                    if "thinking_level" in thinking_kwargs:
+                        fallback = gemini_thinking_kwargs(
+                            "gemini-2.5-flash",
+                            kwargs.get("thinking_effort", kwargs.get("effort", self.effort)),
+                        )
+                        if fallback:
+                            try:
+                                config_args["thinking_config"] = types.ThinkingConfig(**fallback)
+                            except Exception:
+                                pass
             converted = self.convert_tools(tools)
             if converted:
                 config_args["tools"] = converted
@@ -122,7 +140,7 @@ class GoogleGenAIDriver(BaseDriver):
 
             config = types.GenerateContentConfig(**config_args)
             try:
-                response = client.models.generate_content(model=self.model_id, contents=contents, config=config)
+                response = self._generate(client, contents, config)
             except Exception as exc:
                 raise self._map_error(exc) from exc
             result = self.parse_response(response)
@@ -135,6 +153,21 @@ class GoogleGenAIDriver(BaseDriver):
             return result
 
         return self.run_with_retry(_call)
+
+    def _generate(self, client: Any, contents: Any, config: Any) -> Any:
+        """Prefer generate_content_stream so thinking idle time does not drop the socket."""
+        models = client.models
+        stream_fn = getattr(models, "generate_content_stream", None)
+        if callable(stream_fn):
+            try:
+                chunks = list(stream_fn(model=self.model_id, contents=contents, config=config))
+                if chunks:
+                    return merge_gemini_chunks(chunks)
+            except Exception as exc:
+                if not is_stream_unsupported(exc):
+                    if type(exc).__name__ not in ("AttributeError", "TypeError"):
+                        raise
+        return models.generate_content(model=self.model_id, contents=contents, config=config)
 
     @staticmethod
     def convert_messages(messages: list[Any]) -> tuple[str, list[Any]]:
@@ -270,3 +303,51 @@ class GoogleGenAIDriver(BaseDriver):
         except ImportError as exc:
             raise PermanentDriverError(f"google-genai SDK not installed: {exc}") from exc
         return types.Part.from_function_response(name=function_name, response=response_dict)
+
+
+def self_test() -> tuple[int, int]:
+    from types import SimpleNamespace
+
+    counts = [0, 0]
+
+    def check(name: str, cond: bool) -> None:
+        counts[0 if cond else 1] += 1
+        print(f"{'PASS' if cond else 'FAIL'} google_driver::{name}", flush=True)
+
+    chunks = [
+        SimpleNamespace(
+            candidates=[SimpleNamespace(
+                finish_reason="STOP",
+                content=SimpleNamespace(parts=[SimpleNamespace(text="x", function_call=None, thought=None)]),
+            )],
+            usage_metadata=None,
+        ),
+        SimpleNamespace(
+            candidates=[SimpleNamespace(
+                finish_reason="STOP",
+                content=SimpleNamespace(parts=[SimpleNamespace(text="y", function_call=None, thought=None)]),
+            )],
+            usage_metadata=SimpleNamespace(
+                prompt_token_count=1, candidates_token_count=2, total_token_count=3
+            ),
+        ),
+    ]
+
+    class _Models:
+        def generate_content_stream(self, **kwargs):
+            return chunks
+
+        def generate_content(self, **kwargs):
+            raise AssertionError("non-stream generate_content should not run")
+
+    driver = GoogleGenAIDriver("gemini-3.8-flash", client=SimpleNamespace(models=_Models()))
+    merged = driver._generate(driver._client, contents="hi", config=None)
+    parsed = driver.parse_response(merged)
+    check("stream_merge_content", parsed.content == "x\ny")
+    check("stream_merge_tokens", parsed.total_tokens == 3)
+    return counts[0], counts[1]
+
+
+if __name__ == "__main__":
+    passed, failed = self_test()
+    raise SystemExit(0 if failed == 0 else 1)

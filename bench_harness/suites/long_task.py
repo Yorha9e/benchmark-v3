@@ -602,7 +602,10 @@ def run_raft_scenario(
     Never raises for model-behaviour reasons — every failure is captured
     as data (only harness-internal crashes propagate).
     """
-    workspace_dir = Path(workspace_dir)
+    # Absolute: child node processes are spawned with cwd=node-dir, so any
+    # relative script path would resolve against the WRONG directory
+    # (doubled path, silent no-start, leader=None for every model).
+    workspace_dir = Path(workspace_dir).resolve()
     broker_root = workspace_dir / "broker"
     nodes_dir = workspace_dir / "nodes"
     broker_root.mkdir(parents=True, exist_ok=True)
@@ -1470,7 +1473,9 @@ def run_saga_scenario(
     coord_src: str | None = None,
 ) -> dict[str, Any]:
     """Execute the full Saga Jepsen scenario; returns milestone inputs."""
-    workspace_dir = Path(workspace_dir)
+    # Absolute (see run_raft_scenario): coord children spawn with their own
+    # cwd, so relative runner/workspace paths would silently no-start.
+    workspace_dir = Path(workspace_dir).resolve()
     broker_root = workspace_dir / "saga_broker"
     broker_root.mkdir(parents=True, exist_ok=True)
     write_partitions(broker_root, [])
@@ -1791,17 +1796,19 @@ def build_raft_milestones(data: dict[str, Any]) -> list[MilestoneResult]:
         ]),
         _ms2("raft_cluster", 2, "Log replication (20 writes)", [
             (len(phase_a) == 20, "%d/20 acked" % len(phase_a)),
-            (all(r["k"] in union_post for r in phase_a),
-             "all acked keys present post-heal"),
+            (len(phase_a) > 0 and all(r["k"] in union_post for r in phase_a),
+             "all acked keys present post-heal" if phase_a else "no acked writes to verify"),
         ]),
         _ms2("raft_cluster", 3, "Single leader per term", [
-            (single.passed, single.detail),
+            (len(elections) > 0 and single.passed,
+             single.detail if elections else "no elections observed"),
             (len({e.get("term") for e in elections}) >= 1, "terms observed"),
         ]),
         _ms2("raft_cluster", 4, "Split-brain safety", [
             (data.get("minority_write_acked") is False,
              "minority write acked=%r" % (data.get("minority_write_acked"),)),
-            ("minority_key" not in union_post, "minority key absent post-heal"),
+            (bool(union_post) and "minority_key" not in union_post,
+             "minority key absent post-heal" if union_post else "no post-heal state to verify"),
         ]),
         _ms2("raft_cluster", 5, "Majority progress during partition", [
             (data.get("partition_leader") in majority,
@@ -1816,7 +1823,8 @@ def build_raft_milestones(data: dict[str, Any]) -> list[MilestoneResult]:
              "lagging node converged to majority state"),
         ]),
         _ms2("raft_cluster", 7, "Commit persistence", [
-            (persist.passed, persist.detail),
+            (len(committed) > 0 and persist.passed,
+             persist.detail if committed else "no committed records to verify"),
             (len(committed) >= 20, "%d committed records" % len(committed)),
         ]),
         _ms2("raft_cluster", 8, "Crash recovery (external SIGKILL)", [
@@ -1830,7 +1838,8 @@ def build_raft_milestones(data: dict[str, Any]) -> list[MilestoneResult]:
              consist_final.detail if consist_final else "no final stores"),
         ]),
         _ms2("raft_cluster", 10, "Client linearizability", [
-            (linear.passed, linear.detail),
+            (len(data.get("client_ops", [])) > 0 and linear.passed,
+             linear.detail if data.get("client_ops") else "no operations to verify"),
             (len(data.get("client_ops", [])) >= 20,
              "%d client ops recorded" % len(data.get("client_ops", []))),
         ]),
@@ -1926,7 +1935,8 @@ def build_saga_milestones(data: dict[str, Any]) -> list[MilestoneResult]:
             (data.get("dangling_holds") == 0, "holds left=%r" % (data.get("dangling_holds"),)),
         ]),
         _ms2("saga_coordinator", 10, "Atomicity + never-lost persistence", [
-            (atomic_ok, atomic_detail),
+            (len(committed) > 0 and atomic_ok,
+             atomic_detail if committed else "no committed txns to verify"),
             (bool(persist and persist.passed), persist.detail if persist else "no committed census"),
         ]),
     ]
@@ -1999,7 +2009,6 @@ class LongTaskSuite(SuiteAdapter):
 
     suite_name = "long"
     TASK_IDS = ("raft_cluster", "saga_coordinator")
-    max_turns = 16
 
     def describe_task(self, task_id: str) -> dict[str, Any]:
         title, _ = LONG_BRIEFS[task_id]
@@ -2015,10 +2024,14 @@ class LongTaskSuite(SuiteAdapter):
         target = "raft.py" if task_id == "raft_cluster" else "saga.py"
         return (
             "You are implementing a distributed-systems benchmark task: %s.\n\n"
-            "%s\n\nRules: create ONLY `%s` in the workspace (stdlib only, "
-            "no network); honour every line of the contract above, including "
-            "the partitions file, the marker line and the durability rules. "
-            "When done, reply with no further tool calls." % (title, contract, target)
+            "%s\n\nRules: use the `write` or `edit` tool to create ONLY `%s` "
+            "in the workspace (stdlib only, no network) — bash/`python -c` "
+            "prototypes are not scored; honour every line of the contract "
+            "above, including the partitions file, the marker line and the "
+            "durability rules. When the file on disk is ready, call the "
+            "`finish` tool with a non-empty summary of what you changed and "
+            "how you checked it; a reply with no tool calls does not end "
+            "the task." % (title, contract, target)
         )
 
     def evaluate_task(

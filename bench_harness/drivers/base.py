@@ -25,6 +25,95 @@ DEFAULT_HEADERS: dict[str, str] = {
     "Accept": "application/json, text/event-stream, */*",
 }
 
+#: Connect vs idle-read split. A single 120s timeout used to kill long
+#: reasoning turns that emit nothing until the first token. Streaming
+#: resets the read timer on every SSE chunk; the read budget is the
+#: allowed silence *between* chunks.
+#: Default read is unlimited (``none``) so the harness does not abort a
+#: thinking model and leave ``client disconnected`` on the gateway.
+#: Override with BENCH_HTTP_READ_TIMEOUT (seconds, or none/0).
+DEFAULT_CONNECT_TIMEOUT = 30.0
+DEFAULT_WRITE_TIMEOUT = 120.0
+DEFAULT_POOL_TIMEOUT = 30.0
+DEFAULT_KEEPALIVE_EXPIRY = 300.0
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+def default_read_timeout() -> float | None:
+    """Idle-read timeout in seconds, or None for no limit."""
+    raw = os.environ.get("BENCH_HTTP_READ_TIMEOUT", "none")
+    text = str(raw).strip().lower()
+    if text in ("", "none", "off", "0", "infinite", "inf"):
+        return None
+    try:
+        value = float(text)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def httpx_timeout() -> Any:
+    """httpx timeout: short connect, optional idle-read for streaming/thinking."""
+    import httpx
+
+    return httpx.Timeout(
+        connect=DEFAULT_CONNECT_TIMEOUT,
+        read=default_read_timeout(),
+        write=DEFAULT_WRITE_TIMEOUT,
+        pool=DEFAULT_POOL_TIMEOUT,
+    )
+
+
+def httpx_limits() -> Any:
+    """Keep pooled sockets longer than httpx's 5s default.
+
+    Gateways log the pool reclaim as ``client disconnected`` even after a
+    successful turn; 5s expiry makes that look like a mid-request abort.
+    """
+    import httpx
+
+    expiry = _env_float("BENCH_HTTP_KEEPALIVE", DEFAULT_KEEPALIVE_EXPIRY)
+    if expiry <= 0:
+        expiry = DEFAULT_KEEPALIVE_EXPIRY
+    return httpx.Limits(
+        max_connections=100,
+        max_keepalive_connections=20,
+        keepalive_expiry=expiry,
+    )
+
+
+def env_proxy() -> str | None:
+    return (
+        os.environ.get("HTTPS_PROXY")
+        or os.environ.get("HTTP_PROXY")
+        or os.environ.get("https_proxy")
+        or os.environ.get("http_proxy")
+    )
+
+
+def build_httpx_client(proxy: str | None = None) -> Any:
+    """Shared HTTP client: streaming-friendly timeouts + longer keep-alive."""
+    import httpx
+
+    kwargs: dict[str, Any] = {
+        "headers": dict(DEFAULT_HEADERS),
+        "timeout": httpx_timeout(),
+        "limits": httpx_limits(),
+        "follow_redirects": True,
+    }
+    if proxy:
+        kwargs["proxy"] = proxy
+    return httpx.Client(**kwargs)
+
 #: HTTP statuses treated as transient (SPEC v3 Section 4).
 TRANSIENT_STATUS_CODES = frozenset({408, 425, 429, 500, 502, 503, 504})
 
@@ -232,10 +321,31 @@ class BaseDriver(ABC):
             return None
         return parsed if parsed > 0 else None
 
+    @staticmethod
+    def compact_http_body(message: str) -> str:
+        """Keep JSON errors; collapse HTML 404 pages into one readable line."""
+        text = (message or "").strip()
+        if not text:
+            return text
+        lowered = text[:200].lower()
+        if "<!doctype html" in lowered or "<html" in lowered:
+            if "openrouter" in text.lower():
+                return (
+                    "OpenRouter returned an HTML 404 page (wrong path). "
+                    "Anthropic SDK posts to {base}/v1/messages — use "
+                    "https://openrouter.ai/api not https://openrouter.ai/api/v1. "
+                    "OpenAI-compat driver should use https://openrouter.ai/api/v1."
+                )
+            return "server returned an HTML page instead of a JSON API error (wrong base URL or path)"
+        if len(text) > 500:
+            return text[:500] + "…"
+        return text
+
     def classify_http_error(self, status_code: int | None, message: str = "") -> Exception:
         """Map an HTTP failure to transient vs permanent driver errors."""
+        compact = self.compact_http_body(message)
         if status_code in PERMANENT_STATUS_CODES:
-            return PermanentDriverError(f"HTTP {status_code}: {message}")
+            return PermanentDriverError(f"HTTP {status_code}: {compact}")
         if self.is_transient_status(status_code):
-            return TransientDriverError(message or f"HTTP {status_code}", status_code=status_code)
-        return PermanentDriverError(f"HTTP {status_code}: {message}")
+            return TransientDriverError(compact or f"HTTP {status_code}", status_code=status_code)
+        return PermanentDriverError(f"HTTP {status_code}: {compact}")

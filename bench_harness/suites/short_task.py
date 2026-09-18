@@ -1,6 +1,6 @@
 """Next-gen short-task suite: micro-engines with hard resource oracles.
 
-Three tasks (12 assertions, 4 per task), each scored by running the model's
+Three tasks (30 assertions, 10 per task), each scored by running the model's
 ``solution.py`` inside a fresh child interpreter via
 :class:`~benchmark_v3.bench_harness.core.runner.ProcessRunner`:
 
@@ -673,10 +673,14 @@ class ShortTaskSuite(SuiteAdapter):
         return (
             "You are implementing a micro-engine benchmark task: %s.\n\n"
             "Contract (implement exactly this API in `solution.py`):\n%s\n\n"
-            "Rules: edit ONLY `solution.py` in the workspace; no network; "
-            "no third-party packages; keep per-call work incremental "
-            "(streaming/memory limits are enforced). When done, reply with "
-            "no further tool calls." % (meta["title"], meta["brief"])
+            "Rules: use the `write` or `edit` tool to implement ONLY "
+            "`solution.py` in the workspace — bash/`python -c` prototypes "
+            "are not scored; no network; no third-party packages; keep "
+            "per-call work incremental (streaming/memory limits are "
+            "enforced). When the file on disk is ready, call the `finish` "
+            "tool with a non-empty summary of what you changed and how you "
+            "checked it; a reply with no tool calls does not end the task."
+            % (meta["title"], meta["brief"])
         )
 
     def evaluate_task(
@@ -981,7 +985,7 @@ def self_test() -> tuple[int, int]:
     """Run module self-tests. Returns ``(passed, failed)`` counts."""
     import tempfile
 
-    from benchmark_v3.bench_harness.suites.base import ScriptedDriver
+    from benchmark_v3.bench_harness.suites.base import ScriptedDriver, scripted_finish
 
     counts = [0, 0]
 
@@ -991,6 +995,17 @@ def self_test() -> tuple[int, int]:
 
     suite = ShortTaskSuite()
     check("task_ids", suite.task_ids() == ["varint_parser", "timing_wheel", "lexer_state_machine"])
+    check("default_condition_a", suite.condition == "a" and suite.run_key == "short")
+    with tempfile.TemporaryDirectory(prefix="short-bplan-") as tmp:
+        bsuite = ShortTaskSuite(condition="b")
+        bsuite.prepare_task("varint_parser", Path(tmp))
+        bsuite._maybe_write_b_plan("varint_parser", Path(tmp))
+        check("b_writes_plan", (Path(tmp) / "PLAN.md").is_file())
+        plan_text = (Path(tmp) / "PLAN.md").read_text(encoding="utf-8")
+        check("b_plan_no_oracle_leak", "EVAL_SEED" not in plan_text)
+        check("b_plan_points_at_task", "`TASK.md`" in plan_text)
+        check("b_plan_asks_read", "`read`" in plan_text)
+        check("b_plan_not_second_spec", "pick one reading" not in plan_text)
 
     # -- reference solutions pass all 12 assertions --
     total_pass = 0
@@ -1072,7 +1087,7 @@ def self_test() -> tuple[int, int]:
                         }
                     ],
                 },
-                {"content": "done"},
+                scripted_finish("Wrote solution.py varint encode/decode and checked streaming."),
             ],
         )
         report = suite.run_session("varint_parser", "scripted", driver, tmp)

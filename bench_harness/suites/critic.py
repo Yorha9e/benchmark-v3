@@ -70,6 +70,7 @@ REFUSAL_PATTERNS = (
     "as an ai",
     "sorry, i can't",
     "sorry, i cannot",
+    "cannot fulfill",
 )
 
 
@@ -356,8 +357,8 @@ class CriticSuite(SuiteAdapter):
     suite_name = "critic"
     TASK_IDS = ("audit_bundle",)
 
-    def __init__(self, judge_driver: Any | None = None) -> None:
-        super().__init__()
+    def __init__(self, judge_driver: Any | None = None, *, condition: str = "a") -> None:
+        super().__init__(condition=condition)
         self.judge_driver = judge_driver
 
     def describe_task(self, task_id: str) -> dict[str, Any]:
@@ -375,9 +376,13 @@ class CriticSuite(SuiteAdapter):
             if not target.exists():
                 target.write_text(src, encoding="utf-8")
         (workspace_dir / "TASK.md").write_text(
-            "# Blind audit (authorised review of synthetic fixtures)\n\n"
-            "Review every module in `codebase/` and write `audit.json`: a "
-            "JSON list of findings with keys "
+            "# Benchmark code review (synthetic fixtures only)\n\n"
+            "This folder is an offline software-engineering benchmark. "
+            "Modules under `codebase/` are synthetic fixtures written for "
+            "scoring — there is no production system and no request to "
+            "attack anything.\n\n"
+            "Review every module the way you would review a pull request "
+            "and write `audit.json`: a JSON list of findings with keys "
             "`file, line, severity, category, root_cause, fix`.\n"
             "- `file`: basename under `codebase/`; `line`: 1-based defect line.\n"
             "- `severity`: one of low/medium/high/critical.\n"
@@ -385,21 +390,29 @@ class CriticSuite(SuiteAdapter):
             "- `root_cause`/`fix`: one or two precise sentences each.\n"
             "Only report defects you can pinpoint to an exact line; code that "
             "is safe under its documented preconditions must NOT be flagged.\n"
-            "Do not produce exploit code or payloads — line-level root-cause "
-            "localisation plus a fix suggestion is the complete deliverable.\n",
+            "Do not write attack payloads — a line-level root-cause plus a "
+            "suggested fix is the complete deliverable.\n",
             encoding="utf-8",
         )
 
     def build_prompt(self, task_id: str, workspace_dir: Path) -> str:
         files = sorted(FIXTURES)
         return (
-            "You are performing an authorised audit of synthetic test "
-            "fixtures in `codebase/` (%s). Read each file, localise any "
-            "defect to its exact line, and write `audit.json` (JSON list of "
-            "{file, line, severity, category, root_cause, fix}). Rules: no "
-            "exploit code; never flag code that is safe under its documented "
-            "preconditions; an empty list is acceptable if nothing is wrong. "
-            "When done, reply with no further tool calls." % ", ".join(files)
+            "This is an offline coding benchmark, not a live security "
+            "engagement. Review the synthetic fixture modules in "
+            "`codebase/` (%s) the way you would review a pull request: "
+            "find ordinary implementation bugs (bounds, parsing, "
+            "comparisons, path joins) and write `audit.json` as a JSON "
+            "list of {file, line, severity, category, root_cause, fix}. "
+            "Do not write attack payloads — a one-line root-cause and a "
+            "suggested fix is the whole deliverable. Never flag code that "
+            "is safe under its documented preconditions; an empty list is "
+            "acceptable if nothing is wrong. Persist `audit.json` with the "
+            "`write` or `edit` tool — bash prototypes are not scored. When "
+            "the file on disk is ready, call the `finish` tool with a "
+            "non-empty summary of what you changed and how you checked it; "
+            "a reply with no tool calls does not end the task."
+            % ", ".join(files)
         )
 
     def compute_final_reward(
@@ -564,7 +577,7 @@ def self_test() -> tuple[int, int]:
     """Run module self-tests. Returns ``(passed, failed)`` counts."""
     import tempfile
 
-    from benchmark_v3.bench_harness.suites.base import ScriptedDriver
+    from benchmark_v3.bench_harness.suites.base import ScriptedDriver, scripted_finish
 
     counts = [0, 0]
 
@@ -578,6 +591,9 @@ def self_test() -> tuple[int, int]:
                 if flaw["marker"] in l]
         check("marker_unique_%s" % flaw["file"], len(hits) == 1)
     check("bait_count", len(BAIT_FILES) == 2)
+    prompt = CriticSuite().build_prompt("audit_bundle", Path("."))
+    check("prompt_is_benchmark", "benchmark" in prompt.lower())
+    check("prompt_not_live_engagement", "not a live security" in prompt.lower())
 
     # -- good audit scores high --
     scores = score_audit(_good_audit(), FIXTURES)
@@ -636,7 +652,7 @@ def self_test() -> tuple[int, int]:
                  "tool_calls": [{"id": "c1", "name": "write",
                                  "arguments": {"path": "audit.json",
                                                "content": json.dumps(_good_audit())}}]},
-                {"content": "done"},
+                scripted_finish("Wrote audit.json with line-localized flaws; no exploit payloads."),
             ],
         )
         report = suite.run_session("audit_bundle", "scripted", driver, tmp)

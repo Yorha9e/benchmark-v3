@@ -16,7 +16,31 @@ from benchmark_v3.bench_harness.drivers.base import (
     DriverResponse,
     PermanentDriverError,
     TransientDriverError,
+    build_httpx_client,
+    env_proxy,
+    httpx_timeout,
 )
+from benchmark_v3.bench_harness.drivers.effort import anthropic_effort_wire
+from benchmark_v3.bench_harness.drivers.stream import (
+    finalize_anthropic_stream,
+    is_stream_unsupported,
+    looks_like_anthropic_message,
+)
+
+
+def normalize_anthropic_base_url(url: str | None) -> str | None:
+    """Strip a trailing ``/v1`` — the Anthropic SDK always posts ``/v1/messages``.
+
+    OpenRouter's Messages API lives at ``https://openrouter.ai/api/v1/messages``,
+    so the SDK base must be ``https://openrouter.ai/api``. Passing
+    ``.../api/v1`` produces ``.../api/v1/v1/messages`` and an HTML 404.
+    """
+    if not url or not isinstance(url, str):
+        return url
+    text = url.strip().rstrip("/")
+    if text.lower().endswith("/v1"):
+        text = text[:-3].rstrip("/")
+    return text or url
 
 
 class AnthropicDriver(BaseDriver):
@@ -40,21 +64,19 @@ class AnthropicDriver(BaseDriver):
         if self._client is not None:
             return self._client
         try:
-            import httpx
             from anthropic import Anthropic
         except ImportError as exc:
             raise PermanentDriverError(f"anthropic SDK not installed: {exc}") from exc
 
-        proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY") or os.environ.get("https_proxy") or os.environ.get("http_proxy")
-        http_client = httpx.Client(
-            headers=dict(DEFAULT_HEADERS),
-            proxy=proxy,
-            timeout=httpx.Timeout(120.0, connect=30.0),
-        )
+        timeout = httpx_timeout()
+        http_client = build_httpx_client(env_proxy())
         self._client = Anthropic(
             api_key=self.api_key or os.environ.get("ANTHROPIC_API_KEY", "mock-key"),
-            base_url=self.base_url or os.environ.get("ANTHROPIC_BASE_URL"),
+            base_url=normalize_anthropic_base_url(
+                self.base_url or os.environ.get("ANTHROPIC_BASE_URL")
+            ),
             http_client=http_client,
+            timeout=timeout,
             default_headers=dict(DEFAULT_HEADERS),
             max_retries=0,  # retries managed by the harness
         )
@@ -162,17 +184,26 @@ class AnthropicDriver(BaseDriver):
             if converted:
                 create_kwargs["tools"] = converted
 
-            eff = kwargs.get("thinking_effort", kwargs.get("effort", self.effort))
-            if eff and eff not in ("none", "off", "disabled"):
-                budget_map = {"low": 2048, "medium": 8192, "high": 16384, "xhigh": 32768, "max": 64000}
-                budget = budget_map.get(eff, 8192)
-                create_kwargs["thinking"] = {"type": "enabled", "budget_tokens": budget}
-                current_max = create_kwargs.get("max_tokens", self.max_tokens)
-                create_kwargs["max_tokens"] = max(current_max, budget + 4096)
+            wire = anthropic_effort_wire(
+                self.model_id,
+                kwargs.get("thinking_effort", kwargs.get("effort", self.effort)),
+            )
+            if wire is not None:
+                mode, payload = wire
+                current_max = int(create_kwargs.get("max_tokens", self.max_tokens))
+                if mode == "adaptive":
+                    create_kwargs["thinking"] = {"type": "adaptive"}
+                    create_kwargs["output_config"] = {"effort": payload}
+                    if payload in ("high", "xhigh", "max"):
+                        create_kwargs["max_tokens"] = max(current_max, 32000)
+                else:
+                    budget = int(payload)
+                    create_kwargs["thinking"] = {"type": "enabled", "budget_tokens": budget}
+                    create_kwargs["max_tokens"] = max(current_max, budget + 4096)
                 create_kwargs.pop("temperature", None)
 
             try:
-                response = client.messages.create(**create_kwargs)
+                response = self._create_message(client, create_kwargs)
             except Exception as exc:
                 raise self._map_error(exc) from exc
             result = self.parse_response(response)
@@ -185,6 +216,26 @@ class AnthropicDriver(BaseDriver):
             return result
 
         return self.run_with_retry(_call)
+
+    def _create_message(self, client: Any, create_kwargs: dict[str, Any]) -> Any:
+        """Prefer Anthropic SSE (``messages.stream``); keep parse_response unchanged."""
+        messages = client.messages
+        stream_fn = getattr(messages, "stream", None)
+        if callable(stream_fn):
+            try:
+                return finalize_anthropic_stream(stream_fn(**create_kwargs))
+            except Exception as exc:
+                if not is_stream_unsupported(exc):
+                    raise
+        try:
+            raw = messages.create(**{**create_kwargs, "stream": True})
+        except Exception as exc:
+            if is_stream_unsupported(exc):
+                return messages.create(**create_kwargs)
+            raise
+        if looks_like_anthropic_message(raw):
+            return raw
+        return finalize_anthropic_stream(raw)
 
     def parse_response(self, response: Any) -> DriverResponse:
         tool_calls: list[dict[str, Any]] = []
@@ -245,3 +296,49 @@ class AnthropicDriver(BaseDriver):
                 }
             ],
         }
+
+
+def self_test() -> tuple[int, int]:
+    from types import SimpleNamespace
+
+    counts = [0, 0]
+
+    def check(name: str, cond: bool) -> None:
+        counts[0 if cond else 1] += 1
+        print(f"{'PASS' if cond else 'FAIL'} anthropic_driver::{name}", flush=True)
+
+    class _Mgr:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def get_final_message(self):
+            return SimpleNamespace(
+                content=[
+                    SimpleNamespace(type="thinking", thinking="why"),
+                    SimpleNamespace(type="text", text="done"),
+                ],
+                stop_reason="end_turn",
+                usage=SimpleNamespace(input_tokens=2, output_tokens=3),
+            )
+
+    class _Messages:
+        def stream(self, **kwargs):
+            return _Mgr()
+
+        def create(self, **kwargs):
+            raise AssertionError("non-stream create should not run when stream() works")
+
+    driver = AnthropicDriver("claude-sonnet-4-6", client=SimpleNamespace(messages=_Messages()))
+    result = driver.chat([{"role": "user", "content": "hi"}])
+    check("stream_text", result.content == "done")
+    check("stream_thought", result.thought == "why")
+    check("stream_tokens", result.total_tokens == 5)
+    return counts[0], counts[1]
+
+
+if __name__ == "__main__":
+    passed, failed = self_test()
+    raise SystemExit(0 if failed == 0 else 1)

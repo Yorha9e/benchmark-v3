@@ -40,14 +40,41 @@ class WorkspaceManager:
     # -- lifecycle ------------------------------------------------------
 
     def setup(self, create_git: bool = False) -> Path:
-        """Create the sandbox directory and record the Git baseline."""
+        """Create the sandbox directory.
+
+        Git baseline is *not* created here: fixtures are written by
+        ``prepare_task`` afterwards. Call :meth:`ensure_git_baseline`
+        once the workspace tree is complete. ``create_git=True`` is
+        kept for callers that already have files in place.
+        """
         self.workspace_dir.mkdir(parents=True, exist_ok=True)
-        if create_git and not (self.workspace_dir / ".git").exists():
-            self._git("init")
-            self._git("add", "-A")
-            self._git("commit", "-m", "baseline", "--allow-empty")
-        self.record_baseline()
+        if create_git:
+            self.ensure_git_baseline()
+        else:
+            self.record_baseline()
         return self.workspace_dir
+
+    def ensure_git_baseline(self) -> str | None:
+        """Init the workspace repo and commit the current tree as baseline.
+
+        Uses ``git -c user.*`` only (never writes the user gitconfig).
+        Fail-open: missing git or commit errors leave ``baseline_commit`` unset
+        so evaluation still proceeds.
+        """
+        try:
+            if not (self.workspace_dir / ".git").exists():
+                self._git("init")
+            self._git("add", "-A")
+            self._git(
+                "-c", "user.email=bench-harness@localhost",
+                "-c", "user.name=bench-harness",
+                "-c", "commit.gpgsign=false",
+                "commit", "-m", "baseline", "--allow-empty", "--no-gpg-sign",
+            )
+        except Exception:
+            self.baseline_commit = None
+            return None
+        return self.record_baseline()
 
     def record_baseline(self) -> str | None:
         """Record the current baseline commit SHA (None when not a repo)."""

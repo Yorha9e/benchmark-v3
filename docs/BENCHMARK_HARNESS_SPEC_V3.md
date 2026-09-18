@@ -203,7 +203,7 @@ class EvaluationReport:
 
 ### 1. 单轮 Prompt 快照原理 (`core/snapshot.py`)
 - 在每次向底层 Driver 发送 API 请求前，将当前轮次的完整请求上下文**原子覆写写入**：
-  `workspace/last_prompt_snapshot.json`：
+  `{run}/{suite}/{task}/last_prompt_snapshot.json`（与任务产物同级，不放进模型可写的 `workspace/`，避免被误改或误删）：
   ```json
   {
     "turn_index": 5,
@@ -240,7 +240,7 @@ class EvaluationReport:
 
 | 套件维度 | 核心考点 | 计分标准 (满分) | 时间与Token处理 |
 | :--- | :--- | :--- | :--- |
-| **次世代短任务** (3题) | 零拷贝Varint解析、分层时间轮、容错Lexer | **12 项断言** (每题4项)，含 `tracemalloc` $\le 4\text{MB}$ 内存探针 | 耗时仅记录，超 10s 判超时；Token 审计 |
+| **次世代短任务** (3题) | 零拷贝Varint解析、分层时间轮、容错Lexer | **30 项断言** (每题10项)，含 `tracemalloc` $\le 4\text{MB}$ 内存探针 | 耗时仅记录，超 10s 判超时；Token 审计 |
 | **次世代长任务** (2题) | Raft 3节点共识复制、Saga 分布式事务协调 | **20 个里程碑** (40 项严格断言)，含外部真实 SIGKILL 与 Jepsen 分区 | 耗时仅记录；Token 审计与 10M 熔断 |
-| **Reviewer 靶场** | 1% 低概率死锁、跨模块语义漂移、无锁诱饵代码 | **8 项压测断言** $\times$ **AST 微创系数** (推倒重写惩罚，诱饵误改判负) | 耗时仅记录；Token 审计 |
+| **Reviewer 靶场** | 1% 低概率死锁、跨模块语义漂移、无锁诱饵代码 | **12 项 milestone** (3 任务 × 4：fix / contracts / minimal / bait)，AST 微创系数惩罚推倒重写 | 耗时仅记录；Token 审计 |
 | **Critic 盲审** | 去标签化真实漏洞 (时序/路径/越界/性能) + 诱饵代码 | **百分制**：召回 55 + 诱饵防误报 20 + 深度 20 + 格式 5 | **0 分速度分**；耗时纯展示；安全拒答单独打标 |

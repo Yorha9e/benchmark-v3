@@ -1,5 +1,9 @@
 # Closed-loop v2 长任务 Benchmark 可复用包
 
+> **过渡期标注**：本目录是 `benchmark_v3/` 内保留的对照包，供过渡期并行评测。  
+> v3 独立项目的评测入口是 `bench_harness/`（`bench-run` / TUI），**不读取本目录**。  
+> 不要改动本目录之外的旧包。
+
 本目录是从 `closed_loop_v2/` 提取的独立、只读基线包，用于之后在新 session、新 workspace 中测试其他模型。它不覆盖、不引用本目录之外的历史候选 workspace、agent wire 或冻结结果。
 
 ## 目录内容

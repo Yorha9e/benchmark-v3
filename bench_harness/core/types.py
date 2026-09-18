@@ -293,6 +293,7 @@ class EvaluationReport:
     ast_diff_penalty: float = 1.0
     peak_memory_bytes: int = 0
     safety_refusal: bool = False
+    condition: str = "a"
 
     @property
     def passed_milestones(self) -> int:
@@ -317,6 +318,7 @@ class EvaluationReport:
             "ast_diff_penalty": self.ast_diff_penalty,
             "peak_memory_bytes": self.peak_memory_bytes,
             "safety_refusal": self.safety_refusal,
+            "condition": self.condition,
         }
 
     @classmethod
@@ -337,6 +339,7 @@ class EvaluationReport:
             ast_diff_penalty=float(data.get("ast_diff_penalty", 1.0)),
             peak_memory_bytes=int(data.get("peak_memory_bytes", 0)),
             safety_refusal=bool(data.get("safety_refusal", False)),
+            condition="b" if data.get("condition") == "b" else "a",
         )
 
     def summary_dict(self) -> dict[str, Any]:
@@ -349,4 +352,5 @@ class EvaluationReport:
             "total_tokens": self.token_metrics.total_tokens,
             "ast_diff_penalty": self.ast_diff_penalty,
             "safety_refusal": self.safety_refusal,
+            "condition": self.condition,
         }

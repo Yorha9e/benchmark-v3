@@ -1,5 +1,9 @@
 # Reusable short-task benchmark package
 
+> **过渡期标注**：本目录是 `benchmark_v3/` 内保留的对照包，供过渡期并行评测。  
+> v3 独立项目的评测入口是 `bench_harness/`（`bench-run` / TUI），**不读取本目录**。  
+> 不要改动本目录之外的旧包。
+
 这是一个可复用的短任务测试包，包含题目、候选模板、Instruction Gate、criterion evaluator、运行 harness 和评分说明，供后续模型进行新的 A/B 测试。
 
 ## 重要原则
