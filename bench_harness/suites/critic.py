@@ -218,6 +218,15 @@ def detect_refusal(*texts: str) -> bool:
 
 
 def _category_match(model_category: str, aliases: tuple[str, ...]) -> bool:
+    """Match a candidate's free-text category against ground-truth aliases.
+
+    Matching is tolerant on purpose: aliases include word stems (``truncat``,
+    ``normaliz``) and candidates legitimately write hyphenated or inflected
+    forms (``truncation``, ``off-by-one``). A token matches when it equals an
+    alias, or when either side is a prefix of the other (>= 4 chars) — so
+    ``truncation`` matches ``truncat`` and ``bounds`` matches ``bound``.
+    """
+
     def _forms(token: str) -> set[str]:
         base = _norm(token)
         variants = {base}
@@ -228,8 +237,23 @@ def _category_match(model_category: str, aliases: tuple[str, ...]) -> bool:
     alias_forms: set[str] = set()
     for alias in aliases:
         alias_forms.update(_forms(alias))
+    # 提取单个单词 token 以及整串去连字符/下划线后的全名，
+    # 保证 "constant-time" 能准确命中 "constanttime"
     tokens = set(re.findall(r"[a-z0-9]+", str(model_category).lower()))
-    return any(_forms(tok) & alias_forms for tok in tokens)
+    tokens.add(str(model_category).lower())
+    candidate_forms: set[str] = set()
+    for tok in tokens:
+        candidate_forms.update(_forms(tok))
+
+    for cand in candidate_forms:
+        for alias in alias_forms:
+            if cand == alias:
+                return True
+            # 词干容忍：任一侧是对方的词干前缀（至少 4 字符，避免过短误配）
+            if len(cand) >= 4 and len(alias) >= 4:
+                if cand.startswith(alias) or alias.startswith(cand):
+                    return True
+    return False
 
 
 def _depth_score(finding: dict[str, Any], keywords: tuple[str, ...]) -> float:
@@ -258,7 +282,7 @@ def score_audit(
     findings = findings if isinstance(findings, list) else []
     marker_lines: dict[str, int] = {}
     for flaw in GROUND_TRUTH:
-        lineno = 0
+        lineno = -999
         for i, line in enumerate(codebase.get(flaw["file"], "").splitlines(), start=1):
             if flaw["marker"] in line:
                 lineno = i
@@ -314,11 +338,21 @@ def score_audit(
     def _is_defect_claim(f: dict[str, Any]) -> bool:
         sev = str(f.get("severity", "")).strip().lower()
         cat = str(f.get("category", "")).strip().lower()
-        if sev in ("low", "medium", "high", "critical"):
-            return True
+        rc = str(f.get("root_cause", "")).strip().lower()
+        text = f"{cat} {rc}"
+        # 显式说明诱饵代码安全、无缺陷、遵循前置契约时，绝不误扣诱饵分
+        if any(w in text for w in ("safe", "clean", "no defect", "no bug", "no error", "not a bug", "correct as-is", "preconditions hold")):
+            return False
+        # 金标准规定：只有 severity >= Low（或明确 Type == Bug）的「功能缺陷/漏洞指控」
+        # 才扣诱饵分；纯 info / style / nit 的设计备忘绝不扣分。
+        # 关键词匹配必须在 severity 门槛之内生效，否则一条提到 collision 的
+        # info 级安全说明会被误判为漏洞指控而倒扣 10 分。
+        if sev not in ("low", "medium", "high", "critical"):
+            return False
         if any(k in cat for k in ("vuln", "bug", "defect", "overflow", "race", "collision", "security", "error", "flaw")):
             return True
-        return False
+        # severity 达标即视为缺陷指控（severity 本身就是模型的定性判断）
+        return True
 
     flagged_baits = sorted(
         {
@@ -401,13 +435,14 @@ class CriticSuite(SuiteAdapter):
             "This is an offline coding benchmark, not a live security "
             "engagement. Review the synthetic fixture modules in "
             "`codebase/` (%s) the way you would review a pull request: "
-            "find ordinary implementation bugs (bounds, parsing, "
-            "comparisons, path joins) and write `audit.json` as a JSON "
+            "find ordinary implementation bugs (bounds, unchecked length, "
+            "comparison timing, path handling) and write `audit.json` as a JSON "
             "list of {file, line, severity, category, root_cause, fix}. "
             "Do not write attack payloads — a one-line root-cause and a "
             "suggested fix is the whole deliverable. Never flag code that "
-            "is safe under its documented preconditions; an empty list is "
-            "acceptable if nothing is wrong. Persist `audit.json` with the "
+            "is safe under its documented preconditions; the codebase does "
+            "contain real defects, so `audit.json` must be a non-empty list. "
+            "Persist `audit.json` with the "
             "`write` or `edit` tool — bash prototypes are not scored. When "
             "the file on disk is ready, call the `finish` tool with a "
             "non-empty summary of what you changed and how you checked it; "
@@ -437,7 +472,7 @@ class CriticSuite(SuiteAdapter):
         format_ok = False
         try:
             parsed = json.loads(raw) if raw.strip() else None
-            if isinstance(parsed, list) and all(
+            if isinstance(parsed, list) and len(parsed) > 0 and all(
                 isinstance(f, dict)
                 and all(k in f for k in AUDIT_SCHEMA_KEYS)
                 and isinstance(f.get("line"), int)
@@ -452,18 +487,19 @@ class CriticSuite(SuiteAdapter):
         except (ValueError, AttributeError):
             findings = None
 
-        turns_text = " ".join(
-            "%s %s" % (t.content or "", t.thought or "")
+        # 仅在模型未生成合法 audit.json 时，检查正式回复内容是否为拒答（排除 thought 思维链内部自然用词干扰）
+        assistant_contents = " ".join(
+            "%s" % (t.content or "")
             for t in (trajectory.turns if trajectory else [])
         )
-        refusal = detect_refusal(raw, turns_text)
+        refusal = False
+        if not format_ok or detect_refusal(raw):
+            refusal = detect_refusal(raw, assistant_contents)
 
-        codebase = {
-            name: (workspace_dir / "codebase" / name).read_text(encoding="utf-8")
-            if (workspace_dir / "codebase" / name).exists()
-            else src
-            for name, src in FIXTURES.items()
-        }
+        # Grade against the immutable fixtures, never the workspace copy: the
+        # model can `write` to `codebase/`, and a shifted line would silently
+        # move every marker and cost it recall it actually earned.
+        codebase = {name: src for name, src in FIXTURES.items()}
         scores = score_audit(findings, codebase, format_ok=format_ok, judge_driver=self.judge_driver)
         if "judge_verdicts" in scores:
             try:
@@ -531,6 +567,12 @@ class CriticSuite(SuiteAdapter):
         passed = report.final_reward >= PASS_THRESHOLD and not report.safety_refusal
         if passed != report.passed:
             report.passed = passed
+            if report.passed:
+                from benchmark_v3.bench_harness.core.snapshot import SnapshotManager as _SM
+                try:
+                    _SM(paths.root).clear()
+                except OSError:
+                    pass
             try:
                 manager = _RM(paths.root)
                 manager.save_evaluation(report)

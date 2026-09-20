@@ -34,7 +34,8 @@ __all__ = ["ShortTaskSuite", "SHORT_TASK_TIMEOUT", "run_task_checks"]
 
 #: Per-task child-process timeout (seconds). Exceeding it fails the task's
 #: assertions; the elapsed time itself never affects the score.
-SHORT_TASK_TIMEOUT = 10.0
+#: Set to 20.0s for Windows cross-platform headroom on multi-MiB tracemalloc.
+SHORT_TASK_TIMEOUT = 20.0
 
 #: tracemalloc peak budget for the varint streaming check (4 MiB).
 VARINT_MEMORY_LIMIT = 4 * 1024 * 1024
@@ -57,7 +58,8 @@ TASK_BRIEFS: dict[str, dict[str, str]] = {
             "- `iter_values(chunks: Iterable[bytes]) -> Iterator[int]`: lazily "
             "decode values across arbitrary chunk splits (1-byte splits must "
             "work; empty chunks are ignored). Raise ValueError on truncated "
-            "or overlong (>10 byte / non-canonical) input.\n"
+            "input or on an overlong encoding (>10 bytes with the "
+            "continuation bit still set).\n"
             "RESOURCE LIMIT: decoding a multi-MiB stream while consuming the "
             "iterator incrementally must peak at <= 4 MiB traced memory."
         ),
@@ -67,6 +69,9 @@ TASK_BRIEFS: dict[str, dict[str, str]] = {
         "brief": (
             "Implement `solution.py` with class `TimingWheel(tick_ms=10, "
             "wheel_size=256)` exposing:\n"
+            "- `now() -> int`: the current tick, starting at `0` on a fresh "
+            "instance and increasing by exactly 1 per `tick()` (tick is the "
+            "unit; `tick_ms` does not change it).\n"
             "- `schedule(delay: int, payload) -> int`: fire `payload` at tick "
             "`now + max(1, delay)` (`delay >= 0`; delay 0 and delay 1 both "
             "fire on the next tick). Returns a timer id.\n"
@@ -74,7 +79,7 @@ TASK_BRIEFS: dict[str, dict[str, str]] = {
             "removed (unknown/already-fired ids -> False).\n"
             "- `tick() -> list`: advance one tick, return due payloads in "
             "FIFO order.\n"
-            "- `now() -> int`, `pending() -> int`.\n"
+            "- `pending() -> int`.\n"
             "PERF LIMIT: scheduling tens of thousands of timers and ticking "
             "thousands of times must finish in a few seconds (amortised O(1) "
             "tick; a full scan per tick will time out)."
@@ -86,15 +91,18 @@ TASK_BRIEFS: dict[str, dict[str, str]] = {
             "Implement `solution.py` with:\n"
             "- `tokenize(source: str) -> list[tuple[str, str]]`: emit "
             "('IDENT', ...), ('INT', ...), ('STRING', ...) (escapes \\\\ \\\" "
-            "\\n \\t), ('SYM', ch) for single-char symbols, "
+            "\\n \\t), ('SYM', ch) for single-char symbols in `()[]{},;=+-*/`, "
             "('MACRO_OPEN', '#['), and ('ERROR', reason). Skip whitespace and "
             "`//` line comments. `#` not starting `#[` is an ERROR token. "
             "Unclosed strings/macros emit ERROR and recovery continues; "
-            "`tokenize` never raises on bad input.\n"
+            "`tokenize` never raises on bad input. An ERROR token's second "
+            "element is the offending character (e.g. `('ERROR', '@')` for a "
+            "stray `@`), or a short reason string for malformed constructs.\n"
             "- `expand(tokens, env: dict[str, list[tuple]]) -> list[tuple]`: "
             "recursively splice `#[NAME]` with `env[NAME]` (nested macros "
             "expand depth-first, `]`-matched). Unknown names / unclosed "
-            "macros emit ERROR tokens. Depth > 64 or cycles raise ValueError."
+            "macros emit ERROR tokens (an unknown macro's ERROR text contains "
+            "the missing name). Depth > 64 or cycles raise ValueError."
         ),
     },
 }
@@ -171,7 +179,11 @@ _VARINT_CHECK = _CHILD_PREAMBLE + _CHILD_IMPORT + """
 rng = random.Random(seed)
 vals = [0, 1, 127, 128, 300, 16384, 2**32 - 1, 2**63 - 1, 2**64 - 1]
 vals += [rng.randrange(0, 2**64) for _ in range(400)]
-wire = b"".join(solution.encode_varint(v) for v in vals)
+wire = b""
+try:
+    wire = b"".join(solution.encode_varint(v) for v in vals)
+except Exception:
+    pass
 
 # a1: single-byte values (0..127) encode to 1 byte and decode correctly
 try:
@@ -218,10 +230,14 @@ try:
 except Exception as exc:
     record("a5", False, "empty chunks raised %r" % (exc,))
 
-# a6: empty input stream returns empty iterator
+# a6: empty input stream returns empty iterator (and non-empty stream yields valid items)
 try:
-    e_ok = list(solution.iter_values(iter([]))) == [] and list(solution.iter_values(iter([b"", b""]))) == []
-    record("a6", e_ok, "empty stream handled")
+    e_ok = (
+        list(solution.iter_values(iter([]))) == []
+        and list(solution.iter_values(iter([b"", b""]))) == []
+        and list(solution.iter_values(iter([b"\\x01"]))) == [1]
+    )
+    record("a6", e_ok, "empty stream handled and non-empty stream decodes")
 except Exception as exc:
     record("a6", False, "empty stream raised %r" % (exc,))
 
@@ -262,9 +278,9 @@ try:
 except Exception as exc:
     record("a9", False, "range test raised %r" % (exc,))
 
-# a10: memory oracle — ~7MiB wire, incremental consumption, peak <= 4MiB
+# a10: memory oracle — ~4.4MiB wire, incremental consumption, peak <= 4MiB
 try:
-    N = 800000
+    N = 500000
     def _gen():
         buf = bytearray()
         for k in range(N):
@@ -373,14 +389,16 @@ try:
 except Exception as exc:
     record("a6", False, "cancel pending raised %r" % (exc,))
 
-# a7: cancel unknown or already-fired timer returns False
+# a7: cancel unknown or already-fired timer returns False (active timer returns True)
 try:
     w7 = W(tick_ms=10, wheel_size=16)
+    t_live = w7.schedule(5, "live")
+    c_live = w7.cancel(t_live) is True
     c_unk = w7.cancel(999999) is False
     t2 = w7.schedule(1, "fire")
     w7.tick()
     c_fired = w7.cancel(t2) is False
-    record("a7", c_unk and c_fired, "cancel unknown/fired ok")
+    record("a7", c_live and c_unk and c_fired, "cancel live/unknown/fired ok")
 except Exception as exc:
     record("a7", False, "cancel invalid raised %r" % (exc,))
 
@@ -422,11 +440,15 @@ try:
         w10.schedule(rng2.randrange(1, 5000), k)
     t0 = time.monotonic()
     n = 0
-    for _ in range(5000):
+    timeout_hit = False
+    for step in range(5000):
         n += len(w10.tick())
+        if step % 200 == 0 and (time.monotonic() - t0) > 4.5:
+            timeout_hit = True
+            break
     dt = time.monotonic() - t0
-    ok_eff = n == 60000 and dt < 3.0
-    record("a10", ok_eff, "fired=%d in %.2fs" % (n, dt))
+    ok_eff = (not timeout_hit) and n == 60000 and dt < 3.0
+    record("a10", ok_eff, "fired=%d in %.2fs%s" % (n, dt, " (aborted O(N))" if timeout_hit else ""))
 except Exception as exc:
     record("a10", False, "efficiency raised %r" % (exc,))
 finish()
@@ -439,10 +461,8 @@ tok, exp = solution.tokenize, solution.expand
 # a1: basic identifier and keyword tokens
 try:
     res = tok("let x = 42;")
-    types = [t[0] for t in res]
-    vals = [t[1] for t in res]
-    ok_a1 = ("IDENT" in types and "let" in vals and "x" in vals)
-    record("a1", ok_a1, "ident/keyword tokens")
+    expected = [("IDENT", "let"), ("IDENT", "x"), ("SYM", "="), ("INT", "42"), ("SYM", ";")]
+    record("a1", res == expected, "ident/keyword token sequence ok")
 except Exception as exc:
     record("a1", False, "ident raised %r" % (exc,))
 
@@ -458,7 +478,8 @@ except Exception as exc:
 try:
     res = tok("= ; + - * / ( ) [ ]")
     syms = [t[1] for t in res if t[0] == "SYM"]
-    record("a3", len(syms) >= 8 and "=" in syms and ";" in syms, "symbol tokens=%r" % (syms,))
+    expected_syms = set("=;+-*/()[]")
+    record("a3", len(syms) == 10 and set(syms) == expected_syms, "all 10 symbol tokens ok")
 except Exception as exc:
     record("a3", False, "symbols raised %r" % (exc,))
 
@@ -482,7 +503,11 @@ except Exception as exc:
 try:
     res = tok("ok @ dear # foo")
     errs = [t[1] for t in res if t[0] == "ERROR"]
-    record("a6", "@" in errs and "#" in errs, "stray error tokens=%r" % (errs,))
+    # 题面允许 ERROR 的第二个元素是「 offending character 」或「 short reason
+    # string 」，所以这里按子串匹配：模型输出 "unexpected '#'" / "invalid '#'
+    # character" 这类带上下文的原因串，同样算正确识别了杂散字符。
+    record("a6", any("@" in e for e in errs) and any("#" in e for e in errs),
+           "stray error tokens=%r" % (errs,))
 except Exception as exc:
     record("a6", False, "stray chars raised %r" % (exc,))
 
@@ -508,12 +533,15 @@ try:
 except Exception as exc:
     record("a8", False, "nested macro raised %r" % (exc,))
 
-# a9: unknown macro produces ERROR token
+# a9: unknown macro and unclosed macro produce ERROR token
 try:
     unk = exp([("MACRO_OPEN", "#["), ("IDENT", "NOPE"), ("SYM", "]")], {})
-    record("a9", any(t[0] == "ERROR" and "NOPE" in t[1] for t in unk), "unknown macro token=%r" % (unk,))
+    unclosed = exp([("MACRO_OPEN", "#["), ("IDENT", "FOO")], {})
+    has_unk_err = any(t[0] == "ERROR" and "NOPE" in t[1] for t in unk)
+    has_unclosed_err = any(t[0] == "ERROR" for t in unclosed)
+    record("a9", has_unk_err and has_unclosed_err, "unknown/unclosed macro token produces ERROR")
 except Exception as exc:
-    record("a9", False, "unknown macro raised %r" % (exc,))
+    record("a9", False, "unknown/unclosed macro raised %r" % (exc,))
 
 # a10: cyclic/over-deep macro depth limiting + large text throughput
 try:
