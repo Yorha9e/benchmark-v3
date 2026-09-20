@@ -4,7 +4,14 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import sys
 from pathlib import Path
+
+from benchmark_v3.bench_harness.core.runner import (
+    bind_to_kill_on_close_job,
+    close_job_handle,
+    kill_process_tree,
+)
 
 
 class WorkspaceManager:
@@ -129,22 +136,54 @@ class WorkspaceManager:
     # -- internals ---------------------------------------------------------
 
     def _git(self, *args: str, check: bool = True) -> str | None:
+        # Windows: bind the short-lived git child to a kill-on-close Job
+        # Object so no git helper/credential process survives the harness.
+        # Fail-open: any job/Win32 failure must not affect the git call.
+        job = 0
+        proc: subprocess.Popen | None = None
         try:
-            completed = subprocess.run(
+            proc = subprocess.Popen(
                 ["git", *args],
                 cwd=self.workspace_dir,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                timeout=30,
+                **( {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)}
+                    if sys.platform == "win32" else {} ),
             )
+        except OSError as exc:
+            if check:
+                raise RuntimeError(f"git {' '.join(args)} failed to start: {exc}") from exc
+            return None
+        try:
+            # Bind only after a successful spawn; a failed bind is a no-op.
+            job = bind_to_kill_on_close_job(proc.pid)
+            stdout, stderr = proc.communicate(timeout=30)
+            returncode = proc.returncode
+        except subprocess.TimeoutExpired:
+            kill_process_tree(proc.pid)
+            try:
+                proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.communicate()
+            if check:
+                raise RuntimeError(f"git {' '.join(args)} timed out after 30s")
+            return None
         except (OSError, subprocess.SubprocessError):
+            kill_process_tree(proc.pid)
             if check:
                 raise
             return None
-        if completed.returncode != 0:
+        finally:
+            # Closing the job handle reaps any leaked git helper tree.
+            close_job_handle(job)
+        if returncode != 0:
             if check:
-                raise RuntimeError(f"git {' '.join(args)} failed: {completed.stderr.strip()}")
+                raise RuntimeError(
+                    f"git {' '.join(args)} failed: {(stderr or '').strip()}"
+                )
             return None
-        return completed.stdout
+        return stdout

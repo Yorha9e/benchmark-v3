@@ -33,6 +33,11 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
+from benchmark_v3.bench_harness.core.runner import (
+    bind_to_kill_on_close_job,
+    close_job_handle,
+)
+
 __all__ = [
     "CRITICAL_WRITE_MARKER",
     "MarkerWatcher",
@@ -202,6 +207,7 @@ class NodeProcess:
         self.env = dict(env) if env else {}
         self._extra_popen_kwargs = dict(popen_kwargs) if popen_kwargs else {}
         self._proc: subprocess.Popen[str] | None = None
+        self._job: int = 0
         self._state = NodeState.PENDING
         self._exit_code: int | None = None
         self.restarts = 0
@@ -258,6 +264,15 @@ class NodeProcess:
                     **kwargs,
                 )
             self._proc = proc
+            # Windows: bind the node (and everything it spawns) to a
+            # kill-on-close Job Object — this is where node orphans come
+            # from. Fail-open: a failed bind leaves the old taskkill/killpg
+            # machinery fully in charge. Any stale handle from a previous
+            # spawn is closed first.
+            if self._job:
+                close_job_handle(self._job)
+                self._job = 0
+            self._job = bind_to_kill_on_close_job(proc.pid)
             self._exit_code = None
             self._state = NodeState.RUNNING
             return proc.pid
@@ -313,11 +328,13 @@ class NodeProcess:
                 rc = proc.wait(timeout=timeout)
                 self._exit_code = rc
                 self._state = NodeState.KILLED
+                self._close_job_locked()
                 return proc.poll() is not None
             # A deliberate graceful stop is STOPPED by definition, even though
             # terminate() surfaces as rc=1 (Windows) or -SIGTERM (POSIX).
             self._exit_code = rc
             self._state = NodeState.STOPPED
+            self._close_job_locked()
             return True
 
     def hard_kill(self, timeout: float = 10.0) -> bool:
@@ -326,10 +343,12 @@ class NodeProcess:
             proc = self._proc
             if proc is None:
                 self._state = NodeState.KILLED
+                self._close_job_locked()
                 return True
             if proc.poll() is not None:
                 self._exit_code = proc.returncode
                 self._state = NodeState.KILLED
+                self._close_job_locked()
                 return True
             pid = proc.pid
             self._lock.release()
@@ -342,6 +361,7 @@ class NodeProcess:
             except subprocess.TimeoutExpired:
                 return False
             self._state = NodeState.KILLED
+            self._close_job_locked()
             return dead and proc.poll() is not None
 
     def restart(self, graceful: bool = True, stop_timeout: float = 10.0) -> int:
@@ -362,6 +382,16 @@ class NodeProcess:
         return pid
 
     # -- internals --------------------------------------------------------
+    def _close_job_locked(self) -> None:
+        """Close the node's kill-on-close Job Object handle (idempotent).
+
+        On Windows, closing the last job handle reaps anything still inside
+        the job — the kernel-side backstop for orphaned node children.
+        """
+        if self._job:
+            job, self._job = self._job, 0
+            close_job_handle(job)
+
     def _sync_exit_locked(
         self, proc: subprocess.Popen[str], rc: int | None = None
     ) -> None:

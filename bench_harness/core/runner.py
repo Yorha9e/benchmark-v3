@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import os
 import signal
 import subprocess
@@ -9,6 +10,149 @@ import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+
+__all__ = [
+    "RunResult",
+    "ProcessRunner",
+    "bind_to_kill_on_close_job",
+    "close_job_handle",
+    "kill_process_tree",
+]
+
+# ---------------------------------------------------------------------------
+# Windows Job Object (kill-on-job-close) support
+# ---------------------------------------------------------------------------
+#
+# Children spawned for model-authored code (probes, node processes) can leak
+# grandchildren (node workers, npm helpers) that outlive the parent. Binding
+# a child to a Job Object with JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE makes the
+# kernel reap the whole tree the moment the parent closes the job handle —
+# including when the harness itself dies. Fail-open everywhere: if the Win32
+# APIs are unavailable (non-Windows, odd Python builds) every helper is a
+# harmless no-op.
+_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+_JOB_OBJECT_EXTENDED_LIMIT_INFO_SIZE = 144  # sizeof(JOBOBJECT_EXTENDED_LIMIT_INFORMATION) on Win64
+_JOB_HANDLE_NONE = 0
+
+
+def _kernel32():  # noqa: ANN202 - returns windll or None
+    if sys.platform != "win32":
+        return None
+    try:
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+    except AttributeError:
+        return None
+    if not hasattr(kernel32, "CreateJobObjectW"):
+        return None
+    return kernel32
+
+
+def bind_to_kill_on_close_job(pid: int) -> int:
+    """Assign *pid* to a fresh Job Object with KILL_ON_JOB_CLOSE.
+
+    Returns the job handle (truthy int) for a later :func:`close_job_handle`,
+    or 0 when the binding is unavailable (POSIX / API failure) — callers must
+    treat 0 as "no job", never as a valid handle. Binding never raises.
+    """
+    if sys.platform != "win32" or pid <= 0:
+        return _JOB_HANDLE_NONE
+    kernel32 = _kernel32()
+    if kernel32 is None:
+        return _JOB_HANDLE_NONE
+    try:
+        kernel32.CreateJobObjectW.restype = ctypes.c_void_p
+        kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p]
+        job = kernel32.CreateJobObjectW(None, None)
+        if not job:
+            return _JOB_HANDLE_NONE
+        kernel32.SetInformationJobObject.restype = ctypes.c_int
+        kernel32.SetInformationJobObject.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_uint,
+        ]
+
+        class _JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ("PerProcessUserTimeLimit", ctypes.c_longlong),
+                ("PerJobUserTimeLimit", ctypes.c_longlong),
+                ("LimitFlags", ctypes.c_uint),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", ctypes.c_uint),
+                ("Affinity", ctypes.POINTER(ctypes.c_ulong)),
+                ("PriorityClass", ctypes.c_uint),
+                ("SchedulingClass", ctypes.c_uint),
+            ]
+
+        class _IO_COUNTERS(ctypes.Structure):
+            _fields_ = [
+                ("ReadOperationCount", ctypes.c_ulonglong),
+                ("WriteOperationCount", ctypes.c_ulonglong),
+                ("OtherOperationCount", ctypes.c_ulonglong),
+                ("ReadTransferCount", ctypes.c_ulonglong),
+                ("WriteTransferCount", ctypes.c_ulonglong),
+                ("OtherTransferCount", ctypes.c_ulonglong),
+            ]
+
+        class _JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ("BasicLimitInformation", _JOBOBJECT_BASIC_LIMIT_INFORMATION),
+                ("IoInfo", _IO_COUNTERS),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed", ctypes.c_size_t),
+            ]
+
+        info = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+        info.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        ok = kernel32.SetInformationJobObject(
+            ctypes.c_void_p(job),
+            9,  # JobObjectExtendedLimitInformation
+            ctypes.byref(info),
+            _JOB_OBJECT_EXTENDED_LIMIT_INFO_SIZE,
+        )
+        if not ok:
+            kernel32.CloseHandle(ctypes.c_void_p(job))
+            return _JOB_HANDLE_NONE
+        kernel32.AssignProcessToJobObject.restype = ctypes.c_int
+        kernel32.AssignProcessToJobObject.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+        ]
+        # PROCESS_SET_QUOTA | PROCESS_TERMINATE
+        handle = kernel32.OpenProcess(0x0100 | 0x0001, False, int(pid))
+        if not handle:
+            kernel32.CloseHandle(ctypes.c_void_p(job))
+            return _JOB_HANDLE_NONE
+        try:
+            if not kernel32.AssignProcessToJobObject(ctypes.c_void_p(job), ctypes.c_void_p(handle)):
+                kernel32.CloseHandle(ctypes.c_void_p(job))
+                return _JOB_HANDLE_NONE
+        finally:
+            kernel32.CloseHandle(ctypes.c_void_p(handle))
+        return int(job)
+    except Exception:  # fail-open: isolation aid only, never break the caller
+        return _JOB_HANDLE_NONE
+
+
+def close_job_handle(job: int) -> None:
+    """Close a job handle from :func:`bind_to_kill_on_close_job`.
+
+    On Windows, closing the last job handle reaps any processes still in the
+    job (KILL_ON_JOB_CLOSE). No-op for handle 0 / non-Windows / closed jobs.
+    """
+    if not job or sys.platform != "win32":
+        return
+    kernel32 = _kernel32()
+    if kernel32 is None:
+        return
+    try:
+        kernel32.CloseHandle(ctypes.c_void_p(job))
+    except Exception:
+        pass
 
 
 @dataclass
@@ -120,6 +264,7 @@ class ProcessRunner:
             popen_kwargs["start_new_session"] = True
 
         started = time.monotonic()
+        job_handle = 0
         try:
             proc = subprocess.Popen(argv, **popen_kwargs)  # noqa: S603 — caller-owned harness input
         except OSError as exc:
@@ -131,6 +276,9 @@ class ProcessRunner:
                 duration_s=0.0,
                 argv=display_argv,
             )
+        # Windows: bind the child tree to a kill-on-close Job Object so any
+        # grandchildren it leaks are reaped when this runner finishes.
+        job_handle = bind_to_kill_on_close_job(proc.pid)
         try:
             stdout, stderr = proc.communicate(input=input_text, timeout=deadline)
             timed_out = False
@@ -142,6 +290,9 @@ class ProcessRunner:
                 proc.kill()
                 stdout, stderr = proc.communicate()
             timed_out = True
+        finally:
+            # Closing the job handle reaps any survivors (KILL_ON_JOB_CLOSE).
+            close_job_handle(job_handle)
         duration = time.monotonic() - started
         result = RunResult(
             returncode=proc.returncode if proc.returncode is not None else -1,
@@ -163,6 +314,9 @@ class ProcessRunner:
             for key in ("PATH", "SystemRoot", "SYSTEMROOT", "TEMP", "TMP", "HOME", "LANG", "LC_ALL"):
                 if key in os.environ:
                     env[key] = os.environ[key]
+        # 强制 Windows 子进程标准输出采用 UTF-8 编码，防止中文环境下默认 ANSI/CP936 造成乱码
+        env.setdefault("PYTHONUTF8", "1")
+        env.setdefault("PYTHONIOENCODING", "utf-8")
         if extra_env:
             env.update(extra_env)
         return env

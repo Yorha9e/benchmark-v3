@@ -72,11 +72,32 @@ CRITICAL_MARKER = "CRITICAL_WRITE_POINT"
 # ---------------------------------------------------------------------------
 
 def write_partitions(broker_root: str | Path, cuts: list[tuple[str, str]]) -> None:
-    """Atomically publish bidirectional cuts ``[(a, b), ...]``."""
+    """Atomically publish bidirectional cuts ``[(a, b), ...]``.
+
+    Node/coordinator children poll this file constantly, so on Windows
+    ``os.replace`` can transiently fail (WinError 5/32) while a reader holds
+    a handle. Retry briefly instead of crashing the scenario.
+    """
     path = Path(broker_root) / "partitions.json"
     tmp = path.with_name("partitions.json.tmp-%d" % os.getpid())
     tmp.write_text(json.dumps({"cuts": [list(c) for c in cuts]}), encoding="utf-8")
-    os.replace(tmp, path)
+    last_exc: OSError | None = None
+    for attempt in range(10):
+        try:
+            os.replace(tmp, path)
+            last_exc = None
+            break
+        except OSError as exc:
+            last_exc = exc
+            if attempt == 9:
+                break
+            time.sleep(0.02 * (attempt + 1))
+    if last_exc is not None:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise last_exc
 
 
 def read_partitions(broker_root: str | Path) -> set[tuple[str, str]]:
@@ -592,6 +613,27 @@ def _wait_converged(nodes_dir: Path, timeout: float = 6.0) -> dict[str, dict[str
     return last
 
 
+def _clear_runtime_state(*paths: Path) -> None:
+    """Remove runtime artefacts left over from a previous (self-test) run.
+
+    Called before each scenario so a model that exercised its own
+    implementation inside the workspace is not graded on stale state
+    (queued mailbox messages, node state/logs, service DBs, WALs,
+    supervisor registries). Only generated runtime data is deleted —
+    the model's source deliverable is never touched.
+    """
+    import shutil as _shutil
+
+    for path in paths:
+        try:
+            if path.is_dir():
+                _shutil.rmtree(path, ignore_errors=True)
+            elif path.exists():
+                path.unlink()
+        except OSError:
+            pass
+
+
 def run_raft_scenario(
     workspace_dir: str | Path,
     seed: int = 7,
@@ -608,6 +650,12 @@ def run_raft_scenario(
     workspace_dir = Path(workspace_dir).resolve()
     broker_root = workspace_dir / "broker"
     nodes_dir = workspace_dir / "nodes"
+    # Fresh run: wipe runtime state the model may have left behind while
+    # self-testing (queued mailbox messages, node state/logs, supervisor
+    # registry). Only the model's own source file is preserved, so a model
+    # that legitimately exercised its implementation is not judged on
+    # leftovers from its own rehearsal.
+    _clear_runtime_state(broker_root, nodes_dir, workspace_dir / "sup")
     broker_root.mkdir(parents=True, exist_ok=True)
     nodes_dir.mkdir(parents=True, exist_ok=True)
     write_partitions(broker_root, [])
@@ -773,7 +821,12 @@ def run_raft_scenario(
                 time.sleep(0.5)
             finally:
                 for watcher in watchers.values():
-                    watcher.stop()
+                    try:
+                        watcher.stop(timeout=5.0)
+                    except Exception:
+                        pass
+                # 确保被击杀的节点完全停止，消除异步 kill 与 restart 之间的竞态
+                time.sleep(0.5)
             # Restart the killed node (state dir preserved -> recovery).
             data["killed_node"] = killed_node or heal_leader
             try:
@@ -781,7 +834,9 @@ def run_raft_scenario(
             except Exception as exc:  # noqa: BLE001
                 data["notes"].append("restart failed: %r" % (exc,))
             time.sleep(2.0)
-            final_leader, _ = _wait_leader(client, 10.0)
+            # 15s: Windows cold-start / disk-handle jitter after the external
+            # SIGKILL restart can exceed the previous 10s budget.
+            final_leader, _ = _wait_leader(client, 15.0)
             data["final_leader"] = final_leader
             if final_leader:
                 for i in range(3):
@@ -924,10 +979,12 @@ class ServiceSimulator(threading.Thread):
                 self._reply(src, {"type": "rollback_ack", "req_id": req_id, "ok": True})
             elif kind == "status":
                 self._reply(src, {"type": "status_ack", "req_id": req_id,
+                                  "ok": True,
                                   "state": self._do_status(msg.get("txid", ""))})
             elif kind == "waits":
                 holders, waiters = self._do_waits()
                 self._reply(src, {"type": "waits_ack", "req_id": req_id,
+                                  "ok": True,
                                   "holders": holders, "waiters": waiters})
         except _StoreUnavailable as exc:
             try:
@@ -1467,6 +1524,175 @@ def _svc_statuses(broker_root: Path, services: tuple[str, ...], txids: list[str]
     return states
 
 
+# ---------------------------------------------------------------------------
+# Out-of-process coordinator probes (child interpreter + JSON back-pattern)
+# ---------------------------------------------------------------------------
+#
+# ``saga.py`` is the model's deliverable: importing it in the parent and
+# calling ``Coordinator(...)`` lets a poisoned module kill (``sys.exit`` /
+# ``os._exit``), corrupt or hang the harness. These probes therefore run the
+# coordinator inside a child Python interpreter via :class:`ProcessRunner`.
+# The parent writes the probe parameters as JSON argv, the child imports
+# saga.py, drives the scenario against the SAME file-broker mailboxes (the
+# parent-side service threads keep running and see the child like any other
+# participant), and prints exactly one JSON verdict line on stdout. The
+# parent takes the last ``{...}`` line; timeout / crash / non-JSON all
+# degrade to ``None`` (probe isolated, milestone fails closed).
+
+_SAGA_PROBE_EXECUTE = '''"""Saga child probe: single execute() through the model coordinator."""
+import json, sys, time
+
+workspace = sys.argv[1]
+site_dir = sys.argv[2] if len(sys.argv) > 2 else None
+payload = json.loads(sys.argv[3])
+if site_dir:
+    sys.path.insert(0, site_dir)
+sys.path.insert(0, workspace)
+from saga import Coordinator
+
+out = {"ok": False}
+
+def _finish():
+    print(json.dumps(out), flush=True)
+
+try:
+    coord = Coordinator(payload["broker_root"], payload["services"],
+                        payload["wal_path"], node_id=payload["node_id"],
+                        timeout=payload["timeout"], seed=payload["seed"])
+    ok, txid = coord.execute(payload["ops"])
+    out["ok"] = bool(ok)
+    out["txid"] = txid
+except BaseException as exc:
+    out["ok"] = False
+    out["error"] = "%s: %s" % (type(exc).__name__, exc)
+_finish()
+'''
+
+_SAGA_PROBE_DEADLOCK = '''"""Saga child probe: scripted TA/TB deadlock + resolution verdict."""
+import json, sys, threading, time
+
+workspace = sys.argv[1]
+site_dir = sys.argv[2] if len(sys.argv) > 2 else None
+payload = json.loads(sys.argv[3])
+if site_dir:
+    sys.path.insert(0, site_dir)
+sys.path.insert(0, workspace)
+from saga import Coordinator
+
+out = {}
+
+def _finish():
+    print(json.dumps(out), flush=True)
+
+def _status(coord, txid):
+    reply = coord._request("inventory", {"type": "status", "txid": txid},
+                           timeout=min(payload["timeout"], 1.5))
+    return str(reply.get("state")) if reply else "unknown"
+
+try:
+    dl = Coordinator(payload["broker_root"], payload["services"],
+                     payload["wal_path"], node_id=payload["node_id"],
+                     timeout=payload["timeout"], seed=payload["seed"])
+    tx_a = dl.begin([{"service": "inventory", "item": "alpha", "qty": 1}])
+    tx_b = dl.begin([{"service": "inventory", "item": "beta", "qty": 1}])
+    prep_a = dl.prepare(tx_a)
+    prep_b = dl.prepare(tx_b)
+    out["deadlock_base"] = {"a": prep_a, "b": prep_b}
+    results = {}
+
+    def _more_a():
+        results["a"] = dl.prepare_more(
+            tx_a, [{"service": "inventory", "item": "beta", "qty": 1}])
+
+    def _more_b():
+        results["b"] = dl.prepare_more(
+            tx_b, [{"service": "inventory", "item": "alpha", "qty": 1}])
+
+    ta = threading.Thread(target=_more_a, daemon=True)
+    tb = threading.Thread(target=_more_b, daemon=True)
+    ta.start()
+    tb.start()
+    # Poll the wire-level waits view until both transaction threads are
+    # blocked in a cycle (bounded wait budget; no hardcoded sleep).
+    t_wait = time.monotonic() + float(payload["wait_budget"])
+    while time.monotonic() < t_wait:
+        if ta.is_alive() and tb.is_alive():
+            reply = dl._request("inventory", {"type": "waits"},
+                                timeout=min(payload["timeout"], 1.5))
+            waiters = (reply or {}).get("waiters") or {}
+            if len(waiters) >= 2:
+                break
+        time.sleep(0.05)
+    cycle = dl.resolve_deadlocks()
+    out["deadlock_cycle"] = cycle
+    ta.join(timeout=float(payload["join_budget"]))
+    tb.join(timeout=float(payload["join_budget"]))
+    out["threads_settled"] = (not ta.is_alive()) and (not tb.is_alive())
+    # Commit whichever side survived resolution (still 'prepared').
+    for tx in (tx_a, tx_b):
+        if _status(dl, tx) == "prepared":
+            dl.commit(tx)
+    time.sleep(0.3)
+    inv_a = _status(dl, tx_a)
+    inv_b = _status(dl, tx_b)
+    out["survivor_committed"] = (inv_a == "committed") != (inv_b == "committed")
+    out["victim_rolled_back"] = "aborted" in (inv_a, inv_b)
+    out["deadlock_pair"] = [tx_a, tx_b]
+except BaseException as exc:
+    out["error"] = "%s: %s" % (type(exc).__name__, exc)
+_finish()
+'''
+
+_SAGA_PROBE_SCRIPTS = {
+    "execute": _SAGA_PROBE_EXECUTE,
+    "deadlock": _SAGA_PROBE_DEADLOCK,
+}
+
+#: Wall-clock budget for the whole deadlock child scenario (the in-child
+#: budgets sum well below this; anything beyond means the child is hung).
+SAGA_DEADLOCK_TIMEOUT = 60.0
+
+#: Wall-clock budget for a single execute() probe child.
+SAGA_EXECUTE_TIMEOUT = 30.0
+
+
+def _run_saga_probe_in_child(
+    workspace_dir: Path,
+    op: str,
+    payload: dict[str, Any],
+    site_dir: str | None = None,
+    timeout: float = SAGA_EXECUTE_TIMEOUT,
+) -> dict[str, Any] | None:
+    """Run one coordinator probe in a child interpreter; never raises.
+
+    The child imports the model's ``saga.py``, executes *op* and prints one
+    JSON object. Returns the parsed dict, or ``None`` on timeout / crash /
+    non-JSON output — the parent harness always survives model bugs.
+    """
+    script = _SAGA_PROBE_SCRIPTS.get(op)
+    if script is None:
+        return None
+    runner = ProcessRunner(default_timeout=timeout)
+    result = runner.run(
+        [sys.executable, "-c", script, str(workspace_dir),
+         str(site_dir or ""), json.dumps(payload)],
+        cwd=workspace_dir,
+        timeout=timeout,
+    )
+    if result.timed_out:
+        return None
+    for line in reversed((result.stdout or "").splitlines()):
+        line = line.strip()
+        if line.startswith("{") and line.endswith("}"):
+            try:
+                parsed = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(parsed, dict):
+                return parsed
+    return None
+
+
 def run_saga_scenario(
     workspace_dir: str | Path,
     seed: int = 11,
@@ -1476,6 +1702,25 @@ def run_saga_scenario(
     # Absolute (see run_raft_scenario): coord children spawn with their own
     # cwd, so relative runner/workspace paths would silently no-start.
     workspace_dir = Path(workspace_dir).resolve()
+    # Fresh run: wipe runtime state from any self-test the model performed
+    # (broker queues, coord workdirs, service DBs, WALs, supervisor registry).
+    # `saga.py` (the deliverable) and `run_saga.py` (rewritten below) survive.
+    _clear_runtime_state(
+        workspace_dir / "saga_broker",
+        workspace_dir / "sup",
+        workspace_dir / "coord1",
+        workspace_dir / "coord2",
+        workspace_dir / "payment.db",
+        workspace_dir / "payment.db.bak",
+        workspace_dir / "inventory.db",
+        workspace_dir / "shipping.db",
+        workspace_dir / "saga_wal.jsonl",
+        workspace_dir / "probe_wal.jsonl",
+        workspace_dir / "deadlock_wal.jsonl",
+        workspace_dir / "results_phase1.json",
+        workspace_dir / "results_phase1a.json",
+        workspace_dir / "results_phase2.json",
+    )
     broker_root = workspace_dir / "saga_broker"
     broker_root.mkdir(parents=True, exist_ok=True)
     write_partitions(broker_root, [])
@@ -1511,8 +1756,11 @@ def run_saga_scenario(
         runner = str(workspace_dir / "run_saga.py")
 
         # Phase 1: steady txns, then big commit killed at the marker.
-        # The watcher starts only AFTER phase1a exists, so the kill lands
-        # on the big commit's marker (BATCH1 commits print markers too).
+        # The watcher arms only after phase1a reports the big txn prepared,
+        # and starts counting from the CURRENT end of the log: BATCH1's three
+        # commits printed markers long before this point, so `from_start=True`
+        # would fire on a stale marker and kill the coordinator before the
+        # `big` transaction was even prepared.
         coord1 = mgr.spawn_node(
             "coord1", [sys.executable, runner, str(workspace_dir), "phase1", site_dir],
             workdir=str(workspace_dir / "coord1"),
@@ -1531,7 +1779,9 @@ def run_saga_scenario(
                 except ValueError:
                     pass
             time.sleep(0.1)
-        watcher = mgr.watch_marker("coord1", CRITICAL_MARKER, action="kill", poll_interval=0.02)
+        # from_start=False: ignore every marker already written by the BATCH1
+        # commits; only the upcoming `big` commit may trigger the kill.
+        watcher = mgr.watch_marker("coord1", CRITICAL_MARKER, action="kill", poll_interval=0.02, from_start=False)
         deadline = time.monotonic() + 25.0
         while time.monotonic() < deadline:
             candidate = workspace_dir / "results_phase1a.json"
@@ -1621,23 +1871,37 @@ def run_saga_scenario(
         sender.matrix.heal_all()
         time.sleep(0.2)
         data["svc_alive_after_corrupt"] = any(s.is_alive() for s in services if s.svc_id == "payment")
-        sys.path.insert(0, str(workspace_dir))
-        try:
-            import saga as saga_mod  # noqa: PLC0415 - model/reference module under test
-
-            probe_coord = saga_mod.Coordinator(str(broker_root), list(SAGA_SERVICES),
-                                              str(workspace_dir / "probe_wal.jsonl"),
-                                              node_id="client", timeout=2.0, seed=seed)
-            ok_probe, _ = probe_coord.execute(
-                [{"service": "payment", "item": "alpha", "qty": 1}])
-            data["torn_probe_aborted"] = not ok_probe
-        except Exception as exc:  # noqa: BLE001
-            data["notes"].append("torn probe crashed: %r" % (exc,))
+        # Torn-write probe runs OUT-OF-PROCESS: saga.py is imported inside a
+        # child interpreter, so a poisoned coordinator can neither kill nor
+        # hang the harness (crash -> None, hang -> timeout, both isolated;
+        # services keep running parent-side and speak to the child through
+        # the file broker).
+        probe_payload = {
+            "broker_root": str(broker_root),
+            "services": list(SAGA_SERVICES),
+            "wal_path": str(workspace_dir / "probe_wal.jsonl"),
+            "node_id": COORD_ID,
+            "timeout": 2.0,
+            "seed": seed,
+            "ops": [{"service": "payment", "item": "alpha", "qty": 1}],
+        }
+        result = _run_saga_probe_in_child(workspace_dir, "execute", probe_payload,
+                                          site_dir, timeout=30.0)
+        if result is None:
+            data["notes"].append("torn probe crashed/hung (child isolated)")
             data["torn_probe_aborted"] = False
+        else:
+            data["torn_probe_aborted"] = not bool(result.get("ok"))
         try:
             import shutil as _shutil2
 
-            _shutil2.copyfile(backup, pay_db)
+            # 在 Windows 平台下还原数据库文件时，必须先暂停/排他保护 payment 服务，防范 WinError 32 句柄锁定
+            pay_svc = next((s for s in services if s.svc_id == "payment"), None)
+            if pay_svc:
+                with pay_svc._guard:
+                    _shutil2.copyfile(backup, pay_db)
+            else:
+                _shutil2.copyfile(backup, pay_db)
         except OSError as exc:
             data["notes"].append("restore failed: %r" % (exc,))
         time.sleep(0.3)
@@ -1645,72 +1909,48 @@ def run_saga_scenario(
         # Partition probe: isolate payment, expect abort; heal, expect success.
         write_partitions(broker_root, [("client", "payment"), (COORD_ID, "payment")])
         sender.matrix.partition([COORD_ID, "client"], ["payment"])
-        try:
-            ok_part, _ = probe_coord.execute(
-                [{"service": "payment", "item": "alpha", "qty": 1}])
-            data["partition_probe_aborted"] = not ok_part
-        except Exception as exc:  # noqa: BLE001
-            data["notes"].append("partition probe crashed: %r" % (exc,))
+        result = _run_saga_probe_in_child(workspace_dir, "execute", probe_payload,
+                                          site_dir, timeout=30.0)
+        if result is None:
+            data["notes"].append("partition probe crashed/hung (child isolated)")
+        else:
+            data["partition_probe_aborted"] = not bool(result.get("ok"))
         write_partitions(broker_root, [])
         sender.matrix.heal_all()
         time.sleep(0.5)
-        try:
-            ok_healed, _ = probe_coord.execute(
-                [{"service": "payment", "item": "alpha", "qty": 1}])
-            data["healed_probe_ok"] = bool(ok_healed)
-        except Exception as exc:  # noqa: BLE001
-            data["notes"].append("healed probe crashed: %r" % (exc,))
+        result = _run_saga_probe_in_child(workspace_dir, "execute", probe_payload,
+                                          site_dir, timeout=30.0)
+        if result is None:
+            data["notes"].append("healed probe crashed/hung (child isolated)")
+        else:
+            data["healed_probe_ok"] = bool(result.get("ok"))
 
-        # Scripted deadlock: TA holds alpha wants beta; TB holds beta wants alpha.
-        try:
-            dl_coord = saga_mod.Coordinator(str(broker_root), list(SAGA_SERVICES),
-                                           str(workspace_dir / "deadlock_wal.jsonl"),
-                                           node_id="client", timeout=3.0, seed=seed + 1)
-            tx_a = dl_coord.begin([{"service": "inventory", "item": "alpha", "qty": 1}])
-            tx_b = dl_coord.begin([{"service": "inventory", "item": "beta", "qty": 1}])
-            prep_a = dl_coord.prepare(tx_a)
-            prep_b = dl_coord.prepare(tx_b)
-            data["deadlock_base"] = {"a": prep_a, "b": prep_b}
-            results: dict[str, Any] = {}
-
-            def _more_a() -> None:
-                results["a"] = dl_coord.prepare_more(
-                    tx_a, [{"service": "inventory", "item": "beta", "qty": 1}])
-
-            def _more_b() -> None:
-                results["b"] = dl_coord.prepare_more(
-                    tx_b, [{"service": "inventory", "item": "alpha", "qty": 1}])
-
-            ta = threading.Thread(target=_more_a, daemon=True)
-            tb = threading.Thread(target=_more_b, daemon=True)
-            ta.start()
-            tb.start()
-            time.sleep(0.5)  # both blocked: alpha held by A, beta held by B
-            cycle = dl_coord.resolve_deadlocks()
-            data["deadlock_cycle"] = cycle
-            ta.join(timeout=6.0)
-            tb.join(timeout=6.0)
-            data["deadlock_threads_settled"] = (not ta.is_alive()) and (not tb.is_alive())
-            # Survivor commits, victim stays rolled back.
-            committed_now = []
-            for tx in (tx_a, tx_b):
-                states = _svc_statuses(broker_root, SAGA_SERVICES, [tx])
-                if all(s == "committed" for s in states["inventory"].values()):
-                    committed_now.append(tx)
-            # Commit whichever side survived resolution.
-            for tx in (tx_a, tx_b):
-                states = _svc_statuses(broker_root, SAGA_SERVICES, [tx])
-                inv = states["inventory"].get(tx, "unknown")
-                if inv == "prepared":
-                    dl_coord.commit(tx)
-            time.sleep(0.3)
-            after = _svc_statuses(broker_root, SAGA_SERVICES, [tx_a, tx_b])
-            inv_a, inv_b = after["inventory"].get(tx_a), after["inventory"].get(tx_b)
-            data["survivor_committed"] = (inv_a == "committed") != (inv_b == "committed")
-            data["victim_rolled_back"] = "aborted" in (inv_a, inv_b)
-            data["deadlock_pair"] = [tx_a, tx_b]
-        except Exception as exc:  # noqa: BLE001
-            data["notes"].append("deadlock probe crashed: %r" % (exc,))
+        # Scripted deadlock: TA holds alpha wants beta; TB holds beta wants
+        # alpha. The whole scenario (prepare_more race, waits polling,
+        # resolve_deadlocks, victim rollback) runs OUT-OF-PROCESS inside one
+        # child interpreter; the parent reads a single JSON verdict. A
+        # poisoned saga.py can neither kill nor hang the harness.
+        dl_payload = {
+            "broker_root": str(broker_root),
+            "services": list(SAGA_SERVICES),
+            "wal_path": str(workspace_dir / "deadlock_wal.jsonl"),
+            "node_id": COORD_ID,
+            "timeout": 3.0,
+            "seed": seed + 1,
+            "wait_budget": 1.5,
+            "join_budget": 6.0,
+        }
+        dl_result = _run_saga_probe_in_child(workspace_dir, "deadlock", dl_payload,
+                                             site_dir, timeout=60.0)
+        if dl_result is None:
+            data["notes"].append("deadlock probe crashed/hung (child isolated)")
+        else:
+            for key in ("deadlock_base", "deadlock_cycle", "deadlock_pair"):
+                if key in dl_result:
+                    data[key] = dl_result[key]
+            data["survivor_committed"] = bool(dl_result.get("survivor_committed"))
+            data["victim_rolled_back"] = bool(dl_result.get("victim_rolled_back"))
+            data["deadlock_threads_settled"] = bool(dl_result.get("threads_settled"))
 
         # Dangling-hold sweep (direct store read) + committed census.
         dangling = None
@@ -1755,8 +1995,6 @@ def run_saga_scenario(
             svc.stop()
         for svc in services:
             svc.join(timeout=5.0)
-        sys.path = [p for p in sys.path if p != str(workspace_dir)]
-        sys.modules.pop("saga", None)
 
 # ---------------------------------------------------------------------------
 # Milestone builders (10 milestones x 2 assertions per task = 40 total)
@@ -1802,17 +2040,17 @@ def build_raft_milestones(data: dict[str, Any]) -> list[MilestoneResult]:
         _ms2("raft_cluster", 3, "Single leader per term", [
             (len(elections) > 0 and single.passed,
              single.detail if elections else "no elections observed"),
-            (len({e.get("term") for e in elections}) >= 1, "terms observed"),
+            (len({e.get("term") for e in elections if isinstance(e.get("term"), int)}) >= 1, "terms observed"),
         ]),
         _ms2("raft_cluster", 4, "Split-brain safety", [
-            (data.get("minority_write_acked") is False,
-             "minority write acked=%r" % (data.get("minority_write_acked"),)),
+            (len(phase_a) > 0 and data.get("minority_write_acked") is False,
+             "minority write acked=%r" % (data.get("minority_write_acked"),) if phase_a else "no steady-state writes to verify partition"),
             (bool(union_post) and "minority_key" not in union_post,
              "minority key absent post-heal" if union_post else "no post-heal state to verify"),
         ]),
         _ms2("raft_cluster", 5, "Majority progress during partition", [
-            (data.get("partition_leader") in majority,
-             "partition leader=%r" % (data.get("partition_leader"),)),
+            (old_leader is not None and data.get("partition_leader") in majority,
+             "partition leader=%r" % (data.get("partition_leader"),) if old_leader else "no initial leader to establish majority"),
             (len(data.get("partition_acked", [])) == 5,
              "%d/5 partition writes acked" % len(data.get("partition_acked", []))),
         ]),
@@ -1906,13 +2144,14 @@ def build_saga_milestones(data: dict[str, Any]) -> list[MilestoneResult]:
         ]),
         _ms2("saga_coordinator", 3, "Marker-triggered external SIGKILL", [
             (data.get("kill_observed") is True, "kill at commit point observed"),
-            (data.get("nemesis_ok") is True,
-             "nemesis events ok=%r" % (data.get("nemesis_log"),)),
+            (bool(data.get("nemesis_log")) and data.get("nemesis_ok") is True,
+             "nemesis events ok=%r" % (data.get("nemesis_log"),) if data.get("nemesis_log") else "no nemesis events executed"),
         ]),
         _ms2("saga_coordinator", 4, "Crash recovery without dangling prepares", [
-            (big_resolved, "big txn states=%r" % (big_states,)),
-            (phase2 is not None and isinstance(phase2.get("recovered"), list),
-             "recover() ran on restart"),
+            (big is not None and big_resolved, "big txn states=%r" % (big_states,) if big else "no big txn created to recover"),
+            (big is not None and phase2 is not None and isinstance(phase2.get("recovered"), list) and (
+                big in phase2["recovered"]
+            ), "recover() ran on restart and restored big_txid" if big else "no big txn created to verify recovery"),
         ]),
         _ms2("saga_coordinator", 5, "Torn-write fail-closed", [
             (data.get("svc_alive_after_corrupt") is True, "payment service survived corrupt_file"),
@@ -1931,8 +2170,10 @@ def build_saga_milestones(data: dict[str, Any]) -> list[MilestoneResult]:
             (data.get("victim_rolled_back") is True, "victim rolled back"),
         ]),
         _ms2("saga_coordinator", 9, "Idempotent recovery, no dangling holds", [
-            ((phase2.get("recovered_again") == []), "second recover() is a no-op"),
-            (data.get("dangling_holds") == 0, "holds left=%r" % (data.get("dangling_holds"),)),
+            (bool(phase2) and isinstance(phase2.get("recovered"), list) and len(phase2.get("recovered", [])) > 0 and (phase2.get("recovered_again") == []),
+             "second recover() is a no-op" if (phase2 and phase2.get("recovered")) else "no initial recoveries to verify idempotence"),
+            (bool(phase2) and data.get("dangling_holds") == 0 and len(committed) > 0,
+             "holds left=%r" % (data.get("dangling_holds"),) if committed else "no committed txns to verify clean state"),
         ]),
         _ms2("saga_coordinator", 10, "Atomicity + never-lost persistence", [
             (len(committed) > 0 and atomic_ok,
@@ -1962,7 +2203,13 @@ restart recovery honouring this contract:
   client_status/bye with the field shapes of the reference protocol
   (term, candidate, last_idx/last_term, prev_idx/prev_term, entries,
   leader_commit, match_idx, req_id/key/value). Every client_* reply MUST
-  echo the request's req_id (unmatched replies are dropped).
+  echo the request's req_id (unmatched replies are dropped). Two reply
+  payloads are consumed by the harness verbatim:
+  - `client_status_reply` MUST carry `role` (the string `"leader"` while
+    this node believes it leads) and `term` (int);
+  - `client_write_reply` MUST carry `ok` (bool) — the harness acks a write
+    only when this is true;
+  - `client_read_reply` MUST carry `value`.
 * Durability: `state.json` (term, voted_for, log, commit_index, store,
   results) atomically persisted before every client ack.
 * Observability: append `{"term", "leader"}` to `elections_<id>.log` on
@@ -1981,9 +2228,22 @@ wal_path, node_id="coord", timeout=2.5, seed=0)` driving the services
 `inventory/payment/shipping` over `<broker_root>/mailbox_<id>/` with
 `partitions.json` cuts honoured on every send/recv:
 
+* Mailboxes: `<broker_root>/mailbox_<id>/msg-*.json` — the file name MUST
+  start with `msg-` and end with `.json`; files named anything else are not
+  delivered. Each file holds one envelope `{seq, src, dst, send_time,
+  deliver_at, payload}` where `payload` is the protocol message below;
+  write atomically (temp file + `os.replace`), delete a file once consumed,
+  and skip corrupt files. Service ids are `inventory`, `payment`,
+  `shipping`; your own mailbox id is the `node_id` you were constructed with.
+* Partitions: re-read `<broker_root>/partitions.json` (`{"cuts": [[a, b]]}`,
+  bidirectional) frequently; never send to / never accept from cut peers.
 * op: `{"service", "item", "qty"}`. Service protocol: prepare/commit/
   rollback/status/waits with `{type, txid, item, qty, req_id}` and
   `{type: <kind>_ack, req_id, ok, ...}` replies (match by req_id).
+  Two reply shapes are consumed by the harness verbatim:
+  - `status_ack` MUST carry `state` (the txid's per-service state string);
+  - `waits_ack` MUST carry `holders` (item -> txid holding it) and
+    `waiters` (txid -> item it is blocked on) for the deadlock resolver.
 * `begin(ops)->txid`, `prepare(txid)->{svc: bool}`,
   `prepare_more(txid, extra)->{svc: bool}`, `commit(txid, hold_open=0.0)`,
   `rollback(txid, reason="")`, `execute(ops)->(ok, txid)`.
