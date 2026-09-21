@@ -142,7 +142,23 @@ class GoogleGenAIDriver(BaseDriver):
             try:
                 response = self._generate(client, contents, config)
             except Exception as exc:
-                raise self._map_error(exc) from exc
+                mapped = self._map_error(exc)
+                # Gateway rejected the thinking level (some gateways only
+                # accept a subset). Degrade to vendor default and retry once
+                # rather than failing the whole task.
+                if (
+                    "thinking_config" in config_args
+                    and not kwargs.get("_thinking_dropped")
+                    and isinstance(mapped, PermanentDriverError)
+                    and "INVALID_ARGUMENT" in str(mapped).upper()
+                    and "THINKING" in str(mapped).upper()
+                ):
+                    # Gateway rejected the thinking level (some gateways only
+                    # accept a subset). Degrade to vendor default and retry once
+                    # rather than failing the whole task.
+                    retry_kwargs = dict(kwargs, _thinking_dropped=True)
+                    return self.chat(messages, tools, **retry_kwargs)
+                raise mapped from exc
             result = self.parse_response(response)
             self.account_usage(result.token_usage)
             if result.truncated and not kwargs.get("_trunc_retry"):
@@ -209,15 +225,15 @@ class GoogleGenAIDriver(BaseDriver):
                 if content:
                     parts.append(types.Part.from_text(text=str(content)))
                 for tc in tool_calls:
-                    fn = tc.get("function", {})
-                    fn_name = fn.get("name", "")
-                    fn_args = fn.get("arguments", {})
+                    fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+                    fn_name = str(fn.get("name") or tc.get("name") or "")
+                    fn_args = fn.get("arguments") if "arguments" in fn else tc.get("arguments", {})
                     if isinstance(fn_args, str):
                         try:
                             fn_args = json.loads(fn_args)
                         except Exception:
                             fn_args = {}
-                    parts.append(types.Part.from_function_call(name=fn_name, args=fn_args))
+                    parts.append(types.Part.from_function_call(name=fn_name, args=fn_args if isinstance(fn_args, dict) else {}))
                 converted.append(types.Content(role="model", parts=parts))
 
             elif role == "tool":
@@ -264,10 +280,21 @@ class GoogleGenAIDriver(BaseDriver):
                     thought = part.thought
         usage = getattr(response, "usage_metadata", None)
         if usage is not None:
+            # ``thoughts_token_count`` is the vendor-native thinking budget
+            # actually consumed. Surface it as reasoning_tokens so effort
+            # changes are visible in telemetry even when the gateway does
+            # not stream thought text back.
+            reasoning = int(getattr(usage, "thoughts_token_count", 0) or 0)
+            if not reasoning:
+                prompt_n = int(getattr(usage, "prompt_token_count", 0) or 0)
+                cand_n = int(getattr(usage, "candidates_token_count", 0) or 0)
+                total_n = int(getattr(usage, "total_token_count", 0) or 0)
+                reasoning = max(0, total_n - prompt_n - cand_n)
             token_usage = {
                 "prompt_tokens": getattr(usage, "prompt_token_count", 0) or 0,
                 "completion_tokens": getattr(usage, "candidates_token_count", 0) or 0,
                 "total_tokens": getattr(usage, "total_token_count", 0) or 0,
+                "reasoning_tokens": reasoning,
             }
         else:
             token_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}

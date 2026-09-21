@@ -130,8 +130,10 @@ class AnthropicDriver(BaseDriver):
                 if content:
                     content_blocks.append({"type": "text", "text": str(content)})
                 for tc in tool_calls:
-                    fn = tc.get("function", {})
-                    args = fn.get("arguments", {})
+                    # 兼容规范化的扁平字典 {"id", "name", "arguments"} 与未展开的 {"function": {...}}
+                    fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+                    tool_name = str(fn.get("name") or tc.get("name") or "")
+                    args = fn.get("arguments") if "arguments" in fn else tc.get("arguments", {})
                     if isinstance(args, str):
                         try:
                             args = json.loads(args)
@@ -140,7 +142,7 @@ class AnthropicDriver(BaseDriver):
                     content_blocks.append({
                         "type": "tool_use",
                         "id": str(tc.get("id", "")),
-                        "name": str(fn.get("name", "")),
+                        "name": tool_name,
                         "input": args if isinstance(args, dict) else {},
                     })
                 anthropic_msgs.append({"role": "assistant", "content": content_blocks})

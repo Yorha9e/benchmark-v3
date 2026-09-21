@@ -29,10 +29,14 @@ DEFAULT_HEADERS: dict[str, str] = {
 #: reasoning turns that emit nothing until the first token. Streaming
 #: resets the read timer on every SSE chunk; the read budget is the
 #: allowed silence *between* chunks.
-#: Default read is unlimited (``none``) so the harness does not abort a
-#: thinking model and leave ``client disconnected`` on the gateway.
-#: Override with BENCH_HTTP_READ_TIMEOUT (seconds, or none/0).
+#: The read budget is deliberately generous (10 min) rather than unlimited:
+#: a gateway that accepts the connection and then goes silent (hung upstream,
+#: dead backend) would otherwise stall the harness forever — no error, no
+#: retry, just a permanent "running" task. A ReadTimeout is raised as a
+#: transient failure and goes through the normal retry/backoff path.
+#: Override with BENCH_HTTP_READ_TIMEOUT (seconds, or none/0 for unlimited).
 DEFAULT_CONNECT_TIMEOUT = 30.0
+DEFAULT_READ_TIMEOUT = 600.0
 DEFAULT_WRITE_TIMEOUT = 120.0
 DEFAULT_POOL_TIMEOUT = 30.0
 DEFAULT_KEEPALIVE_EXPIRY = 300.0
@@ -49,15 +53,15 @@ def _env_float(name: str, default: float) -> float:
 
 
 def default_read_timeout() -> float | None:
-    """Idle-read timeout in seconds, or None for no limit."""
-    raw = os.environ.get("BENCH_HTTP_READ_TIMEOUT", "none")
+    """Idle-read timeout in seconds (default 600), or None for no limit."""
+    raw = os.environ.get("BENCH_HTTP_READ_TIMEOUT", str(DEFAULT_READ_TIMEOUT))
     text = str(raw).strip().lower()
     if text in ("", "none", "off", "0", "infinite", "inf"):
         return None
     try:
         value = float(text)
     except (TypeError, ValueError):
-        return None
+        return DEFAULT_READ_TIMEOUT
     return value if value > 0 else None
 
 

@@ -522,18 +522,20 @@ def self_test() -> tuple[int, int]:
     check("timeout_not_unsupported", not is_stream_unsupported(_E(None, "ReadTimeout")))
     check("typeerror_fallback", is_stream_unsupported(TypeError("unexpected keyword stream")))
     from benchmark_v3.bench_harness.drivers.base import (
+        DEFAULT_READ_TIMEOUT,
         default_read_timeout,
         httpx_limits,
         httpx_timeout,
     )
-    check("read_timeout_default_unlimited", default_read_timeout() is None)
+    check("read_timeout_bounded_default",
+          default_read_timeout() == DEFAULT_READ_TIMEOUT and DEFAULT_READ_TIMEOUT > 0)
     try:
         t = httpx_timeout()
-        check("httpx_read_unlimited", t.read is None and float(t.connect) <= 30.0)
+        check("httpx_read_bounded", t.read == DEFAULT_READ_TIMEOUT and float(t.connect) <= 30.0)
         limits = httpx_limits()
         check("keepalive_not_five_seconds", float(limits.keepalive_expiry) >= 60.0)
     except Exception:
-        check("httpx_read_unlimited", False)
+        check("httpx_read_bounded", False)
         check("keepalive_not_five_seconds", False)
     return counts[0], counts[1]
 

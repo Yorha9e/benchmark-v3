@@ -83,7 +83,14 @@ def gemini_uses_thinking_level(model_id: str) -> bool:
 
 
 def gemini_thinking_kwargs(model_id: str, value: Any) -> dict[str, Any] | None:
-    """Arguments for ``types.ThinkingConfig``."""
+    """Arguments for ``types.ThinkingConfig``.
+
+    Gateways differ in which ``thinking_level`` values they accept (e.g. some
+    reject ``minimal`` outright with HTTP 400). Unsupported labels degrade to
+    the nearest universally-accepted level instead of failing the request:
+    ``minimal`` -> ``low`` (closest supported tier). If a gateway still
+    rejects the value, the driver retries without the field.
+    """
     eff = normalize_effort(value)
     if gemini_uses_thinking_level(model_id):
         if eff is None:
@@ -92,7 +99,10 @@ def gemini_thinking_kwargs(model_id: str, value: Any) -> dict[str, Any] | None:
             return {"thinking_level": "minimal"}
         if eff in ("xhigh", "max"):
             return {"thinking_level": "high"}
-        if eff in ("minimal", "low", "medium", "high"):
+        if eff == "minimal":
+            # 部分网关不支持 minimal，降级到最接近的 low
+            return {"thinking_level": "low"}
+        if eff in ("low", "medium", "high"):
             return {"thinking_level": eff}
         return {"thinking_level": "medium"}
     if eff is None:

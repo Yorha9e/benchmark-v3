@@ -195,7 +195,8 @@ class TokenAuditMetrics:
         passed_milestones: int = 0,
         budget: int = TOKEN_BUDGET,
     ) -> TokenAuditMetrics:
-        total = prompt_tokens + completion_tokens + reasoning_tokens
+        # 主流 API 规范中 completion_tokens 已包含 reasoning_tokens，不重复相加
+        total = prompt_tokens + completion_tokens
         per_milestone = (total / passed_milestones) if passed_milestones > 0 else 0.0
         return cls(
             prompt_tokens=prompt_tokens,
