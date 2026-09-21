@@ -6,7 +6,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from benchmark_v3.bench_harness.core.snapshot import atomic_write_json, exclusive_file_lock
+from benchmark_v3.bench_harness.core.snapshot import (
+    atomic_write_json,
+    atomic_write_text,
+    exclusive_file_lock,
+)
 from benchmark_v3.bench_harness.core.types import EvaluationReport
 
 EVALUATION_FILENAME = "evaluation.json"
@@ -235,7 +239,27 @@ class MasterLeaderboard:
             patch_tasks = entry.get("tasks")
             if isinstance(disk_tasks, dict) and isinstance(patch_tasks, dict):
                 tasks: dict[str, Any] = dict(disk_tasks)
-                tasks.update(patch_tasks)
+                # 逐槽位比较时间戳：caller 可能持有一个较老的快照（例如
+                # rescore 读盘后跑了几分钟），直接 update 会把这期间实时
+                # 跑测写入的更新槽位冲回旧值。只有 caller 的槽位不比磁盘
+                # 上的旧时才覆盖；磁盘上更新的槽位一律保留。
+                for slot_key, slot_val in patch_tasks.items():
+                    disk_val = tasks.get(slot_key)
+                    if not isinstance(disk_val, dict) or not isinstance(slot_val, dict):
+                        tasks[slot_key] = slot_val
+                        continue
+                    # 裸字符串比较有三个陷阱：(a) None 会变成 "None" 而
+                    # "None" > "2026-..." 恒成立，让 None 槽位反向覆盖合法
+                    # 时间戳；(b) 缺失 updated_at 变成 ""，永远写不进去；
+                    # (c) ISO 微秒被省略时 "…04Z" > "…04.123456Z" （'Z'>'.'）
+                    # 会把更早的时间误判为更新。所以只在两侧都有合法时间
+                    # 戳时才比较，其余一律以 caller 为准。
+                    s_ts = slot_val.get("updated_at")
+                    d_ts = disk_val.get("updated_at")
+                    if not (isinstance(s_ts, str) and isinstance(d_ts, str) and s_ts and d_ts):
+                        tasks[slot_key] = slot_val
+                    elif s_ts >= d_ts:
+                        tasks[slot_key] = slot_val
                 merged_entry["tasks"] = tasks
             elif isinstance(disk_tasks, dict):
                 merged_entry["tasks"] = dict(disk_tasks)
@@ -726,7 +750,9 @@ class MasterLeaderboard:
             cls.refresh_aggregates(payload)
             md_content = cls.render_markdown(payload)
             try:
-                LEADERBOARD_MD_PATH.write_text(md_content, encoding="utf-8")
+                # 原子替换：直接 write_text 在并发导出时会让同时读取
+                # LEADERBOARD.md 的一方读到截断内容。
+                atomic_write_text(LEADERBOARD_MD_PATH, md_content)
             except OSError:
                 pass
             if persist:

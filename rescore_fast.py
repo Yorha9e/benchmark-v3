@@ -21,6 +21,8 @@ sys.path.insert(0, "D:/vscode/kimisubagentexplore/subagentbenchmark")
 
 from benchmark_v3.bench_harness.core.report import MasterLeaderboard
 from benchmark_v3.bench_harness.suites.critic import (
+    BAIT_POINTS,
+    DEPTH_POINTS,
     FIXTURES,
     POINTS_PER_FLAW,
     RECALL_POINTS,
@@ -193,10 +195,13 @@ def rescore_critic(_task_id: str, ws_dir: Path) -> dict:
         format_score = float(scores.get("format", 0.0))
 
     total = min(100.0, round(recall + bait + depth + format_score + novel, 2))
+    # 里程碑阈值必须与 critic.py 的实时判分保持一致，否则同一份分数在
+    # 实时评测与离线复算下会算出不同的 milestones_passed。
+    # critic.py: recall >= POINTS_PER_FLAW * 2, depth >= DEPTH_POINTS / 2
     ms = 0
-    ms += 1 if recall > 0 else 0
-    ms += 1 if bait >= 20 else 0
-    ms += 1 if depth >= 14 else 0
+    ms += 1 if recall >= POINTS_PER_FLAW * 2 else 0
+    ms += 1 if bait >= BAIT_POINTS else 0
+    ms += 1 if depth >= DEPTH_POINTS / 2 else 0
     ms += 1 if format_score > 0 else 0
     return {"reward": total, "passed": total >= 70.0, "milestones_passed": ms, "milestones_total": 4}
 

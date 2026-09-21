@@ -15,7 +15,13 @@ SNAPSHOT_FILENAME = "last_prompt_snapshot.json"
 
 
 def atomic_write_json(path: str | Path, payload: dict[str, Any]) -> Path:
-    """Write JSON atomically (tmp file + os.replace)."""
+    """Write JSON atomically (tmp file + os.replace).
+
+    ``os.replace`` can transiently fail on Windows when another process has
+    the target open (WinError 5/32 — e.g. a reader polling the manifest or a
+    scanner holding a handle). Retry briefly before giving up so a momentary
+    lock does not surface as a crash.
+    """
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(dir=str(target.parent), prefix=target.name + ".", suffix=".tmp")
@@ -25,7 +31,56 @@ def atomic_write_json(path: str | Path, payload: dict[str, Any]) -> Path:
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(tmp_name, target)
+        last_exc: OSError | None = None
+        for attempt in range(10):
+            try:
+                os.replace(tmp_name, target)
+                last_exc = None
+                break
+            except OSError as exc:
+                last_exc = exc
+                if attempt == 9:
+                    break
+                time.sleep(0.02 * (attempt + 1))
+        if last_exc is not None:
+            raise last_exc
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+    return target
+
+
+def atomic_write_text(path: str | Path, text: str) -> Path:
+    """Write text atomically (tmp file + os.replace), retrying on WinError.
+
+    Same contract as :func:`atomic_write_json` but for rendered artifacts
+    such as ``LEADERBOARD.md``: a plain ``write_text`` lets a concurrent
+    reader observe a truncated file mid-write.
+    """
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=str(target.parent), prefix=target.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        last_exc: OSError | None = None
+        for attempt in range(10):
+            try:
+                os.replace(tmp_name, target)
+                last_exc = None
+                break
+            except OSError as exc:
+                last_exc = exc
+                if attempt == 9:
+                    break
+                time.sleep(0.02 * (attempt + 1))
+        if last_exc is not None:
+            raise last_exc
     except BaseException:
         try:
             os.unlink(tmp_name)
