@@ -343,16 +343,22 @@ def score_audit(
         # 显式说明诱饵代码安全、无缺陷、遵循前置契约时，绝不误扣诱饵分
         if any(w in text for w in ("safe", "clean", "no defect", "no bug", "no error", "not a bug", "correct as-is", "preconditions hold")):
             return False
-        # 金标准规定：只有 severity >= Low（或明确 Type == Bug）的「功能缺陷/漏洞指控」
-        # 才扣诱饵分；纯 info / style / nit 的设计备忘绝不扣分。
-        # 关键词匹配必须在 severity 门槛之内生效，否则一条提到 collision 的
-        # info 级安全说明会被误判为漏洞指控而倒扣 10 分。
-        if sev not in ("low", "medium", "high", "critical"):
+        # 第一阶段：明确的信息/风格类 severity 直接豁免。金标准只要求对
+        # 「功能缺陷/漏洞指控」扣分，纯 info/style/nit 的设计备忘不扣分；
+        # 即使 category 里提到了 collision 之类的词根，也只是在做说明。
+        if sev in ("info", "informational", "style", "nit", "note", "notes",
+                   "n/a", "na", "none", "null", "unknown", "suggestion", "comment",
+                   "minor", "trivial", "cosmetic"):
             return False
+        # 第二阶段：明确的缺陷/漏洞类别词算缺陷指控。severity 省略时也要
+        # 扣分，否则模型不填 severity 就能对诱饵编造严重漏洞而逃掉扣分。
         if any(k in cat for k in ("vuln", "bug", "defect", "overflow", "race", "collision", "security", "error", "flaw")):
             return True
-        # severity 达标即视为缺陷指控（severity 本身就是模型的定性判断）
-        return True
+        # 第三阶段：按 severity 定性（含 major/blocker/sev1 等常见同义词）
+        # 注意 "warning" 不在这里：它表示提醒而非严重性，配合 style 类
+        # category 时应豁免（由第一阶段的 category 语义决定）。
+        return sev in ("low", "medium", "high", "critical",
+                       "major", "blocker", "sev1", "sev2", "sev3", "severe")
 
     flagged_baits = sorted(
         {

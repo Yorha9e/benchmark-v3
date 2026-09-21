@@ -155,7 +155,7 @@ def expand(tokens, env):
 # ---------------------------------------------------------------------------
 
 _CHILD_PREAMBLE = """
-import json, sys, tracemalloc, random
+import json, sys, tracemalloc, random, re
 ws, seed = sys.argv[1], int(sys.argv[2])
 sys.path.insert(0, ws)
 out = {"assertions": [], "peak_bytes": 0}
@@ -504,9 +504,12 @@ try:
     res = tok("ok @ dear # foo")
     errs = [t[1] for t in res if t[0] == "ERROR"]
     # 题面允许 ERROR 的第二个元素是「 offending character 」或「 short reason
-    # string 」，所以这里按子串匹配：模型输出 "unexpected '#'" / "invalid '#'
+    # string 」，所以按子串匹配：模型输出 "unexpected '#'" / "invalid '#'
     # character" 这类带上下文的原因串，同样算正确识别了杂散字符。
-    record("a6", any("@" in e for e in errs) and any("#" in e for e in errs),
+    # 但必须排除 "#" 只是行号/编号前缀的无关串（如 "line #1"、"Error #404"），
+    # 否则一个完全没识别杂散 # 的实现会靠无关文本蒙混过关。
+    record("a6", any("@" in e for e in errs)
+           and any(re.search(r"(?<![A-Za-z0-9])#(?![A-Za-z0-9])", e) for e in errs),
            "stray error tokens=%r" % (errs,))
 except Exception as exc:
     record("a6", False, "stray chars raised %r" % (exc,))
