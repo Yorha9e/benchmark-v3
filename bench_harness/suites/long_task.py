@@ -1673,8 +1673,10 @@ def _run_saga_probe_in_child(
     if script is None:
         return None
     runner = ProcessRunner(default_timeout=timeout)
+    # 同 reviewer 探针：子进程以 cwd=workspace_dir 启动，必须先解析为绝对
+    # 路径，否则相对路径会被相对 cwd 再拼一次（路径重复 -> 探针全部失败）。
     result = runner.run(
-        [sys.executable, "-c", script, str(workspace_dir),
+        [sys.executable, "-c", script, str(Path(workspace_dir).resolve()),
          str(site_dir or ""), json.dumps(payload)],
         cwd=workspace_dir,
         timeout=timeout,

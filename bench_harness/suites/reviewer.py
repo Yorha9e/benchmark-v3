@@ -330,7 +330,7 @@ REVIEWER_TASKS: dict[str, dict[str, Any]] = {
 #: Child preamble: argv is ``<workspace>``; the child defines the JSON sink
 #: (``out`` / ``_finish``) and the workspace-module loader used by every body.
 _CHILD_PREAMBLE = (
-    "import json, sys, threading, time\n"
+    "import json, os, sys, threading, time\n"
     "ws = sys.argv[1]\n"
     "sys.path.insert(0, ws)\n"
     "out = {'passed': False, 'detail': ''}\n"
@@ -363,7 +363,7 @@ def _run_probe_in_child(
     script = _CHILD_PREAMBLE + body
     runner = ProcessRunner(default_timeout=timeout)
     result = runner.run(
-        [sys.executable, "-c", script, str(workspace)],
+        [sys.executable, "-c", script, str(Path(workspace).resolve())],
         cwd=workspace,
         timeout=timeout,
     )
