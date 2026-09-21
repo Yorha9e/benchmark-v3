@@ -200,6 +200,52 @@ FLAW_DOSSIERS: dict[str, dict[str, str]] = {
 }
 
 
+def _extract_json_object(raw: str) -> dict[str, Any] | None:
+    """Extract a top-level JSON object from model output (codeblock or balanced braces)."""
+    if not raw or not raw.strip():
+        return None
+    # 1. Try markdown code block ```json { ... } ```
+    cb_match = re.search(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", raw, re.IGNORECASE)
+    if cb_match:
+        try:
+            parsed = json.loads(cb_match.group(1))
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+    # 2. Balanced brace scan for the first valid top-level object
+    start = raw.find("{")
+    while start != -1:
+        depth = 0
+        in_str = False
+        escape = False
+        for idx in range(start, len(raw)):
+            ch = raw[idx]
+            if escape:
+                escape = False
+                continue
+            if ch == "\\":
+                escape = True
+                continue
+            if ch == '"':
+                in_str = not in_str
+                continue
+            if not in_str:
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        try:
+                            parsed = json.loads(raw[start : idx + 1])
+                            if isinstance(parsed, dict):
+                                return parsed
+                        except Exception:
+                            break
+        start = raw.find("{", start + 1)
+    return None
+
+
 class CriticJudgeEvaluator:
     """Evaluates Critic findings using an independent judge model or strict heuristic fallback."""
 
@@ -290,9 +336,8 @@ class CriticJudgeEvaluator:
                 )
                 try:
                     resp = self.judge_driver.chat([{"role": "user", "content": prompt}], temperature=0.0)
-                    m = re.search(r"\{.*\}", resp.content, re.DOTALL)
-                    if m:
-                        parsed = json.loads(m.group(0))
+                    parsed = _extract_json_object(resp.content)
+                    if parsed:
                         if parsed.get("is_valid_novel_defect") and bonus_total < 5.0:
                             sc = float(parsed.get("bonus_score", 2.5))
                             bonus_total = min(5.0, bonus_total + sc)
@@ -302,13 +347,14 @@ class CriticJudgeEvaluator:
                                 "bonus_score": sc,
                                 "reasoning": parsed.get("reasoning", "Valid novel defect approved by judge."),
                             })
-                            continue
+                        # 专家裁判已介入判定，跳过后续启发式回落
+                        continue
                 except Exception:
                     pass
 
             # 启发式规则兜底
             text = f"{cat} {root_cause} {fix}".lower()
-            if file_name == "session_tokens.py" and any(k in text for k in ("guest", "entropy", "predictable", "cwe-330", "cwe-340", "forge")):
+            if file_name == "session_tokens.py" and any(k in text for k in ("guest token", "zero entropy", "predictable token", "cwe-330", "cwe-340", "forgeable token")):
                 if bonus_total < 5.0:
                     bonus_total = min(5.0, bonus_total + 2.5)
                     novel_verdicts.append({
@@ -317,7 +363,7 @@ class CriticJudgeEvaluator:
                         "bonus_score": 2.5,
                         "reasoning": "额外发现了 make_guest_token 凭证零随机熵、确定性可伪造的安全缺陷 (CWE-330)。",
                     })
-            elif file_name == "config_codec.py" and any(k in text for k in ("count = 255", "amplification", "dos", "255")):
+            elif file_name == "config_codec.py" and any(k in text for k in ("count=255", "count == 255", "amplification attack", "dos via count")):
                 if bonus_total < 5.0:
                     bonus_total = min(5.0, bonus_total + 2.5)
                     novel_verdicts.append({
@@ -357,10 +403,9 @@ class CriticJudgeEvaluator:
                 temperature=0.0,
             )
             raw = response.content.strip()
-            # 提取 JSON 块
-            match = re.search(r"\{.*\}", raw, re.DOTALL)
-            if match:
-                parsed = json.loads(match.group(0))
+            # 健壮提取 JSON 字典
+            parsed = _extract_json_object(raw)
+            if parsed:
                 level = str(parsed.get("level", "L1")).upper()
                 score = float(parsed.get("score", 1.0))
                 evidence = str(parsed.get("evidence_quote", ""))
@@ -429,8 +474,8 @@ class CriticJudgeEvaluator:
             }
 
         elif flaw_file == "archive_import.py":
-            # 伪修复一票否决检测
-            if "replace('../', '')" in combined or "replace('..', '')" in combined:
+            # 伪修复一票否决检测：匹配单次 replace 剥离
+            if re.search(r"replace\(\s*['\"](?:\.\./|\.\.)['\"]\s*,\s*['\"]['\"]\s*\)", combined):
                 return {
                     "level": "L1",
                     "score": 1.0,
@@ -451,7 +496,11 @@ class CriticJudgeEvaluator:
                     "reasoning": "伪修复陷阱：盲目 basename 未检验空串与 ..，在部分系统上依然逃逸（一票否决）。",
                 }
 
-            has_production_fix = any(k in combined for k in ("commonpath", "is_relative_to", "realpath", "o_nofollow")) and "startswith" not in combined
+            # 排除明确否定 startswith 的优秀答案（如 'do not use startswith'）
+            has_startswith_pseudo = "startswith" in combined and not any(
+                k in combined for k in ("not use startswith", "avoid startswith", "never startswith", "do not use startswith")
+            )
+            has_production_fix = any(k in combined for k in ("commonpath", "is_relative_to", "realpath", "o_nofollow")) and not has_startswith_pseudo
             has_attack_vector = any(k in combined for k in ("../", "..\\", "traversal", "escape", "overwrite", "authorized_keys", "cron", "rce"))
             has_mechanism = any(k in combined for k in ("relative path", "path join", "join", "outside", "root", "absolute path"))
 
@@ -548,10 +597,10 @@ class CriticJudgeEvaluator:
                 }
             if "except indexerror" in combined and "pass" in combined:
                 return {
-                    "level": "L2",
-                    "score": 2.5,
+                    "level": "L1",
+                    "score": 1.0,
                     "evidence_quote": "except IndexError: pass",
-                    "reasoning": "伪修复陷阱：使用 try-except pass 粗暴吞掉越界异常，留下半混合脏状态。",
+                    "reasoning": "伪修复陷阱：使用 try-except pass 粗暴吞掉越界异常，留下半混合脏状态（一票否决）。",
                 }
 
             has_clipping_fix = any(k in combined for k in ("max(0", "min(", "clip", "intersect", "span"))

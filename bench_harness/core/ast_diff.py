@@ -38,12 +38,33 @@ class AstDiffResult:
 
 
 def _node_sequence(source: str) -> list[str] | None:
-    """Flatten an AST into node-type names; None when unparseable."""
+    """Flatten an AST into DFS pre-order structural tokens with attributes; None when unparseable."""
     try:
         tree = ast.parse(source)
     except (SyntaxError, ValueError):
         return None
-    return [type(node).__name__ for node in ast.walk(tree)]
+
+    seq: list[str] = []
+
+    def _dfs(node: ast.AST) -> None:
+        name = type(node).__name__
+        attr = ""
+        if isinstance(node, ast.Name):
+            attr = f":{node.id}"
+        elif isinstance(node, ast.Attribute):
+            attr = f":{node.attr}"
+        elif isinstance(node, ast.FunctionDef):
+            attr = f":{node.name}"
+        elif isinstance(node, ast.arg):
+            attr = f":{node.arg}"
+        elif isinstance(node, ast.Constant):
+            attr = f":{type(node.value).__name__}"
+        seq.append(f"{name}{attr}")
+        for child in ast.iter_child_nodes(node):
+            _dfs(child)
+
+    _dfs(tree)
+    return seq
 
 
 def compute_penalty(
