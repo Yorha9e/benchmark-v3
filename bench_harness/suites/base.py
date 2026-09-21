@@ -161,6 +161,98 @@ def utc_now_iso() -> str:
 _PARENT_TRAVERSAL_RE = None  # lazy-compiled (see _command_escapes_workspace)
 
 
+def _bulk_kill_reason(command: str) -> str | None:
+    """Screen process-kill commands that would tear down the harness itself.
+
+    The task runs inside the harness's **own** interpreter, so an image-name
+    kill (``taskkill /F /IM python.exe``), a bare ``taskkill`` with no
+    ``/PID``, or a name-wide ``pkill``/``killall`` kills the evaluator
+    mid-run: no traceback, no finalize, and the run is stranded at
+    ``status: running`` forever. Observed in the wild on 2026-09-20 — a model
+    ran ``taskkill /F /IM python.exe`` to clean up its own test nodes and
+    silently killed the benchmark.
+
+    Only **literal-PID** kills stay allowed (``taskkill /F /PID 1234``): a
+    model cleaning up its own node processes is legitimate, and the harness
+    wipes leftover runtime state itself. A PID given as a shell variable
+    (``//PID $p`` after enumerating every python process) is refused too,
+    since that is the same bulk kill in disguise.
+
+    A kill verb only counts when it carries a kill flag (``/F``, ``/IM``,
+    ``/PID``, ``-Force``), so prose and searches that merely mention the word
+    (``grep -r taskkill .``) stay allowed. Like
+    :func:`_command_escapes_workspace`, this is a best-effort static screen:
+    string-obfuscated invocations are out of scope.
+    """
+    import re
+
+    text = command or ""
+    # Strip quoted string literals and heredoc bodies so that mentioning a
+    # kill verb in text (searching, echoing, or writing source code) is not
+    # mistaken for invoking it.
+    screened = re.sub(r"\"(?:[^\"\\\\]|\\\\.)*\"", " ", text)
+    screened = re.sub(r"'(?:[^'\\\\]|\\\\.)*'", " ", screened)
+    # `kill -9 -1` broadcasts to every process the user owns.
+    if re.search(r"(^|[\s;|&`$()'\"=])kill\s+(?:-\S+\s+)*-?1\b", screened):
+        return ("broadcast signal (`kill -1`) is not allowed; it would also "
+                "terminate the harness running this task")
+    # Name-wide killers: pkill/killall are name-based by construction.
+    if re.search(r"(^|[\s;|&`$()'\"=])(?:pkill|killall)\b", screened, re.IGNORECASE):
+        return ("name-wide process kill (`pkill`/`killall`) is not allowed; "
+                "terminating processes by name also kills the harness running "
+                "this task — the harness cleans up its own processes")
+    # `kill` on an expanded/globbed target (e.g. every python PID enumerated
+    # first). `$!` is the caller's own background job and stays allowed.
+    m = re.search(r"(^|[\s;|&`$()'\"=])kill\s+((?:-\S+\s+)*)([^;|&\n]+)", screened)
+    if m:
+        flags, targets = m.group(2), m.group(3)
+        if not re.search(r"-l\b", flags) and re.search(r"[\$`*]", targets) \
+                and not re.fullmatch(r"\s*\$\!?\s*", targets):
+            return ("`kill` on an expanded target is not allowed; it may match "
+                    "the harness process — kill by a literal PID instead")
+    # Host-shutdown or system disruption commands
+    if re.search(r"(^|[\s;|&`$()'\"=])(?:shutdown|stop-computer)\b", text, re.IGNORECASE):
+        return ("system shutdown commands (`shutdown`, `Stop-Computer`) are not allowed; "
+                "they would terminate the benchmark harness and machine")
+    # WMI process termination: `wmic process ... call terminate` / `delete`
+    if re.search(r"\bwmic\b", text, re.IGNORECASE) and re.search(r"\b(?:terminate|delete)\b", text, re.IGNORECASE):
+        return ("WMI process termination (`wmic ... terminate/delete`) is not allowed; "
+                "it can kill the harness process — kill by explicit PID instead")
+    # Legacy Windows tskill
+    if re.search(r"(^|[\s;|&`$()'\"=])tskill\b", text, re.IGNORECASE):
+        return ("`tskill` is not allowed; kill by explicit PID with `taskkill /PID <n>` instead")
+    # Prohibit inspecting parent process to prevent two-step PID-based harness kills
+    if re.search(r"\bparentprocessid\b", text, re.IGNORECASE):
+        return ("inspecting parent process ID is not allowed")
+
+    # taskkill / Stop-Process: require a kill flag, then demand literal PIDs.
+    # Match the RAW text here (not the quote-stripped copy): nested quotes make
+    # stripping swallow the whole invocation, and a false positive merely tells
+    # the model to use a literal PID — whereas a miss kills the benchmark.
+    if not re.search(r"(?:taskkill|stop-process)\b", text, re.IGNORECASE):
+        return None
+    if not re.search(r"(?:/f\b|/im\b|/pid\b|-force\b|-id\b)", text, re.IGNORECASE):
+        return None  # mere mention (grep/echo/cat) — not an invocation
+    # taskkill /IM <image>  or  Stop-Process -Name <name>
+    if re.search(r"/im\s+\S", text, re.IGNORECASE) or \
+       re.search(r"-name\s+\S", text, re.IGNORECASE):
+        return ("process kill by image name (`/IM`, `-Name`) is not allowed; "
+                "the harness itself runs as python.exe, so this would kill the "
+                "benchmark mid-run — kill by explicit PID instead")
+    # Every targeted PID must be a literal number.
+    pids = re.findall(r"(?:/pid|-id)\s+[\"']?([^\s\"';|&)]+)", text, re.IGNORECASE)
+    if not pids:
+        return ("`taskkill` without an explicit `/PID` is not allowed; the "
+                "harness cleans up its own processes — kill by explicit PID "
+                "only if you must")
+    for pid in pids:
+        if not pid.isdigit():
+            return ("process kill with a non-literal PID (%r) is not allowed; "
+                    "enumerating every python process and killing it also kills "
+                    "the harness — use a literal PID" % pid)
+    return None
+
+
 def _command_escapes_workspace(command: str) -> str | None:
     """Best-effort static screen: does this shell command reach outside cwd?
 
@@ -189,14 +281,12 @@ def _command_escapes_workspace(command: str) -> str | None:
     text = command or ""
     if _PARENT_TRAVERSAL_RE.search(text):
         return "parent-directory traversal (`..`) is not allowed; stay inside the workspace"
+    kill_reason = _bulk_kill_reason(text)
+    if kill_reason is not None:
+        return kill_reason
     lowered = text.lower()
-    for marker in ("$home", "${home}", "$userprofile", "%userprofile%", "%home%",
-                   "$env:home", "${env:home}", "$env:userprofile", "${env:userprofile}",
-                   "$env:homedrive", "$env:homepath", "$env:appdata",
-                   "$env:localappdata", "$env:programdata"):
-        if marker in lowered:
-            return f"home-directory reference ({marker}) is not allowed; stay inside the workspace"
-    if re.search(r"\b(HOME|USERPROFILE|HOMEDRIVE|HOMEPATH|APPDATA|LOCALAPPDATA|PROGRAMDATA)\b", text):
+    # 环境变量引用（支持 $HOME, ${HOME}, %HOME%, $env:HOME 等，避免误伤普通的包含大写单词的文本或文件名）
+    if re.search(r"(?:\$|\%|\$env:|\$\{)(?:HOME|USERPROFILE|HOMEDRIVE|HOMEPATH|APPDATA|LOCALAPPDATA|PROGRAMDATA)\b", text, re.IGNORECASE):
         return "home-directory reference (HOME/USERPROFILE/…) is not allowed; stay inside the workspace"
     # Git escape hatches: re-pointing git at the harness repo would bypass the
     # GIT_CEILING_DIRECTORIES isolation injected at execution time.
@@ -214,9 +304,13 @@ def _command_escapes_workspace(command: str) -> str | None:
         return "opaque -EncodedCommand blobs are not allowed; use plaintext -Command instead"
     # `/dev/null`  drains are harmless and idiomatic; exempt before screening.
     screened = re.sub(r"/dev/null\b", "", text)
-    # Absolute POSIX path, home expansion, or redirect target outside cwd.
-    if re.search(r"(^|[\s;|&`$()'\"=><])(~|/)(?=$|[\s;|&`$()'\"=><]|[\w.~\/])", screened):
-        return "absolute path / home expansion is not allowed; use workspace-relative paths"
+    # URL schemes are network-ish or pseudo-protocols; disallow file: explicitly below, but allow http(s)://
+    screened = re.sub(r"https?://\S*", "", screened)
+    # Absolute POSIX path (starts with / followed by directory name, or root `/`), or home expansion (~ or ~/...)
+    if re.search(r"(?:^|[\s;|&`$()'\"=><])(?:~[/\w.~]*|/(?:[a-zA-Z0-9_.-]+(?:/|$)|$))", screened):
+        # 排除普通的算术除法表达式，如 '1 / 2' 或 ' / ' 前后均为空格的纯符号
+        if not re.search(r"^\s*$", screened) and not re.search(r"\s+/\s+\d+", screened):
+            return "absolute path / home expansion is not allowed; use workspace-relative paths"
     # Windows drive-letter (C:\, C:/), UNC (\\host) or drive-relative (\dir) paths.
     if re.search(r"(^|[\s;|&`$()'\"=><])([a-z]:[\\/]|\\\\[\w.]|\\[\w.][\w.]*[\\/])", screened, re.IGNORECASE):
         return "absolute Windows path is not allowed; use workspace-relative paths"
@@ -444,7 +538,7 @@ class _LoopState:
 
     @property
     def total(self) -> int:
-        return self.prompt_tokens + self.completion_tokens + self.reasoning_tokens
+        return self.prompt_tokens + self.completion_tokens
 
 
 class SuiteAdapter(ABC):
@@ -580,24 +674,27 @@ class SuiteAdapter(ABC):
             + DELIVERABLE_NOTICE
             + TASK_FINISH_NOTICE
         )
-        messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
-        collector.record_user_turn(prompt)
-
         state = _LoopState()
         wall_start = time.monotonic()
         turn = 0
+        is_resumed = False
         if resume:
             saved = snapshot.load()
             if saved and isinstance(saved.get("request"), dict):
                 request = saved["request"]
                 if isinstance(request.get("messages"), list) and request["messages"]:
                     messages = request["messages"]
+                    is_resumed = True
                 try:
                     turn = int(saved.get("turn_index", 0))
                 except (TypeError, ValueError):
                     turn = 0
                 collector.load_existing_messages(messages)
                 reporter.update(task_id, "retry", f"resuming at turn {turn} with full context ({len(messages)} msgs)")
+
+        if not is_resumed:
+            messages = [{"role": "user", "content": prompt}]
+            collector.record_user_turn(prompt)
 
         from benchmark_v3.bench_harness.core.run_manifest import (
             TaskAbandoned,
@@ -925,12 +1022,32 @@ class SuiteAdapter(ABC):
             network_retry_count=int(getattr(driver, "retry_count", 0) or 0),
         )
         final_reward = self.compute_final_reward(milestones, extras)
+
+        # An aborted session must NOT be filed as a legitimate 0-score result:
+        # that would let an upstream outage masquerade as "the model failed the
+        # task" and silently corrupt the leaderboard.
+        #
+        # Two abort shapes are covered (both need evidence of a transport
+        # failure, so a model that simply stops early is still scored honestly):
+        #   * died before completing any turn (0 turns, 0 tokens), and
+        #   * hung mid-task: turns completed but no `finish`, a recorded driver
+        #     error, and output far too small to have been a real attempt.
+        minimal_output = token_metrics.completion_tokens < 5_000
+        aborted = (
+            not state.finish_summary
+            and bool(state.errors)
+            and (
+                (state.turns_used == 0 and token_metrics.total_tokens == 0)
+                or (state.turns_used > 0 and minimal_output)
+            )
+        )
+
         report = EvaluationReport(
             task_id=task_id,
             model_id=model_id,
             timestamp=utc_now_iso(),
-            passed=bool(milestones) and all(m.passed for m in milestones),
-            final_reward=final_reward,
+            passed=False if aborted else (bool(milestones) and all(m.passed for m in milestones)),
+            final_reward=0.0 if aborted else final_reward,
             milestones=milestones,
             token_metrics=token_metrics,
             telemetry=telemetry,
@@ -940,6 +1057,30 @@ class SuiteAdapter(ABC):
             condition=self.condition,
         )
         manager = ReportManager(paths.root)
+        if aborted:
+            # Write a sidecar only — never a scored evaluation.json. Each
+            # abort bumps an attempt counter so a permanently-down upstream
+            # is eventually parked instead of retried forever.
+            try:
+                from benchmark_v3.bench_harness.core.snapshot import atomic_write_json as _awj
+                from benchmark_v3.bench_harness.core.run_manifest import (
+                    aborted_attempts as _attempts,
+                )
+                # ``paths.root`` is this task's own dir (<run>/<suite>/<task>),
+                # so climb two levels for the (run_dir, suite, task) triple.
+                run_root = paths.root.parent.parent
+                _awj(paths.root / "ABORTED.json", {
+                    "task_id": task_id,
+                    "model_id": model_id,
+                    "attempts": _attempts(run_root, paths.root.parent.name, task_id) + 1,
+                    "reason": state.errors[-1] if state.errors else "unknown",
+                    "timestamp": utc_now_iso(),
+                    "note": "session aborted before any completed turn; not a scored result",
+                })
+            except Exception:
+                pass
+            reporter.complete_task(task_id, False, "ABORTED (no scored result)")
+            return report
         manager.save_evaluation(report)
         manager.save_summary(ReportManager.build_summary([report]))
         if report.passed:
