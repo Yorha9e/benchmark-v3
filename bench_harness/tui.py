@@ -660,102 +660,106 @@ def continue_paused_run_picker() -> dict[str, Any] | None:
 
 
 def profile_picker() -> dict[str, Any] | None:
-    """首页：选择现有配置或创建新配置"""
+    """首页：循环选择现有配置或创建新配置（迭代避免尾递归）"""
     nav_reset("主菜单")
-    nav_show()
-    profiles = load_profiles()
-    choices: list[Choice | questionary.Separator] = []
+    while True:
+        nav_show()
+        profiles = load_profiles()
+        choices: list[Choice | questionary.Separator] = []
 
-    if profiles:
-        choices.append(questionary.Separator("── 已保存的模型预设 ──"))
-        for name, cfg in profiles.items():
-            driver = cfg.get("driver", "openai")
-            model = cfg.get("model", "unknown")
-            effort_tag = f" | effort={cfg['effort']}" if cfg.get("effort") else ""
-            choices.append(Choice(f"[Preset] {name}  [{driver} -> {model}{effort_tag}]", value=("load", name)))
-        choices.append(questionary.Separator("── 任务与操作 ──"))
+        if profiles:
+            choices.append(questionary.Separator("── 已保存的模型预设 ──"))
+            for name, cfg in profiles.items():
+                driver = cfg.get("driver", "openai")
+                model = cfg.get("model", "unknown")
+                effort_tag = f" | effort={cfg['effort']}" if cfg.get("effort") else ""
+                choices.append(Choice(f"[Preset] {name}  [{driver} -> {model}{effort_tag}]", value=("load", name)))
+            choices.append(questionary.Separator("── 任务与操作 ──"))
 
-    choices.append(Choice("[+] 新建运行配置 (Create New Configuration)", value=("new", None)))
-    if profiles:
-        choices.append(Choice("[E] 编辑已有预设 (Edit Existing Profile)", value=("edit", None)))
+        choices.append(Choice("[+] 新建运行配置 (Create New Configuration)", value=("new", None)))
+        if profiles:
+            choices.append(Choice("[E] 编辑已有预设 (Edit Existing Profile)", value=("edit", None)))
 
-    from benchmark_v3.bench_harness.core.run_manifest import list_incomplete_runs
+        from benchmark_v3.bench_harness.core.run_manifest import list_incomplete_runs
 
-    incomplete_n = len(list_incomplete_runs())
-    cont_tag = f" [{incomplete_n} 个未完成]" if incomplete_n else ""
-    choices.append(Choice(f"[C] 继续未完成的测评 (Continue Paused Run){cont_tag}", value=("continue", None)))
+        incomplete_n = len(list_incomplete_runs())
+        cont_tag = f" [{incomplete_n} 个未完成]" if incomplete_n else ""
+        choices.append(Choice(f"[C] 继续未完成的测评 (Continue Paused Run){cont_tag}", value=("continue", None)))
 
-    global_judge = load_judge_config()
-    j_tag = f" [当前: {global_judge['model']} ({global_judge.get('driver')})]" if global_judge.get("model") else " [未配置/默认启发式]"
-    choices.append(Choice(f"[J] 配置全局专家裁判模型 (Default Judge){j_tag}", value=("judge", None)))
+        global_judge = load_judge_config()
+        j_tag = f" [当前: {global_judge['model']} ({global_judge.get('driver')})]" if global_judge.get("model") else " [未配置/默认启发式]"
+        choices.append(Choice(f"[J] 配置全局专家裁判模型 (Default Judge){j_tag}", value=("judge", None)))
 
-    choices.append(Choice("[V] 查看最近一次评测汇总报告 (View Latest Report)", value=("view", None)))
-    choices.append(Choice("[L] 查看全局权威总榜 (View Master Leaderboard)", value=("leaderboard", None)))
-    if profiles:
-        choices.append(Choice("[-] 管理/删除已有预设 (Manage Profiles)", value=("manage", None)))
-    choices.append(Choice("[Q] 退出评测应用 (Exit Application)", value=("exit", None)))
+        choices.append(Choice("[V] 查看最近一次评测汇总报告 (View Latest Report)", value=("view", None)))
+        choices.append(Choice("[L] 查看全局权威总榜 (View Master Leaderboard)", value=("leaderboard", None)))
+        if profiles:
+            choices.append(Choice("[-] 管理/删除已有预设 (Manage Profiles)", value=("manage", None)))
+        choices.append(Choice("[Q] 退出评测应用 (Exit Application)", value=("exit", None)))
 
-    action, target = questionary.select(
-        "请选择操作:",
-        choices=choices,
-        style=CUSTOM_STYLE,
-    ).ask()
-
-    if action == "exit" or action is None:
-        return None
-
-    if action == "judge":
-        configure_judge_wizard()
-        return profile_picker()
-
-    if action == "continue":
-        continued = continue_paused_run_picker()
-        if continued is None:
-            return profile_picker()
-        return continued
-
-    if action == "view":
-        view_latest_report()
-        return profile_picker()
-
-    if action == "leaderboard":
-        view_leaderboard()
-        return profile_picker()
-
-    if action == "load":
-        return profiles.get(target)
-
-    if action == "edit":
-        edit_target = questionary.select(
-            "选择要编辑修改的预设配置:",
-            choices=[Choice(f"编辑: {k}", value=k) for k in profiles.keys()] + [Choice("返回上级", value=None)],
+        picked_action = questionary.select(
+            "请选择操作:",
+            choices=choices,
             style=CUSTOM_STYLE,
         ).ask()
-        if edit_target and edit_target in profiles:
-            updated = edit_config_table(edit_target, profiles[edit_target])
-            if updated is None:
-                return profile_picker()
-            profiles[edit_target] = updated
-            save_profiles(profiles)
-            console.print(f"[green]✔ 已更新保存预设配置: {edit_target}[/green]")
-            return updated
-        return profile_picker()
 
-    if action == "manage":
-        del_target = questionary.select(
-            "选择要删除的预设配置:",
-            choices=[Choice(f"删除: {k}", value=k) for k in profiles.keys()] + [Choice("返回上级", value=None)],
-            style=CUSTOM_STYLE,
-        ).ask()
-        if del_target and del_target in profiles:
-            del profiles[del_target]
-            save_profiles(profiles)
-            console.print(f"[green]✔ 已删除预设: {del_target}[/green]")
-        return profile_picker()
+        if picked_action is None or picked_action[0] == "exit":
+            return None
 
-    # action == "new"
-    created = configure_wizard()
-    return created if created else profile_picker()
+        action, target = picked_action
+
+        if action == "judge":
+            configure_judge_wizard()
+            continue
+
+        if action == "continue":
+            continued = continue_paused_run_picker()
+            if continued is None:
+                continue
+            return continued
+
+        if action == "view":
+            view_latest_report()
+            continue
+
+        if action == "leaderboard":
+            view_leaderboard()
+            continue
+
+        if action == "load":
+            return profiles.get(target)
+
+        if action == "edit":
+            edit_target = questionary.select(
+                "选择要编辑修改的预设配置:",
+                choices=[Choice(f"编辑: {k}", value=k) for k in profiles.keys()] + [Choice("返回上级", value=None)],
+                style=CUSTOM_STYLE,
+            ).ask()
+            if edit_target and edit_target in profiles:
+                updated = edit_config_table(edit_target, profiles[edit_target])
+                if updated is not None:
+                    profiles[edit_target] = updated
+                    save_profiles(profiles)
+                    console.print(f"[green]✔ 已更新保存预设配置: {edit_target}[/green]")
+                    return updated
+            continue
+
+        if action == "manage":
+            del_target = questionary.select(
+                "选择要删除的预设配置:",
+                choices=[Choice(f"删除: {k}", value=k) for k in profiles.keys()] + [Choice("返回上级", value=None)],
+                style=CUSTOM_STYLE,
+            ).ask()
+            if del_target and del_target in profiles:
+                del profiles[del_target]
+                save_profiles(profiles)
+                console.print(f"[green]✔ 已删除预设: {del_target}[/green]")
+            continue
+
+        # action == "new"
+        created = configure_wizard()
+        if created:
+            return created
+        continue
 
 
 #: 新建向导中"放弃本次配置"哨兵值（select/checkbox 无取消键，用显式选项实现返回）。
@@ -773,6 +777,7 @@ _CONFIG_FIELDS: tuple[tuple[str, str, str, str], ...] = (
     ("proxy", "网络代理", "text", "留空不走代理，如 http://127.0.0.1:10808"),
     ("effort", "思考强度", "effort", "none/minimal/low/medium/high/xhigh/max，留空=厂商默认"),
     ("suites", "评测套件", "suites", "空格多选：" + "/".join(SELECTABLE_KEYS)),
+    ("tasks", "限定任务", "task_subset", "留空=所选套件全跑；选中后只跑这些题（部分运行）"),
     ("resume", "断点续跑", "bool", "崩溃时从单轮快照原地恢复"),
     ("export_sft", "SFT 导出", "path_opt", "选中后可开关 + 修改导出路径"),
     ("export_dpo", "DPO 导出", "path_opt", "选中后可开关 + 修改导出路径"),
@@ -834,6 +839,9 @@ def _field_display(config: dict[str, Any], key: str, kind: str) -> str:
     if kind == "suites":
         suites = [str(s) for s in (val or [])]
         return ", ".join(f"[green]{_SUITE_LABELS.get(s, s)}[/green]" for s in suites)
+    if kind == "task_subset":
+        tasks = [str(t) for t in (val or [])]
+        return ("[yellow]" + ", ".join(tasks) + "[/yellow] [dim](部分运行)[/dim]") if tasks else "[dim](全部任务)[/dim]"
     if kind == "bool":
         return "[green]✔ 开启[/green]" if val else "[dim]✖ 关闭[/dim]"
     if kind == "path_opt":
@@ -854,6 +862,9 @@ def _field_plain(config: dict[str, Any], key: str, kind: str) -> str:
             return str(val)
         g_tag = global_judge_summary()
         return f"(沿用全局专家裁判: {g_tag})" if g_tag else "(未配置/启发式)"
+    if kind == "task_subset":
+        tasks = [str(t) for t in (val or [])]
+        return ",".join(tasks) if tasks else "(全部任务)"
     if val is None or val == "" or val == []:
         if key.startswith("judge_"):
             g_tag = global_judge_summary()
@@ -959,6 +970,27 @@ def _edit_field_value(config: dict[str, Any], key: str, kind: str, label: str,
         if not picked:
             picked = [DEFAULT_ALL_KEYS[0]]
         config[key] = picked
+        return True
+    if kind == "task_subset":
+        from benchmark_v3.bench_harness.core.run_manifest import known_task_ids
+
+        _avail = known_task_ids()
+        _suites = [s for s in (config.get("suites") or list(DEFAULT_ALL_KEYS)) if s in _avail]
+        _choices = [
+            Choice(f"{s} / {t}", value=t, checked=t in (current or []))
+            for s in _suites for t in _avail[s]
+        ]
+        if not _choices:
+            console.print("[yellow]当前未选中任何可用套件，无法选择任务。[/yellow]")
+            return False
+        picked = questionary.checkbox(
+            "限定任务 (空格多选；全部不选=该套件全跑):",
+            choices=_choices,
+            style=CUSTOM_STYLE,
+        ).ask()
+        if picked is None:
+            return False
+        config[key] = sorted(set(picked))
         return True
     if kind == "bool":
         new = questionary.confirm(f"是否开启 [{label}]?", default=bool(current), style=CUSTOM_STYLE).ask()
@@ -1158,7 +1190,7 @@ def configure_wizard(
         choices=[
             Choice("默认 / 厂商默认 (omit, vendor default)", value=None),
             Choice("关闭 (none)", value="none"),
-            Choice("最小 (minimal)", value="minimal"),
+            Choice("最小 (minimal · 部分网关不支持，将自动降至 low)", value="minimal"),
             Choice("低 (low)", value="low"),
             Choice("中 (medium)", value="medium"),
             Choice("高 (high)", value="high"),
@@ -1189,6 +1221,35 @@ def configure_wizard(
     if not selected_suites:
         selected_suites = [DEFAULT_ALL_KEYS[0]]
 
+    # 第 3.5 步：可选的任务级细化（只跑套件内的部分题目）
+    selected_tasks: list[str] = []
+    scoped_suites = [s for s in selected_suites if s in ("short", "short_b", "long", "long_b", "reviewer", "critic")]
+    if scoped_suites:
+        narrowed = questionary.confirm(
+            "是否只跑选定套件内的部分题目 (任务级细化)?",
+            default=False,
+            style=CUSTOM_STYLE,
+        ).ask()
+        if narrowed:
+            from benchmark_v3.bench_harness.core.run_manifest import known_task_ids
+
+            _available = known_task_ids()
+            task_choices = []
+            for s in scoped_suites:
+                for t in _available.get(s, []):
+                    task_choices.append(Choice(f"{s} / {t}", value=t))
+            picked_tasks = questionary.checkbox(
+                "选择要运行的任务 (空格多选；留空=该套件全跑):",
+                choices=task_choices,
+                style=CUSTOM_STYLE,
+            ).ask() or []
+            selected_tasks = sorted(set(picked_tasks))
+            if selected_tasks:
+                console.print(
+                    "[yellow]✔ 已限定任务: %s（仅这些题会被执行，其余保留旧分）[/yellow]"
+                    % ", ".join(selected_tasks)
+                )
+
     console.print("\n[bold cyan]>>> 第 4 步：运行容灾与微调数据集导出[/bold cyan]")
 
     enable_resume = questionary.confirm(
@@ -1196,6 +1257,19 @@ def configure_wizard(
         default=init.get("resume", True),
         style=CUSTOM_STYLE,
     ).ask()
+
+    on_upstream_error = questionary.select(
+        "上游故障（5xx / 密钥冷却 / 超时）导致任务中断时如何处理?",
+        choices=[
+            Choice("暂停整个队列（推荐：中断的任务不计分，可用 --continue-run 续跑）", value="pause"),
+            Choice("跳过继续跑后续任务（每道中断题记入 ABORTED，不会记 0 分）", value="continue"),
+        ],
+        default=init.get("on_upstream_error", "pause"),
+        style=CUSTOM_STYLE,
+    ).ask()
+    if on_upstream_error is None:
+        return None
+    on_upstream_error = on_upstream_error or "pause"
 
     export_sft = questionary.confirm(
         "是否自动导出 SFT 黄金微调数据集 (Pass@1 满分样本)?",
@@ -1332,6 +1406,8 @@ def configure_wizard(
         "proxy": proxy,
         "effort": effort,
         "suites": selected_suites,
+        "tasks": selected_tasks,
+        "on_upstream_error": on_upstream_error,
         "resume": enable_resume,
         "export_sft": sft_path,
         "export_dpo": dpo_path,
@@ -1384,7 +1460,20 @@ def display_launch_card(config: dict[str, Any]) -> bool:
 
     suites_display = ", ".join([f"[bold green]{s}[/bold green]" for s in config.get("suites", [])])
     table.add_row("运行维度 (Suites)", suites_display)
+    _tasks_sel = [t for t in (config.get("tasks") or []) if t]
+    table.add_row(
+        "运行任务 (Tasks)",
+        ("[bold yellow]仅 " + ", ".join(_tasks_sel) + "[/bold yellow] [dim](部分运行)[/dim]")
+        if _tasks_sel else "[dim]该套件全部任务[/dim]",
+    )
     table.add_row("断点自愈 (Resume)", "✔ 已开启 (启用 Prompt 快照重放)" if config.get("resume") or config.get("continue_run") else "✖ 未开启")
+    _oue = config.get("on_upstream_error") or "pause"
+    table.add_row(
+        "上游故障策略",
+        "[green]✔ 暂停队列[/green] [dim](中断题不计分，可续跑)[/dim]"
+        if _oue == "pause" else
+        "[yellow]⚠ 跳过继续[/yellow] [dim](中断题记入 ABORTED，不记 0 分)[/dim]",
+    )
     if config.get("continue_run") and config.get("output"):
         table.add_row("继续未完成", f"[bold yellow]{config['output']}[/bold yellow]")
     elif config.get("output"):
@@ -1458,6 +1547,11 @@ def launch_harness(config: dict[str, Any]) -> int:
     cli_argv: list[str] = []
     for s in suites:
         cli_argv.extend(["--suite", s])
+    _task_sel = [t for t in (config.get("tasks") or []) if t]
+    if _task_sel:
+        cli_argv.extend(["--tasks", ",".join(_task_sel)])
+    # 上游故障策略：默认暂停，避免网络问题烧穿整个队列
+    cli_argv.extend(["--on-upstream-error", config.get("on_upstream_error") or "pause"])
     cli_argv.extend([
         "--model", config["model"],
         "--driver", driver,

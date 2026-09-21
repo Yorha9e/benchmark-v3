@@ -16,6 +16,11 @@
 - [x] **B5** SPEC / 模块 docstring 的断言计数与实现不一致
 - [x] **B6** `get_suite()` 不转发 `judge_driver`，程序化拉起 Critic 无法挂裁判
 - [x] **B7** Response driver 缺少 OpenAI driver 已有的代理 / 默认头
+- [ ] **B8** 进程自杀与宿主解释器内直接 `exec_module` 逃逸（主进程暴毙元凶）
+- [ ] **B9** 缺少作业对象（Job Object）导致模型后台测试节点残留堆积
+- [ ] **B10** `MasterLeaderboard.save_data` 未持锁导致全量覆盖与丢失更新
+- [ ] **B11** Windows 下 `_read_stores` 并发瞬时句柄锁导致收敛误判（WinError 32）
+- [ ] **B12** Critic 诱饵扣分实现与金标准脱节（纯 info 关键词误扣 10 分）
 
 ---
 
@@ -74,6 +79,38 @@
 
 - **对照**：`openai_driver.py` 有 httpx 代理与 `DEFAULT_HEADERS`；`response_driver.py` 没有。
 - **影响**：同一套本地网关 / 代理配置下，切 Responses 协议可能连不上或丢自定义头。
+
+### B8 — 进程自杀与宿主内 `exec_module` 逃逸
+
+- **文件**：`bench_harness/suites/base.py`、`bench_harness/suites/reviewer.py`、`bench_harness/suites/long_task.py`
+- **现象**：
+  1. 模型在 bash 中调用 `taskkill /F /IM python.exe` 导致评测主进程被连带秒杀；
+  2. `reviewer.py:380` (`_load_module`) 与 `long_task.py:1705` 在宿主解释器直接 `import` 模型 deliverable，若代码含 `sys.exit()`，作为 `BaseException` 会逃逸 `except Exception` 导致评测器瞬间安静退出。
+- **修复**：`base.py` 加 `_bulk_kill_reason` 拦截网；探针捕获 `BaseException`，长期改写为类似 `short_task.py` 的独立子进程隔离执行。
+
+### B9 — 缺少作业对象（Job Object）导致孤儿节点堆积
+
+- **文件**：`bench_harness/core/runner.py`、`bench_harness/core/workspace.py`
+- **现象**：长任务模型后台启动的测试子进程脱离后不会被自动回收，在 Windows 下长期占用端口和文件句柄，反向逼迫模型执行全量进程扑杀。
+- **修复**：引入 Windows Job Object（`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`），任务结束由操作系统内核原子擦除所有衍生孤儿进程。
+
+### B10 — `save_data` 未持锁导致丢失更新
+
+- **文件**：`bench_harness/core/report.py:186`、`rescore_*.py`
+- **现象**：`MasterLeaderboard.save_data` 未加排他文件锁，且全量覆盖写；若离线复算与实时跑测并发执行，内存旧快照会直接冲掉实时跑出的新成绩。
+- **修复**：加排他文件锁；落盘前重新 `load_data()` 执行原子增量合并（merge）。
+
+### B11 — Windows 下 `_read_stores` 并发瞬时句柄锁导致误判
+
+- **文件**：`bench_harness/suites/long_task.py:591` (`_read_stores`)
+- **现象**：节点高频 `os.replace` 写 `state.json` 时，评测器并发读取在 Windows 下抛 `WinError 32`，直接异常降级为 `{}`，在 `_wait_converged` 最后轮询时被误判为状态分裂（扣 0.5 分）。
+- **修复**：在读取时加入 3 次 30ms 的短暂休眠重试，平滑文件锁竞争。
+
+### B12 — Critic 诱饵扣分实现与金标准脱节
+
+- **文件**：`bench_harness/suites/critic.py:338` (`_is_defect_claim`)
+- **现象**：金标准规定仅当 severity >= Low 时扣分，代码却无视 severity 直接匹配 `collision` 等词根，导致对诱饵文件的好心设计说明（info/note）被误扣 10 分。
+- **修复**：限定词根匹配仅在 `severity in ("low", "medium", "high", "critical")` 时生效。
 
 ---
 
