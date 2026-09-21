@@ -86,25 +86,77 @@ def build_planned_queue(
     suite_names: list[str],
     *,
     task_filter: str | None = None,
+    task_filters: list[str] | None = None,
 ) -> list[dict[str, str]]:
-    """Expand suite keys into ordered ``{suite, task_id}`` entries."""
+    """Expand suite keys into ordered ``{suite, task_id}`` entries.
+
+    ``task_filter`` (single) and ``task_filters`` (many) restrict the queue to
+    those task ids. Task ids are matched **within the given suites only** —
+    an id that belongs to none of them yields an empty queue, and the caller
+    is expected to report that as an error rather than silently running
+    nothing or falling back to a wider sweep.
+    """
     from benchmark_v3.bench_harness.suites import get_suite
+
+    wanted: set[str] = set()
+    if task_filter:
+        wanted.add(str(task_filter))
+    for item in task_filters or ():
+        if str(item).strip():
+            wanted.add(str(item).strip())
 
     planned: list[dict[str, str]] = []
     for suite_name in suite_names:
         suite = get_suite(suite_name)
         for task_id in suite.task_ids():
-            if task_filter and task_id != task_filter:
+            if wanted and task_id not in wanted:
                 continue
             planned.append({"suite": suite_name, "task_id": task_id})
     return planned
+
+
+def known_task_ids() -> dict[str, list[str]]:
+    """All selectable ``{suite_key: [task_id, ...]}`` pairs (for help/diagnostics)."""
+    from benchmark_v3.bench_harness.suites import get_suite
+    from benchmark_v3.bench_harness.suites.catalog import SELECTABLE_KEYS
+
+    return {key: list(get_suite(key).task_ids()) for key in SELECTABLE_KEYS}
 
 
 def task_eval_path(output_dir: Path, suite: str, task_id: str) -> Path:
     return Path(output_dir) / suite / task_id / "evaluation.json"
 
 
+#: A task aborted before any completed turn (upstream outage) is retried, but
+#: only this many times — beyond that the task is parked as ``exhausted`` so a
+#: permanently-down upstream cannot make the sweep re-run it forever.
+MAX_ABORTED_ATTEMPTS = 3
+
+
+def aborted_attempts(output_dir: Path, suite: str, task_id: str) -> int:
+    """How many times this task has aborted before completing a turn."""
+    sidecar = Path(output_dir) / suite / task_id / "ABORTED.json"
+    if not sidecar.is_file():
+        return 0
+    try:
+        data = json.loads(sidecar.read_text(encoding="utf-8"))
+        return int(data.get("attempts", 1) or 1)
+    except (OSError, ValueError, TypeError):
+        return 1
+
+
 def task_is_complete(output_dir: Path, suite: str, task_id: str) -> bool:
+    """True when a task produced a SCORED result, or is parked as exhausted.
+
+    An ``ABORTED.json`` sidecar (upstream outage before any completed turn)
+    means the run carries no evidence about the model, so the task is retried
+    — but a permanently unreachable upstream must not cause an endless retry
+    loop, so once ``MAX_ABORTED_ATTEMPTS`` is reached the task is treated as
+    settled (parked) and skipped.
+    """
+    root = Path(output_dir) / suite / task_id
+    if (root / "ABORTED.json").is_file():
+        return aborted_attempts(output_dir, suite, task_id) >= MAX_ABORTED_ATTEMPTS
     return task_eval_path(output_dir, suite, task_id).is_file()
 
 
@@ -140,7 +192,19 @@ def new_manifest(
         suite = item["suite"]
         task_id = item["task_id"]
         if task_is_complete(output_dir, suite, task_id):
-            completed.append({"suite": suite, "task_id": task_id, "skipped": True})
+            # 尝试从磁盘读取实际得分与通过状态
+            ev_file = task_eval_path(output_dir, suite, task_id)
+            comp_entry: dict[str, Any] = {"suite": suite, "task_id": task_id, "skipped": True}
+            if ev_file.is_file():
+                try:
+                    ev_data = json.loads(ev_file.read_text(encoding="utf-8"))
+                    if "passed" in ev_data:
+                        comp_entry["passed"] = bool(ev_data["passed"])
+                    if "final_reward" in ev_data:
+                        comp_entry["reward"] = float(ev_data["final_reward"])
+                except Exception:
+                    pass
+            completed.append(comp_entry)
         else:
             remaining.append({"suite": suite, "task_id": task_id})
     manifest: dict[str, Any] = {
@@ -371,6 +435,21 @@ def self_test() -> tuple[int, int]:
         check("launch_config_model", cfg.get("model") == "m")
         check("launch_config_output", cfg.get("output") == str(root))
         check("continue_flag", cfg.get("continue_run") is True)
+
+        # task-level selection: explicit, scoped, and never silently empty
+        sel = build_planned_queue(["long"], task_filter="saga_coordinator")
+        check("select_single_task", sel == [{"suite": "long", "task_id": "saga_coordinator"}])
+        sel = build_planned_queue(["short_b"], task_filters=["varint_parser", "timing_wheel"])
+        check("select_multi_task", sorted(p["task_id"] for p in sel) == ["timing_wheel", "varint_parser"])
+        check("select_wrong_suite_empty", build_planned_queue(["short"], task_filter="saga_coordinator") == [])
+        check("select_keeps_b_suite", build_planned_queue(["long_b"], task_filter="raft_cluster")
+              == [{"suite": "long_b", "task_id": "raft_cluster"}])
+        check("select_no_filter_full", len(build_planned_queue(["critic"])) == 1)
+        _known = known_task_ids()
+        check("known_tasks_all_suites",
+              {"short", "short_b", "long", "long_b", "reviewer", "critic"} <= set(_known))
+        check("known_tasks_ids", "saga_coordinator" in _known.get("long", []) and
+              "audit_bundle" in _known.get("critic", []))
 
         # abandon scrub
         tdir = root / "short" / "timing_wheel"

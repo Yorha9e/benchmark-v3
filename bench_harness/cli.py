@@ -65,7 +65,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--effort", default=None,
                         choices=["none", "minimal", "low", "medium", "high", "xhigh", "max"],
                         help="Reasoning effort (protocol-native: none/minimal/low/medium/high/xhigh/max).")
-    parser.add_argument("--task", default=None, help="Run a single task id only.")
+    parser.add_argument("--task", default=None,
+                        help="Run a single task id only. Must belong to one of the "
+                             "selected --suite keys (an unknown pairing is an error, "
+                             "not a silent no-op).")
+    parser.add_argument("--tasks", default=None, metavar="ID[,ID...]",
+                        help="Run several task ids in one go (comma-separated). "
+                             "Each must belong to a selected --suite.")
+    parser.add_argument("--on-upstream-error", default="pause",
+                        choices=["pause", "continue"],
+                        help="What to do when the model upstream fails (5xx / key "
+                             "cooldown / timeout) and a task aborts before any turn: "
+                             "'pause' (default) stops the sweep and keeps the run "
+                             "resumable, 'continue' grinds through the remaining "
+                             "tasks (each such task is recorded as ABORTED, not 0).")
     parser.add_argument("--resume", action="store_true",
                         help="Replay stalled snapshot turns instead of restarting.")
     parser.add_argument("--output", default=None,
@@ -164,6 +177,19 @@ def main(argv: list[str] | None = None) -> int:
     from benchmark_v3.bench_harness.suites import get_suite, resolve_suite_keys
 
     args = build_arg_parser().parse_args(argv)
+
+    if getattr(args, "list_tasks", False):
+        from benchmark_v3.bench_harness.core.run_manifest import known_task_ids
+        from benchmark_v3.bench_harness.suites.catalog import SUITE_LABELS
+
+        print("selectable suite -> task ids:")
+        for key, task_ids in known_task_ids().items():
+            print("  %-10s %-38s %s" % (key, "(" + SUITE_LABELS.get(key, "") + ")", ", ".join(task_ids)))
+        print("\nexamples:")
+        print("  --suite long --task saga_coordinator")
+        print("  --suite short_b --tasks varint_parser,timing_wheel")
+        return 0
+
     if not args.model:
         print("error: the following arguments are required: --model (or run with -i for interactive mode)",
               file=sys.stderr)
@@ -175,7 +201,9 @@ def main(argv: list[str] | None = None) -> int:
     from benchmark_v3.bench_harness.core.run_manifest import (
         TaskAbandoned,
         abandon_incomplete_task,
+        build_planned_queue,
         clear_pause_request,
+        known_task_ids,
         load_manifest,
         mark_task_completed,
         new_manifest,
@@ -183,7 +211,6 @@ def main(argv: list[str] | None = None) -> int:
         save_manifest,
         set_manifest_status,
         task_is_complete,
-        build_planned_queue,
     )
 
     # L1 pause: Ctrl+C aborts the *current* task immediately and freezes the run.
@@ -218,10 +245,39 @@ def main(argv: list[str] | None = None) -> int:
 
     reporter = ProgressReporter(output / "live_status.json", enabled=not args.quiet)
     suite_names = resolve_suite_keys(args.suite or ["all"])
-    planned = build_planned_queue(suite_names, task_filter=args.task)
-    if args.task and not planned:
-        print("error: unknown task %r for selected suite(s)" % args.task, file=sys.stderr)
+    extra_tasks = [t.strip() for t in (args.tasks or "").split(",") if t.strip()]
+    planned = build_planned_queue(
+        suite_names, task_filter=args.task, task_filters=extra_tasks,
+    )
+    requested = ([args.task] if args.task else []) + extra_tasks
+    if requested and not planned:
+        # Explicit failure: never silently run nothing (or a wider sweep).
+        available = known_task_ids()
+        hint = ", ".join(
+            "%s: %s" % (k, "/".join(v)) for k, v in available.items()
+            if k in suite_names
+        ) or "(no suites selected)"
+        print(
+            "error: task(s) %s do not belong to the selected suite(s) %s\n"
+            "       available for this selection -> %s"
+            % (", ".join(repr(t) for t in requested), suite_names, hint),
+            file=sys.stderr,
+        )
         return 2
+    # A subset selection is legitimate but must never be mistaken for a full run.
+    if requested and len(planned) < len(build_planned_queue(suite_names)):
+        planned_ids = {p["task_id"] for p in planned}
+        missing = sorted({
+            t for s in suite_names
+            for t in known_task_ids().get(s, [])
+            if t not in planned_ids
+        })
+        print(
+            "note: partial run — executing %d/%d task(s) of %s; not selected: %s"
+            % (len(planned), len(build_planned_queue(suite_names)),
+               "/".join(suite_names), ", ".join(missing) or "-"),
+            file=sys.stderr if not args.quiet else sys.stderr,
+        )
     total_tasks = len(planned)
     reporter.start_session("bench-run/%s" % args.model, total_tasks=total_tasks)
 
@@ -278,12 +334,17 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     try:
+        # 当从中断目录恢复时，优先采用原有的 launch 参数，防止回退到 CLI 默认值
+        effective_driver = args.driver if not args.continue_run else (launch_cfg.get("driver") or args.driver)
+        effective_effort = args.effort if not args.continue_run else (launch_cfg.get("effort") or args.effort)
+        effective_api_key = args.api_key if not args.continue_run else (launch_cfg.get("api_key") or args.api_key)
+        effective_base_url = args.base_url if not args.continue_run else (launch_cfg.get("base_url") or args.base_url)
         driver = build_driver(
-            args.driver,
+            effective_driver,
             args.model,
-            effort=args.effort,
-            api_key=args.api_key,
-            base_url=args.base_url,
+            effort=effective_effort,
+            api_key=effective_api_key,
+            base_url=effective_base_url,
         )
     except Exception as exc:
         print("error: cannot build driver: %s" % exc, file=sys.stderr)
@@ -291,9 +352,24 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     reports: list[Any] = []
+
+    # 若继续未完成的评测，将已有完成任务的 evaluation.json 回载至 reports，保证全量统计与数据集导出不丢失
+    if args.continue_run:
+        from benchmark_v3.bench_harness.core.types import EvaluationReport
+        for item in (manifest.get("planned") or []):
+            s_name = str(item.get("suite") or "")
+            t_name = str(item.get("task_id") or "")
+            eval_file = output / s_name / t_name / "evaluation.json"
+            if eval_file.is_file():
+                try:
+                    loaded_rep = EvaluationReport.from_dict(json.loads(eval_file.read_text(encoding="utf-8")))
+                    reports.append(loaded_rep)
+                except Exception:
+                    pass
     started = time.monotonic()
     paused = False
     pause_reason = ""
+    aborted_any = False
 
     judge_driver = None
     judge_model = args.judge_model
@@ -438,6 +514,44 @@ def main(argv: list[str] | None = None) -> int:
             "reward=%s" % (report.final_reward,),
         )
 
+        # A session that died before any completed turn (upstream outage, key
+        # cooldown) produced no evidence about the model — never let it reach
+        # the leaderboard as a 0-score. By default this PAUSES the sweep so a
+        # flaky upstream cannot burn through the whole queue.
+        if (output / suite_name / task_id / "ABORTED.json").is_file():
+            aborted_any = True
+            if args.on_upstream_error == "pause":
+                paused = True
+                pause_reason = "upstream_error"
+                print(
+                    "task %s/%s ABORTED before any turn (upstream unavailable)."
+                    % (suite_name, task_id),
+                    file=sys.stderr,
+                    flush=True,
+                )
+                print(
+                    "pausing the sweep (--on-upstream-error pause). Nothing was "
+                    "scored for this task; resume with the same --output to "
+                    "retry the remaining queue once the upstream recovers.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                manifest["remaining"] = [
+                    {"suite": suite_name, "task_id": task_id},
+                    *[i for i in work_queue[work_queue.index(item) + 1:]],
+                ]
+                save_manifest(output, manifest)
+                break
+            if not args.quiet:
+                print(
+                    "task %s/%s ABORTED before any turn (upstream unavailable) — "
+                    "excluded from leaderboard; continuing with the next task"
+                    % (suite_name, task_id),
+                    file=sys.stderr,
+                    flush=True,
+                )
+            continue
+
         # Incremental leaderboard: completed tasks land even if we pause later.
         try:
             if not _skip_board:
@@ -487,6 +601,15 @@ def main(argv: list[str] | None = None) -> int:
     set_manifest_status(output, manifest, "completed")
     clear_pause_request(output)
 
+    if aborted_any:
+        print(
+            "warning: at least one task ABORTED before any completed turn "
+            "(upstream unavailable) — excluded from the leaderboard; rerun "
+            "those tasks when the upstream recovers.",
+            file=sys.stderr,
+            flush=True,
+        )
+
     if (args.export_sft or args.export_dpo) and reports:
         _export_datasets(output, reports, args.export_sft, args.export_dpo)
 
@@ -495,8 +618,8 @@ def main(argv: list[str] | None = None) -> int:
     _print_table(reports, output=output, model_id=args.model, driver=args.driver, quiet=args.quiet)
     if not _skip_board and reports:
         _print_post_run_board(reports, quiet=args.quiet)
-    # No new reports (pure continue of already-complete run) → success.
-    if not reports and not (manifest.get("remaining") or []):
+    # 如果本次没有新跑任何任务（例如全部任务此前均已执行完成），直接返回成功 (0)
+    if args.continue_run and not (manifest.get("remaining") or []):
         return 0
     return 0 if reports and all(r.passed for r in reports) else (0 if not reports else 1)
 
