@@ -183,9 +183,67 @@ class MasterLeaderboard:
             return {}
 
     @classmethod
-    def save_data(cls, data: dict[str, Any]) -> None:
+    def save_data(cls, data: dict[str, Any], *, already_locked: bool = False) -> None:
+        """Atomically merge ``data`` into the master leaderboard.
+
+        Default path (``already_locked=False``) takes the exclusive file
+        lock, reloads the freshest on-disk state and merges only the slots
+        the caller carries (partial merge), so a stale in-memory snapshot
+        can never clobber a concurrent writer's entries — lost-update safe.
+        Unlocked callers such as ``rescore_fast.py`` / ``rescore_long.py``
+        inherit this safety without any change on their side.
+
+        Callers that already hold the lock (``update_leaderboard``,
+        ``export_markdown`` with ``persist=True``) must pass
+        ``already_locked=True``: ``msvcrt.locking`` is not recursive, so
+        re-acquiring it in-process would deadlock.
+        """
+        if already_locked:
+            cls._merge_write_locked(data)
+            return
         LEADERBOARD_JSON_PATH.parent.mkdir(parents=True, exist_ok=True)
-        atomic_write_json(LEADERBOARD_JSON_PATH, data)
+        with exclusive_file_lock(LEADERBOARD_JSON_PATH):
+            cls._merge_write_locked(data)
+
+    @classmethod
+    def _merge_write_locked(cls, data: dict[str, Any]) -> None:
+        """Partial-merge save; the exclusive lock must already be held.
+
+        1. reload the latest disk state;
+        2. union model entries, and per entry union ``tasks`` slot keys —
+           caller slots win for keys the caller carries, disk-only keys
+           survive untouched;
+        3. recompute aggregates for every touched entry;
+        4. ``atomic_write_json`` the merged dict.
+
+        The caller's dict is never mutated.
+        """
+        disk = cls.load_data()
+        merged: dict[str, Any] = dict(disk)
+        for key, entry in data.items():
+            disk_entry = merged.get(key)
+            if not isinstance(entry, dict):
+                if merged.get(key) != entry:
+                    merged[key] = entry
+                continue
+            if not isinstance(disk_entry, dict):
+                merged[key] = dict(entry)
+                cls._recompute_aggregates(merged[key])
+                continue
+            merged_entry = {**disk_entry, **entry}
+            disk_tasks = disk_entry.get("tasks")
+            patch_tasks = entry.get("tasks")
+            if isinstance(disk_tasks, dict) and isinstance(patch_tasks, dict):
+                tasks: dict[str, Any] = dict(disk_tasks)
+                tasks.update(patch_tasks)
+                merged_entry["tasks"] = tasks
+            elif isinstance(disk_tasks, dict):
+                merged_entry["tasks"] = dict(disk_tasks)
+            elif isinstance(patch_tasks, dict):
+                merged_entry["tasks"] = dict(patch_tasks)
+            cls._recompute_aggregates(merged_entry)
+            merged[key] = merged_entry
+        atomic_write_json(LEADERBOARD_JSON_PATH, merged)
 
     @classmethod
     def _slot_from_report(
@@ -302,7 +360,7 @@ class MasterLeaderboard:
         n_a = len(cls.CANONICAL_TASKS)
         n_b = len(cls.CANONICAL_B_TASKS)
         entry["tasks_covered"] = f"A {len(a_slots)}/{n_a} · B {len(b_slots)}/{n_b}"
-        trace_pool = a_slots or b_slots
+        trace_pool = a_slots + b_slots
         latest = max(trace_pool, key=lambda s: str(s.get("updated_at", "")))
         entry["run_dir"] = str(latest.get("run_dir", ""))
 
@@ -338,6 +396,32 @@ class MasterLeaderboard:
             on_regress = "keep-best"
 
         entry_key = f"{model_id}@{effort or 'default'}"
+        
+        # 1. 在拿文件锁前，先预判是否有退步槽位并进行用户交互（避免持锁阻塞超过 60s 导致并发死锁）
+        pre_data = cls.load_data()
+        pre_entry = pre_data.get(entry_key) or {}
+        pre_tasks = pre_entry.get("tasks") or {}
+        decisions: dict[str, bool] = {}
+        if on_regress == "ask" and callable(ask_fn):
+            for report in reports:
+                task_id = report.task_id
+                condition = getattr(report, "condition", "a") or "a"
+                slot_key = task_id if condition == "a" else f"{task_id}@{condition}"
+                old_slot = pre_tasks.get(slot_key)
+                if old_slot is not None:
+                    new_r = float(report.final_reward)
+                    old_r = float(old_slot.get("reward", 0.0))
+                    if new_r + cls.REWARD_EPS < old_r:
+                        new_slot_preview = cls._slot_from_report(report, driver, output_dir)
+                        try:
+                            decisions[slot_key] = bool(ask_fn(
+                                f"{model_id} · {slot_key}",
+                                old_slot, new_slot_preview,
+                            ))
+                        except Exception:
+                            decisions[slot_key] = False
+
+        # 2. 获取排他锁快速原子落盘
         with exclusive_file_lock(LEADERBOARD_JSON_PATH):
             data = cls.load_data()
             entry = data.get(entry_key)
@@ -365,15 +449,7 @@ class MasterLeaderboard:
                 if new_r + cls.REWARD_EPS >= old_r:
                     entry["tasks"][slot_key] = new_slot
                     continue
-                overwrite = on_regress == "overwrite"
-                if on_regress == "ask" and callable(ask_fn):
-                    try:
-                        overwrite = bool(ask_fn(
-                            f"{model_id} · {slot_key}",
-                            old_slot, new_slot,
-                        ))
-                    except Exception:
-                        overwrite = False
+                overwrite = on_regress == "overwrite" or decisions.get(slot_key, False)
                 if overwrite:
                     entry["tasks"][slot_key] = new_slot
 
@@ -381,7 +457,7 @@ class MasterLeaderboard:
             entry["wall_time_seconds"] = round(wall_time, 1)
             entry["updated_at"] = _utc_now_iso()
             data[entry_key] = entry
-            cls.save_data(data)
+            cls.save_data(data, already_locked=True)
             cls.export_markdown(data, already_locked=True)
         return LEADERBOARD_MD_PATH
 
@@ -654,7 +730,7 @@ class MasterLeaderboard:
             except OSError:
                 pass
             if persist:
-                cls.save_data(payload)
+                cls.save_data(payload, already_locked=True)
             return md_content
 
         if persist and not already_locked:
@@ -864,6 +940,132 @@ def self_test() -> tuple[int, int]:
     check("follow_gain_is_b_minus_a", abs(float(mixed["follow_gain"]) - 0.6) < 1e-9)
     check("coverage_splits_ab", "A 1/" in mixed["tasks_covered"] and "B 1/" in mixed["tasks_covered"])
     check("md_explains_ratio", "有效得分" in md and "76" in md)
+
+    # ---- persistence: locked partial-merge save (uses tmp CWD) ----------
+    import contextlib
+    import json as _json
+    import os as _os
+    import tempfile as _tempfile
+    import threading as _threading
+
+    global LEADERBOARD_JSON_PATH, LEADERBOARD_MD_PATH
+    _Path = Path
+
+    real_cwd = _os.getcwd()
+    real_lb, real_md = LEADERBOARD_JSON_PATH, LEADERBOARD_MD_PATH
+    tmp_root = _Path(real_cwd) / "bench_runs" / "_m2_selftest"
+    tmp_root.mkdir(parents=True, exist_ok=True)
+    tmp = None
+    try:
+        tmp = _tempfile.mkdtemp(prefix="lb-m2-", dir=str(tmp_root))
+        _os.chdir(tmp)
+        LEADERBOARD_JSON_PATH = _Path(tmp) / "bench_runs" / "leaderboard.json"
+        LEADERBOARD_MD_PATH = _Path(tmp) / "LEADERBOARD.md"
+
+        def _slot(task_id: str, reward: float) -> dict[str, Any]:
+            return {
+                "task_id": task_id,
+                "condition": "a",
+                "reward": reward,
+                "passed": reward >= 1.0,
+                "milestones_passed": int(reward * 10),
+                "milestones_total": 10,
+                "total_tokens": 10,
+                "updated_at": "2026-01-01T00:00:00Z",
+            }
+
+        canon = MasterLeaderboard.CANONICAL_TASKS[0]
+
+        # save_data serializes overlapping saves (no lost slot).
+        errors: list[str] = []
+        errors_lock = _threading.Lock()
+
+        def _concurrent_save(key: str) -> None:
+            try:
+                MasterLeaderboard.save_data({key: {"model_id": key, "tasks": {}}})
+            except Exception as exc:
+                with errors_lock:
+                    errors.append(f"{key}: {exc!r}")
+
+        threads = [
+            _threading.Thread(target=_concurrent_save, args=(f"m{i}@default",))
+            for i in range(8)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        disk = MasterLeaderboard.load_data()
+        check(
+            "save_serializes_concurrent_saves",
+            errors == [] and all(f"m{i}@default" in disk for i in range(8)),
+        )
+
+        # Simulated lost-update: A loads, B saves slot X, A saves slot Y
+        # via save_data -> disk keeps BOTH X and Y. Slot keys are canonical
+        # A-task ids so `_recompute_aggregates` re-scores the merged row.
+        canon0, canon1 = MasterLeaderboard.CANONICAL_TASKS[0], MasterLeaderboard.CANONICAL_TASKS[1]
+        base = {"model_id": "dual", "tasks": {}}
+        MasterLeaderboard.save_data({"dual@default": base})
+        a_view = MasterLeaderboard.load_data()  # A's stale snapshot
+        MasterLeaderboard.save_data(
+            {"dual@default": {"model_id": "dual", "tasks": {canon0: _slot(canon0, 0.5)}}}
+        )  # B lands slot X (canon0) on disk
+        MasterLeaderboard.save_data(
+            {"dual@default": {"model_id": "dual", "tasks": {canon1: _slot(canon1, 0.9)}}}
+        )  # A re-saves its stale snapshot with slot Y (canon1)
+        disk = MasterLeaderboard.load_data()
+        dual = disk.get("dual@default", {})
+        check(
+            "save_merge_keeps_both_slots",
+            set(dual.get("tasks", {})) == {canon0, canon1},
+        )
+        check(
+            "save_merge_preserves_disk_entry",
+            dual.get("model_id") == "dual",
+        )
+        # Aggregates recomputed over the union of slots: A 5/10 + 9/10
+        # milestones -> capability_index = 70.0.
+        check(
+            "save_merge_recomputes_aggregates",
+            abs(float(dual.get("capability_index", -1)) - 70.0) < 0.15,
+        )
+        # Caller's dict is not mutated by the merge.
+        check("save_merge_no_caller_mutation", set(base["tasks"]) == set())
+
+        # already_locked=True path writes directly (caller holds lock).
+        with exclusive_file_lock(LEADERBOARD_JSON_PATH):
+            MasterLeaderboard.save_data(
+                {"dual@default": {"model_id": "dual", "tasks": {canon1: _slot(canon1, 1.0)}}},
+                already_locked=True,
+            )
+        disk = MasterLeaderboard.load_data()
+        check(
+            "save_already_locked_merges",
+            float(disk.get("dual@default", {}).get("tasks", {}).get(canon1, {}).get("reward", -1)) == 1.0,
+        )
+
+        # Non-dict payloads (legacy/foreign top-level values) survive.
+        MasterLeaderboard.save_data({"_meta": "v3"})
+        disk = MasterLeaderboard.load_data()
+        check("save_keeps_nondict_value", disk.get("_meta") == "v3")
+
+        # export_markdown persist path still re-locks + merges safely.
+        md_out = MasterLeaderboard.export_markdown()
+        check(
+            "export_markdown_persist_roundtrip",
+            isinstance(md_out, str) and "权威榜单" in md_out,
+        )
+    except BaseException as exc:
+        check(f"persistence_block_raises::{type(exc).__name__}", False)
+    finally:
+        # Restore CWD before removing the tmp tree (Windows rmdir semantics).
+        _os.chdir(real_cwd)
+        LEADERBOARD_JSON_PATH, LEADERBOARD_MD_PATH = real_lb, real_md
+        if tmp is not None:
+            import shutil as _shutil
+            _shutil.rmtree(str(tmp_root), ignore_errors=True)
+
     return counts[0], counts[1]
 
 
