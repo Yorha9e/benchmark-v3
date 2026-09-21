@@ -201,7 +201,14 @@ class FileMessageBroker:
         RNG seed for reproducibility.
     """
 
-    _GLOB = "msg_*.json"
+    #: Accept ANY ``*.json`` mailbox file (excluding the in-flight ``.tmp_*``
+    #: writers). The contract tells implementations to name files
+    #: ``msg-*.json``, but a candidate that names them after its own request
+    #: id is not *wrong* per the protocol — silently dropping its messages
+    #: would score an otherwise-correct coordinator as if it never spoke.
+    #: Strict on the contract, tolerant on delivery.
+    _GLOB = "*.json"
+    _TMP_PREFIX = ".tmp"
 
     def __init__(
         self,
@@ -325,9 +332,10 @@ class FileMessageBroker:
             }
             if delay > 0:
                 self._stats["delayed"] += 1
-            msg_id = self._store(dst, f"msg_{seq:010d}.json", envelope)
+            # 按 TASK 契约标准使用 msg-*.json 作为文件名，严格遵守规范的模型才能正常处理
+            msg_id = self._store(dst, f"msg-{seq:010d}.json", envelope)
             if self._rng.random() < self._duplicate_rate:
-                self._store(dst, f"msg_{seq:010d}__dup.json", envelope)
+                self._store(dst, f"msg-{seq:010d}__dup.json", envelope)
                 self._stats["duplicated"] += 1
             return msg_id
 
@@ -337,7 +345,15 @@ class FileMessageBroker:
         tmp = box / f".tmp_{uuid.uuid4().hex}.json"
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(envelope, fh)
-        os.replace(tmp, box / filename)
+        target = box / filename
+        for attempt in range(10):
+            try:
+                os.replace(tmp, target)
+                break
+            except OSError:
+                if attempt == 9:
+                    raise
+                time.sleep(0.01)
         return Path(filename).stem
 
     def recv(
@@ -356,7 +372,8 @@ class FileMessageBroker:
         due: list[tuple[float, int, str, Any]] = []
         with self._lock:
             box = self._mailbox(node_id)
-            paths = sorted(box.glob(self._GLOB))
+            paths = self._mailbox_files(node_id)
+            candidates: list[tuple[float, int, str, Any, Path]] = []
             for path in paths:
                 try:
                     with open(path, encoding="utf-8") as fh:
@@ -371,39 +388,39 @@ class FileMessageBroker:
                     self._stats["corrupt_skipped"] += 1
                     continue
                 if deliver_at <= now or include_future:
-                    due.append(
-                        (deliver_at, seq, str(envelope["src"]), envelope["payload"])
+                    candidates.append(
+                        (deliver_at, seq, str(envelope["src"]), envelope["payload"], path)
                     )
                 # else: not yet deliverable; leave the file queued.
-            due.sort(key=lambda item: (item[0], item[1]))
-            if self.reorder and len(due) > 1:
-                self._rng.shuffle(due)
+            candidates.sort(key=lambda item: (item[0], item[1]))
+            if self.reorder and len(candidates) > 1:
+                self._rng.shuffle(candidates)
             if max_messages is not None:
-                due = due[: max(0, max_messages)]
-            wanted = {seq for (_, seq, _, _) in due}
-            # Remove delivered files (both originals and duplicates of the
-            # same seq so a duplicate is delivered exactly as queued).
-            delivered = 0
-            for path in paths:
+                candidates = candidates[: max(0, max_messages)]
+            
+            # 删除已投递的文件，直接使用第一遍收集的路径，避免 Windows 下重复打开句柄
+            for _, _, _, _, path in candidates:
                 try:
-                    with open(path, encoding="utf-8") as fh:
-                        seq = int(json.load(fh)["seq"])
-                except (OSError, ValueError, KeyError):
-                    continue
-                if seq in wanted:
-                    try:
-                        path.unlink()
-                        delivered += 1
-                    except OSError:
-                        pass
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            # 组装返回结果
+            due = [(src, payload) for (_, _, src, payload, _) in candidates]
             # Count logical messages delivered (dedup by seq).
             self._stats["delivered"] += len(due)
-        return [(src, payload) for (_, _, src, payload) in due]
+        return due
+
+    def _mailbox_files(self, node_id: str) -> list[Path]:
+        """Queued message files for *node_id*, excluding in-flight temps."""
+        return [
+            p for p in sorted(self._mailbox(node_id).glob(self._GLOB))
+            if not p.name.startswith(self._TMP_PREFIX)
+        ]
 
     def pending_count(self, node_id: str) -> int:
         """Number of queued (possibly future-dated) files for *node_id*."""
         self.matrix._check(node_id)
-        return len(list(self._mailbox(node_id).glob(self._GLOB)))
+        return len(self._mailbox_files(node_id))
 
     def clear(self, node_id: str | None = None) -> int:
         """Drop all queued files (one mailbox, or every mailbox)."""
@@ -414,7 +431,7 @@ class FileMessageBroker:
         with self._lock:
             for target in targets:
                 self.matrix._check(target)
-                for path in self._mailbox(target).glob(self._GLOB):
+                for path in self._mailbox_files(target):
                     try:
                         path.unlink()
                         removed += 1
