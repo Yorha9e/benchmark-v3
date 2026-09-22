@@ -21,6 +21,32 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def _median(values: list[float]) -> float:
+    """Median of a non-empty sorted list (no statistics import churn)."""
+    n = len(values)
+    mid = n // 2
+    if n % 2:
+        return float(values[mid])
+    return (float(values[mid - 1]) + float(values[mid])) / 2.0
+
+
+def _fmt_tokens_short(value: Any) -> str:
+    """Compact token count for dense tables: 1234567 -> '1.2M', 45600 -> '46k'."""
+    if value is None:
+        return "-"
+    try:
+        v = float(value or 0)
+    except (TypeError, ValueError):
+        return "-"
+    if v <= 0:
+        return "-"
+    if v >= 1_000_000:
+        return f"{v / 1_000_000:.1f}M"
+    if v >= 1_000:
+        return f"{v / 1_000:.0f}k"
+    return f"{v:.0f}"
+
+
 class ReportManager:
     """Persist ``evaluation.json`` / ``summary.json`` atomically and rank runs."""
 
@@ -288,6 +314,7 @@ class MasterLeaderboard:
             "milestones_passed": sum(1 for m in milestones if m.passed),
             "milestones_total": len(milestones),
             "total_tokens": int(report.token_metrics.total_tokens),
+            "wall_seconds": float(getattr(report.telemetry, "wall_time_seconds", 0.0) or 0.0),
             "driver": driver,
             "run_dir": str(output_dir) if output_dir else "",
             "updated_at": _utc_now_iso(),
@@ -311,6 +338,8 @@ class MasterLeaderboard:
 
         ``run_dir`` 相同的记录就地替换，因此对同一次运行做离线复算不会重复
         计数。旧槽位没有 ``runs`` 时，用当前展示值合成一条历史再并入。
+        复算类调用方（rescore_*）不产生新 token/耗时，缺省时从旧槽继承，
+        否则均值会被 0 污染（成本指标与 Succ/Mtok 全废）。
         """
         entry = data.get(model_key)
         if not isinstance(entry, dict):
@@ -331,6 +360,7 @@ class MasterLeaderboard:
                 "reward": cur.get("reward"),
                 "milestones_passed": cur.get("milestones_passed"),
                 "total_tokens": cur.get("total_tokens"),
+                "wall_seconds": cur.get("wall_seconds"),
                 "run_dir": cur.get("run_dir", ""),
                 "updated_at": cur.get("updated_at", ""),
             }]
@@ -338,7 +368,12 @@ class MasterLeaderboard:
         rec = {
             "reward": float(res.get("reward", 0.0) or 0.0),
             "milestones_passed": int(res.get("milestones_passed", 0) or 0),
-            "total_tokens": int(res.get("total_tokens", 0) or 0),
+            "total_tokens": int(
+                res["total_tokens"] if res.get("total_tokens") is not None
+                else (cur.get("total_tokens") or 0)),
+            "wall_seconds": float(
+                res["wall_seconds"] if res.get("wall_seconds") is not None
+                else (cur.get("wall_seconds") or 0.0)),
             "run_dir": str(run_dir or ""),
             "updated_at": _utc_now_iso(),
         }
@@ -357,6 +392,8 @@ class MasterLeaderboard:
         cur["milestones_passed"] = mean_ms
         cur["total_tokens"] = int(round(
             sum(int(r.get("total_tokens", 0) or 0) for r in runs) / n))
+        cur["wall_seconds"] = round(
+            sum(float(r.get("wall_seconds", 0.0) or 0.0) for r in runs) / n, 1)
         # passed 随均值口径重算：里程碑均值打满才算通过
         mt = int(cur.get("milestones_total", 0) or 0)
         cur["passed"] = bool(mt) and mean_ms >= mt
@@ -366,7 +403,8 @@ class MasterLeaderboard:
         cls._recompute_aggregates(entry)
 
     @classmethod
-    def _recompute_aggregates(cls, entry: dict[str, Any]) -> None:
+    def _recompute_aggregates(cls, entry: dict[str, Any],
+                              cost_medians: dict[str, tuple[float, float]] | None = None) -> None:
         """Recompute entry-level aggregates from stored task slots (in place).
 
         Legacy entries without slots keep their last-known aggregates.
@@ -386,6 +424,16 @@ class MasterLeaderboard:
         tasks holding both slots. ``coverage_full`` marks rows holding every
         canonical A and B slot; partial rows are ranked off-board (see
         ``sorted_entries``/``render_markdown``).
+
+        Cost telemetry (``cost_medians`` supplied by ``refresh_aggregates``
+        over the whole board): per-slot cost is the mean of token and wall
+        time normalised by that slot's cross-model median (1.0 = median);
+        ``cost_ratio`` averages it over the row's slots and
+        ``adjusted_index`` = capability / clamp(cost_ratio, 0.5, 3)**0.5 —
+        the geometric mean of capability and efficiency, so brute-force
+        rows lose rank without any hard budget cliff. Without medians the
+        cost fields fall back to neutral (cost_ratio 1.0) and
+        ``adjusted_index`` mirrors ``capability_index``.
         """
         W = cls.B_WEIGHT
         cls._bind_catalog()
@@ -495,9 +543,73 @@ class MasterLeaderboard:
         n_a = len(cls.CANONICAL_TASKS)
         n_b = len(cls.CANONICAL_B_TASKS)
         entry["tasks_covered"] = f"A {len(a_slots)}/{n_a} · B {len(b_slots)}/{n_b}"
+        # 成本遥测：真实总耗时 / TPS / 每通过断言 token / 成本比 / 调整指数。
+        # tokens-per-assertion is the "who brute-forced it" tell: a row that
+        # buys its milestones with 10M-token tasks can't hide behind a high
+        # capability percentage.
+        wall = sum(float(s.get("wall_seconds", 0.0) or 0.0) for s in a_slots + b_slots)
+        entry["total_wall_seconds"] = round(wall, 1)
+        entry["tps"] = round(entry["total_tokens"] / wall, 1) if wall else 0.0
+        ms_p = a_p + b_p
+        entry["tokens_per_assertion"] = int(entry["total_tokens"] / ms_p) if ms_p else 0
+        entry["succ_per_hour"] = (
+            round(float(entry["capability_index"] or 0.0) / (wall / 3600.0), 2) if wall else 0.0)
+        if cost_medians:
+            costs: list[float] = []
+            for s in a_slots + b_slots:
+                med = cost_medians.get(cls._median_key(s))
+                if not med:
+                    continue
+                med_t, med_s = med
+                t_n = (float(s.get("total_tokens", 0) or 0) / med_t) if med_t else 1.0
+                sec = float(s.get("wall_seconds", 0.0) or 0.0)
+                s_n = (sec / med_s) if (med_s and sec) else 1.0
+                costs.append((t_n + s_n) / 2.0)
+            cost_ratio = sum(costs) / len(costs) if costs else 1.0
+        else:
+            cost_ratio = float(entry.get("cost_ratio", 1.0) or 1.0)
+        entry["cost_ratio"] = round(cost_ratio, 2)
+        cap_now = float(entry["capability_index"] or 0.0)
+        clamped = min(max(cost_ratio, 0.5), 3.0)
+        entry["adjusted_index"] = round(cap_now / (clamped ** 0.5), 1)
         trace_pool = a_slots + b_slots
         latest = max(trace_pool, key=lambda s: str(s.get("updated_at", "")))
         entry["run_dir"] = str(latest.get("run_dir", ""))
+
+    @classmethod
+    def _median_key(cls, slot: dict[str, Any]) -> str:
+        """Board-wide median key for a slot (B slots collapse onto their task)."""
+        cond = str(slot.get("condition") or "a")
+        tid = str(slot.get("task_id") or "")
+        return tid if cond == "a" else f"{tid}@{cond}"
+
+    @classmethod
+    def _cost_medians(cls, data: dict[str, Any]) -> dict[str, tuple[float, float]]:
+        """Per-slot cross-model medians of (tokens, wall seconds).
+
+        Returned keyed by ``slot_key`` (``task`` / ``task@b``) so A and B
+        slots of the same task are normalised separately — B tasks carry
+        different plan scaffolding and are not comparable to A.
+        """
+        buckets: dict[str, list[dict[str, Any]]] = {}
+        for entry in data.values():
+            if not isinstance(entry, dict):
+                continue
+            for slot in (entry.get("tasks") or {}).values():
+                if isinstance(slot, dict):
+                    buckets.setdefault(cls._median_key(slot), []).append(slot)
+        out: dict[str, tuple[float, float]] = {}
+        for key, slots in buckets.items():
+            toks = sorted(float(s.get("total_tokens", 0) or 0) for s in slots
+                          if float(s.get("total_tokens", 0) or 0) > 0)
+            secs = sorted(float(s.get("wall_seconds", 0.0) or 0.0) for s in slots
+                          if float(s.get("wall_seconds", 0.0) or 0.0) > 0)
+            if toks or secs:
+                out[key] = (
+                    _median(toks) if toks else 0.0,
+                    _median(secs) if secs else 0.0,
+                )
+        return out
 
     @classmethod
     def update_leaderboard(
@@ -611,9 +723,12 @@ class MasterLeaderboard:
                        full_only: bool = False) -> list[dict[str, Any]]:
         """Master ranking over the stored rows (no second scoring pass).
 
-        ``full_only`` keeps just rows holding every canonical A and B slot
-        (``coverage_full``) — the fair-comparison board; partial rows are
-        listed separately so missing hard suites can't flatter a ranking.
+        Primary key is ``adjusted_index`` (capability ÷ clamped cost^0.5);
+        ``capability_index`` is the pure, v2-comparable reference shown
+        beside it. ``full_only`` keeps just rows holding every canonical A
+        and B slot (``coverage_full``) — the fair-comparison board; partial
+        rows are listed separately so missing hard suites can't flatter a
+        ranking.
         """
         cls._bind_catalog()
         data = data if data is not None else cls.load_data()
@@ -623,6 +738,7 @@ class MasterLeaderboard:
         return sorted(
             entries,
             key=lambda x: (
+                float(x.get("adjusted_index", 0.0) or 0.0),
                 float(x.get("capability_index", 0.0) or 0.0),
                 float(x.get("scoring_points_pct", 0.0) or 0.0),
                 -int(x.get("total_tokens", 0) or 0),
@@ -712,16 +828,17 @@ class MasterLeaderboard:
             "# 🏆 Benchmark v3 全维度权威榜单 (Master Leaderboard)",
             "",
             f"> **最新更新**: `{now_str}`  ",
-            "> **综合指数**: 四套件等权——short / reviewer / long / critic 各取**任务均分**，B 套件（short_b / long_b）按权重 `0.2` 掺入：`(A + 0.2·B) / 1.2`；critic 已折算到 0~1  ",
+            "> **能力分（综合指数）**: 四套件等权——short / reviewer / long / critic 各取**任务均分**，B 套件（short_b / long_b）按权重 `0.2` 掺入：`(A + 0.2·B) / 1.2`；critic 已折算到 0~1  ",
+            "> **调整指数（排名依据）**: `能力分 / clamp(成本C, 0.5, 3)^0.5`——能力与效率的几何平均。C = 各槽位 token 与耗时按跨模型中位数归一后的均值（1.0 = 中位）；clamp 到 3 倍保证再浪费也不会分数断层  ",
+            "> **成本遥测**: `TPS` = 总 token / 真实总耗时（逐槽遥测聚合，非单次运行）；`tok/断言` = 总 token / 通过断言数——力大飞砖的直接证据  ",
             "> **入榜条件**: 9 个 A 槽 + 5 个 B 槽全部齐全（`coverage_full`）；缺槽模型见文末附表，**不参与综合排名**  ",
-            "> **效率维度**: `Succ/Mtok` = 综合指数点 / 百万 Token，越高越省；与综合指数并列阅读  ",
             "> **遵循增益**: 同任务 `(B−A)` 奖励均值；正值=吃到脚手架红利，零/负=给菜谱也白给  ",
-            "> **总榜排序**: 综合指数降序 ➔ 评分点通过率降序 ➔ Token 消耗升序  ",
             "> **合并口径**: 每模型每档 effort 的各任务槽位记录**全部运行历史**，榜单展示**均值**（非最好分）  ",
+            "> **效率维度**: `Succ/Mtok` = 能力分 / 百万 Token；`Succ/h` = 能力分 / 真实小时，越高越省  ",
             "> **分任务榜**: 同源 `leaderboard.json`，按该任务槽位重排；**不是**独立计分表  ",
             "",
-            "| 排名 | 模型标识 (Model ID) | 驱动 / 思考强度 | 综合指数 | short | short_b | reviewer | long | long_b | critic | 遵循增益 | 覆盖 | 运行数 | Token | Succ/Mtok | 耗时 | 制品 |",
-            "| :---: | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | ---: | ---: | ---: | :---: |",
+            "| 排名 | 模型标识 (Model ID) | 驱动 / 思考强度 | 调整指数 | 能力分 | short | short_b | reviewer | long | long_b | critic | 成本C | TPS | tok/断言 | Token | Succ/Mtok | 耗时 | 增益 | 制品 |",
+            "| :---: | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | ---: | ---: | ---: | ---: | ---: | :---: | :---: |",
         ]
 
         for i, item in enumerate(full_rows):
@@ -729,24 +846,27 @@ class MasterLeaderboard:
             m_id = item.get("model_id", "unknown")
             drv = item.get("driver", "openai")
             eff = item.get("effort", "default")
+            adj = float(item.get("adjusted_index", 0.0) or 0.0)
             cap = float(item.get("capability_index", 0.0) or 0.0)
-            covered = item.get("tasks_covered", "-")
             gain = item.get("follow_gain")
-            gain_s = f"{gain:+.2f} (n={item.get('follow_gain_n', 0)})" if gain is not None else "-"
+            gain_s = f"{gain:+.2f}" if gain is not None else "-"
             tokens = item.get("total_tokens", 0)
             succ = item.get("succ_per_mtok", 0.0)
-            runs_n = item.get("run_count_total", 0)
-            wt = item.get("wall_time_seconds", 0.0)
+            cost = float(item.get("cost_ratio", 1.0) or 1.0)
+            tps = float(item.get("tps", 0.0) or 0.0)
+            tpa = item.get("tokens_per_assertion", 0)
+            wall_h = float(item.get("total_wall_seconds", 0.0) or 0.0) / 3600.0
             r_dir = item.get("run_dir", "")
             link = f"[查看日志]({r_dir})" if r_dir else "-"
 
             lines.append(
-                f"| {rank_str} | **`{m_id}`** | `{drv}` · `{eff}` | **`{cap:.1f} / 100`** | "
+                f"| {rank_str} | **`{m_id}`** | `{drv}` · `{eff}` | "
+                f"**`{adj:.1f} / 100`** | `{cap:.1f}` | "
                 f"`{item.get('short_score', '-')}` | `{item.get('short_b_score', '-')}` | "
                 f"`{item.get('reviewer_score', '-')}` | `{item.get('long_score', '-')}` | "
                 f"`{item.get('long_b_score', '-')}` | `{item.get('critic_score', '-')}` | "
-                f"`{gain_s}` | `{covered}` | `{runs_n}` | "
-                f"`{tokens:,}` | **`{succ:.2f}`** | `{wt:.1f}s` | {link} |"
+                f"`{cost:.2f}` | `{tps:,.0f}` | `{_fmt_tokens_short(tpa)}` | "
+                f"`{tokens:,}` | **`{succ:.2f}`** | `{wall_h:.1f}h` | `{gain_s}` | {link} |"
             )
 
         if partial_rows:
@@ -759,10 +879,10 @@ class MasterLeaderboard:
             )
             lines.append("")
             lines.append(
-                "| 模型标识 (Model ID) | 驱动 / 思考强度 | short | short_b | reviewer | long | long_b | critic | 缺失槽位 | Token |"
+                "| 模型标识 (Model ID) | 驱动 / 思考强度 | short | short_b | reviewer | long | long_b | critic | 成本C | TPS | tok/断言 | Token | 缺失槽位 |"
             )
             lines.append(
-                "| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :--- | ---: |"
+                "| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | ---: | ---: | ---: | :--- |"
             )
             for item in partial_rows:
                 missing = item.get("coverage_missing") or []
@@ -775,7 +895,10 @@ class MasterLeaderboard:
                     f"`{item.get('short_score', '-')}` | `{item.get('short_b_score', '-')}` | "
                     f"`{item.get('reviewer_score', '-')}` | `{item.get('long_score', '-')}` | "
                     f"`{item.get('long_b_score', '-')}` | `{item.get('critic_score', '-')}` | "
-                    f"{miss_s or '-'} | `{item.get('total_tokens', 0):,}` |"
+                    f"`{float(item.get('cost_ratio', 1.0) or 1.0):.2f}` | "
+                    f"`{float(item.get('tps', 0.0) or 0.0):,.0f}` | "
+                    f"`{_fmt_tokens_short(item.get('tokens_per_assertion', 0))}` | "
+                    f"`{item.get('total_tokens', 0):,}` | {miss_s or '-'} |"
                 )
 
         lines.extend(cls._task_board_markdown_sections(data))
@@ -832,10 +955,15 @@ class MasterLeaderboard:
 
     @classmethod
     def refresh_aggregates(cls, data: dict[str, Any]) -> dict[str, Any]:
-        """Recompute A/B split fields on every row that has task slots."""
+        """Recompute A/B split + cost fields on every row that has task slots.
+
+        Cost medians are board-wide, so they are computed once up front and
+        handed to every row's ``_recompute_aggregates``.
+        """
+        medians = cls._cost_medians(data)
         for entry in data.values():
             if isinstance(entry, dict):
-                cls._recompute_aggregates(entry)
+                cls._recompute_aggregates(entry, medians)
         return data
 
     @classmethod
@@ -1170,6 +1298,71 @@ def self_test() -> tuple[int, int]:
           [e.get("model_id") for e in MasterLeaderboard.sorted_entries(
               {"full@high": full_entry, "mix@high": mixed}, full_only=True)]
           == ["full"])
+    # No medians supplied (record_run path): cost fields fall back neutral.
+    check("cost_neutral_without_medians",
+          full_entry.get("cost_ratio", 1.0) == 1.0
+          and abs(float(full_entry["adjusted_index"]) - 67.36) < 0.15)
+    # Three-row board: median cost normalisation + clamp + adjusted index.
+    # rows a/b cost 1x, row c costs 10x → per-slot median = 1x.
+    def _scaled(src: dict, factor: float) -> dict:
+        row = {"model_id": "x", "driver": "openai", "effort": "high", "tasks": {}}
+        for k, s in src["tasks"].items():
+            slot = dict(s)
+            slot["total_tokens"] = int(s.get("total_tokens", 10)) * factor
+            slot["wall_seconds"] = float(s.get("wall_seconds", 1.0)) * factor
+            row["tasks"][k] = slot
+        return row
+
+    board = {
+        "a@high": _scaled(full_entry, 1),
+        "b@high": _scaled(full_entry, 1),
+        "c@high": _scaled(full_entry, 10),
+    }
+    board["a@high"]["model_id"] = "cheap"
+    board["b@high"]["model_id"] = "twin"
+    board["c@high"]["model_id"] = "pricey"
+    medians = MasterLeaderboard._cost_medians(board)
+    for row in board.values():
+        MasterLeaderboard._recompute_aggregates(row, medians)
+    cheap, pricey = board["a@high"], board["c@high"]
+    # All rows score identically; median cost = 1x so cheap/twin sit at
+    # cost_ratio 1.0 and pricey at 10.0; the clamp caps the penalty at 3.
+    check("cost_median_keyed_by_slot",
+          set(medians) == set(cheap["tasks"]) and len(medians) == 14)
+    check("cost_ratio_median_is_one", abs(float(cheap["cost_ratio"]) - 1.0) < 0.01)
+    check("cost_ratio_ten_for_pricey", abs(float(pricey["cost_ratio"]) - 10.0) < 0.01)
+    cap_c = float(cheap["capability_index"])
+    check("adjusted_clamped_at_three",
+          abs(float(pricey["adjusted_index"]) - cap_c / (3.0 ** 0.5)) < 0.2)
+    check("adjusted_equals_cap_at_median",
+          abs(float(cheap["adjusted_index"]) - cap_c) < 0.05)
+    check("tps_and_tokens_per_assertion",
+          cheap["tokens_per_assertion"] > 0 and cheap["tps"] > 0
+          and pricey["tokens_per_assertion"] > cheap["tokens_per_assertion"])
+    check("fmt_tokens_short",
+          _fmt_tokens_short(1_234_567) == "1.2M"
+          and _fmt_tokens_short(45_600) == "46k"
+          and _fmt_tokens_short(999) == "999"
+          and _fmt_tokens_short(None) == "-")
+    check("median_helper_even_odd",
+          _median([1.0, 3.0]) == 2.0 and _median([1.0, 2.0, 3.0]) == 2.0)
+    # record_run inherits telemetry from the old slot when res omits it
+    # (rescore path) — otherwise the mean is zeroed.
+    inherit = {"m@default": {"model_id": "m", "tasks": {
+        "varint_parser": {
+            "task_id": "varint_parser", "condition": "a", "reward": 0.5,
+            "passed": False, "milestones_passed": 5, "milestones_total": 10,
+            "total_tokens": 1234, "wall_seconds": 56.7, "run_count": 1,
+            "runs": [{"reward": 0.5, "milestones_passed": 5,
+                      "total_tokens": 1234, "wall_seconds": 56.7,
+                      "run_dir": "r1", "updated_at": "t1"}],
+            "run_dir": "r1", "updated_at": "t1"}}}}
+    MasterLeaderboard.record_run(
+        inherit, "m@default", "varint_parser",
+        {"reward": 0.9, "milestones_passed": 9, "milestones_total": 10}, "r1")
+    slot_i = inherit["m@default"]["tasks"]["varint_parser"]
+    check("record_run_inherits_telemetry",
+          slot_i["total_tokens"] == 1234 and abs(slot_i["wall_seconds"] - 56.7) < 0.01)
 
     # ---- persistence: locked partial-merge save (uses tmp CWD) ----------
     import contextlib

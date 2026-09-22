@@ -892,7 +892,10 @@ def _print_post_run_board(reports: list[Any], quiet: bool = False) -> None:
     from rich.console import Console
     from rich.table import Table
 
-    from benchmark_v3.bench_harness.core.report import MasterLeaderboard
+    from benchmark_v3.bench_harness.core.report import (
+        MasterLeaderboard,
+        _fmt_tokens_short,
+    )
 
     console = Console(legacy_windows=False)
     unique = {(r.task_id, getattr(r, "condition", "a") or "a") for r in reports}
@@ -939,28 +942,38 @@ def _print_post_run_board(reports: list[Any], quiet: bool = False) -> None:
     table = Table(
         title=(
             "[bold green]🏆 全维度权威总榜（仅列全量模型）[/bold green]\n"
-            "[dim]综合指数 = 四套件等权任务均分，B 套件按 0.2 掺入：(A+0.2·B)/1.2[/dim]"
+            "[dim]调整指数 = 能力分 / clamp(成本C,0.5,3)^0.5；能力分为同源参考列[/dim]"
         ),
         border_style="yellow",
     )
     table.add_column("排名", style="bold yellow", width=6, justify="center")
     table.add_column("模型", style="bold white")
     table.add_column("驱动·强度", style="cyan")
-    table.add_column("综合指数", justify="right")
-    table.add_column("覆盖", justify="center")
+    table.add_column("调整指数", justify="right")
+    table.add_column("能力分", justify="right")
+    table.add_column("成本C", justify="right")
+    table.add_column("TPS", justify="right")
+    table.add_column("tok/断言", justify="right")
     table.add_column("Token", justify="right")
     if not entries:
         console.print("\n[yellow]总榜暂无全量模型数据。[/yellow]\n")
         return
     for i, item in enumerate(entries):
+        adj = float(item.get("adjusted_index", 0.0) or 0.0)
         cap = float(item.get("capability_index", 0.0) or 0.0)
         tokens = item.get("total_tokens", 0)
+        cost = float(item.get("cost_ratio", 1.0) or 1.0)
+        tps = float(item.get("tps", 0.0) or 0.0)
+        tpa = item.get("tokens_per_assertion", 0)
         table.add_row(
             _MEDALS[i] if i < 3 else str(i + 1),
             str(item.get("model_id", "?")),
             f"{item.get('driver', '?')}·{item.get('effort', 'default')}",
-            f"{cap:.1f} / 100",
-            str(item.get("tasks_covered", "-")),
+            f"{adj:.1f} / 100",
+            f"{cap:.1f}",
+            f"{cost:.2f}",
+            f"{tps:,.0f}",
+            _fmt_tokens_short(tpa),
             f"{tokens:,}",
         )
     console.print()

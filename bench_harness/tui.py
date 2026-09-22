@@ -340,6 +340,19 @@ def _board_medals() -> list[str]:
     return ["👑 1", "🥈 2", "🥉 3"]
 
 
+def _fmt_tokens_short(value: Any) -> str:
+    """Compact token count for dense tables (mirrors report._fmt_tokens_short)."""
+    try:
+        v = float(value or 0)
+    except (TypeError, ValueError):
+        return "-"
+    if v >= 1_000_000:
+        return f"{v / 1_000_000:.1f}M"
+    if v >= 1_000:
+        return f"{v / 1_000:.0f}k"
+    return f"{v:.0f}"
+
+
 def render_master_board() -> None:
     """Render the master ranking from leaderboard.json (same source as MD)."""
     MasterLeaderboard = _load_master_board()
@@ -360,36 +373,41 @@ def render_master_board() -> None:
     table = Table(
         title=(
             "[bold gold1]🏆 全维度权威总榜（仅列全量模型）[/bold gold1]\n"
-            "[dim]综合指数 = 四套件等权任务均分，B 套件按 0.2 掺入：(A+0.2·B)/1.2[/dim]\n"
-            "[dim]Succ/Mtok = 每百万 Token 换来的综合指数点，越高越省；同一槽位多次运行取均值[/dim]"
+            "[dim]调整指数 = 能力分 / clamp(成本C,0.5,3)^0.5（能力×效率几何平均）；能力分为同源 v2 口径参考列[/dim]\n"
+            "[dim]TPS = 总token/真实总耗时；tok/断言 = 总token/通过断言数（力大飞砖证据）；同槽多次运行取均值[/dim]"
         ),
         border_style="yellow",
     )
     table.add_column("排名", style="bold yellow", width=6, justify="center")
     table.add_column("模型", style="bold white")
     table.add_column("驱动·强度", style="cyan")
-    table.add_column("综合指数", justify="right")
+    table.add_column("调整指数", justify="right")
+    table.add_column("能力分", justify="right")
     for name in ("short", "short_b", "reviewer", "long", "long_b", "critic"):
         table.add_column(name, justify="right")
-    table.add_column("增益", justify="right")
-    table.add_column("运行数", justify="center")
+    table.add_column("成本C", justify="right")
+    table.add_column("TPS", justify="right")
+    table.add_column("tok/断言", justify="right")
     table.add_column("Token", justify="right")
     table.add_column("Succ/Mtok", justify="right", style="green")
     for i, item in enumerate(entries):
+        adj = float(item.get("adjusted_index", 0.0) or 0.0)
         cap = float(item.get("capability_index", 0.0) or 0.0)
         tokens = item.get("total_tokens", 0)
         succ = float(item.get("succ_per_mtok", 0.0) or 0.0)
-        runs_n = item.get("run_count_total", 0)
-        gain = item.get("follow_gain")
-        gain_s = f"{gain:+.2f}" if gain is not None else "-"
+        cost = float(item.get("cost_ratio", 1.0) or 1.0)
+        tps = float(item.get("tps", 0.0) or 0.0)
+        tpa = item.get("tokens_per_assertion", 0)
         table.add_row(
             medals[i] if i < 3 else str(i + 1),
             str(item.get("model_id", "?")),
             f"{item.get('driver', '?')}·{item.get('effort', 'default')}",
-            f"{cap:.1f} / 100",
+            f"{adj:.1f} / 100",
+            f"{cap:.1f}",
             *_suite_cols(item),
-            gain_s,
-            str(runs_n) if runs_n else "-",
+            f"{cost:.2f}",
+            f"{tps:,.0f}",
+            _fmt_tokens_short(tpa),
             f"{tokens:,}",
             f"{succ:.2f}" if succ else "-",
         )
@@ -408,6 +426,9 @@ def render_master_board() -> None:
         ptable.add_column("驱动·强度", style="cyan")
         for name in ("short", "short_b", "reviewer", "long", "long_b", "critic"):
             ptable.add_column(name, justify="right")
+        ptable.add_column("成本C", justify="right")
+        ptable.add_column("TPS", justify="right")
+        ptable.add_column("tok/断言", justify="right")
         ptable.add_column("缺失槽位", style="dim")
         for item in partial:
             missing = item.get("coverage_missing") or []
@@ -418,6 +439,9 @@ def render_master_board() -> None:
                 str(item.get("model_id", "?")),
                 f"{item.get('driver', '?')}·{item.get('effort', 'default')}",
                 *_suite_cols(item),
+                f"{float(item.get('cost_ratio', 1.0) or 1.0):.2f}",
+                f"{float(item.get('tps', 0.0) or 0.0):,.0f}",
+                _fmt_tokens_short(item.get("tokens_per_assertion", 0)),
                 miss_s or "-",
             )
         console.print(ptable)

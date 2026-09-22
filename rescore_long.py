@@ -122,6 +122,10 @@ def main() -> int:
             else:
                 print(f"       {old_reward} (unchanged)", flush=True)
             if not dry:
+                # 复算不重跑 agent：原运行的 token/耗时遥测必须继承，否则
+                # record_run 的均值会被 0 污染（成本指标与 Succ/Mtok 全废）。
+                new_res.setdefault("total_tokens", int(slot.get("total_tokens", 0) or 0))
+                new_res.setdefault("wall_seconds", float(slot.get("wall_seconds", 0.0) or 0.0))
                 # 并入该 run_dir 的运行历史（就地替换同一次运行），保持均值口径
                 MasterLeaderboard.record_run(
                     data, model_key, slot_key, new_res, str(run_dir))
