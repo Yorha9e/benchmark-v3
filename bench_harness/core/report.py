@@ -147,9 +147,9 @@ class MasterLeaderboard:
     #: Floating-point tolerance when comparing rewards (avoid churn on ties).
     REWARD_EPS = 1e-9
 
-    #: B down-weight in the capability index. B re-tests an A-task subset
-    #: under plan scaffolding, so each B milestone counts this fraction of
-    #: an A milestone. Tunable; 0.2 → full board 66 + 50×0.2 = 76 points.
+    #: B down-weight in the composite index. B re-tests an A-task subset
+    #: under plan scaffolding, so the B suite means blend in at this
+    #: fraction of the A means: composite = (A + B_WEIGHT·B)/(1+B_WEIGHT).
     B_WEIGHT = 0.2
 
     @classmethod
@@ -373,11 +373,19 @@ class MasterLeaderboard:
         critic ``audit_bundle`` lives on a 0~100 scale, every other task on
         0~1, mirroring the original normalisation.
 
-        Capability is milestone-based with B down-weighted: B re-tests a
-        subset of A tasks under scaffolding, so each B milestone counts
-        ``B_WEIGHT`` of an A milestone. Full board = 66 + 50×``B_WEIGHT``
-        effective points. ``follow_gain`` is the pure following signal:
-        mean(B_reward − A_reward) over tasks holding both slots.
+        Composite (``capability_index``) is **suite-equal**: each A suite
+        contributes the mean of its task rewards, the two B suites the mean
+        of theirs, blended as ``(A + B_WEIGHT·B)/(1 + B_WEIGHT)``. Equal
+        suite weights stop short (30 milestones) from drowning reviewer
+        (12) and critic (4), and task rewards keep the fractional milestone
+        scores (long milestones carry 2 assertions ⇒ 0.5 steps) that a plain
+        milestone count throws away.
+
+        ``scoring_points_*`` stay milestone-count based as a raw reference.
+        ``follow_gain`` is the pure following signal: mean(B−A) reward over
+        tasks holding both slots. ``coverage_full`` marks rows holding every
+        canonical A and B slot; partial rows are ranked off-board (see
+        ``sorted_entries``/``render_markdown``).
         """
         W = cls.B_WEIGHT
         cls._bind_catalog()
@@ -409,14 +417,35 @@ class MasterLeaderboard:
         if not a_slots and not b_slots:
             return
 
-        def _total(slots: list[dict[str, Any]], task_ids: list[str]) -> str:
-            sel = [s for s in slots if s.get("task_id") in task_ids]
-            if not sel:
-                return "-"
-            return f"{sum(float(s.get('reward', 0.0)) for s in sel):.2f}"
+        def _slot_suite(slot: dict[str, Any]) -> str:
+            """Suite family of a slot; fall back to the task catalog."""
+            return str(slot.get("suite") or cls.TASK_SUITES.get(str(slot.get("task_id"))) or "")
 
-        # Capability: A milestones at full value, B milestones at B_WEIGHT.
-        # Displayed points are the weighted effective points (1 decimal).
+        def _norm(slot: dict[str, Any]) -> float:
+            """Task reward on a 0~1 scale (critic audit_bundle is 0~100)."""
+            r = float(slot.get("reward", 0.0) or 0.0)
+            return r / 100.0 if _slot_suite(slot) == "critic" else r
+
+        def _suite_pct(slots: list[dict[str, Any]], suite: str) -> float | None:
+            vals = [_norm(s) for s in slots if _slot_suite(s) == suite]
+            if not vals:
+                return None
+            return sum(vals) / len(vals) * 100.0
+
+        a_pcts = {su: _suite_pct(a_slots, su)
+                  for su in ("short", "reviewer", "long", "critic")}
+        b_pcts = {su: _suite_pct(b_slots, su) for su in ("short", "long")}
+        a_vals = [v for v in a_pcts.values() if v is not None]
+        b_vals = [v for v in b_pcts.values() if v is not None]
+        if not a_vals:
+            return  # B-only row: keep last-known aggregates
+        a_part = sum(a_vals) / len(a_vals)
+        b_part = sum(b_vals) / len(b_vals) if b_vals else None
+        composite = a_part if b_part is None else (a_part + W * b_part) / (1.0 + W)
+        entry["capability_index"] = round(composite, 1)
+        entry["scoring_points_pct"] = entry["capability_index"]
+
+        # Milestone points stay count-based (raw reference; not the index).
         a_p = sum(int(s.get("milestones_passed", 0)) for s in a_slots)
         a_t = sum(int(s.get("milestones_total", 0)) for s in a_slots)
         b_p = sum(int(s.get("milestones_passed", 0)) for s in b_slots)
@@ -425,30 +454,26 @@ class MasterLeaderboard:
         eff_t = round(a_t + W * b_t, 1)
         entry["scoring_points_passed"] = eff_p
         entry["scoring_points_total"] = eff_t
-        entry["scoring_points_pct"] = round(eff_p / eff_t * 100.0, 1) if eff_t else 0.0
-        entry["capability_index"] = entry["scoring_points_pct"]
         entry["total_tokens"] = sum(int(s.get("total_tokens", 0)) for s in a_slots + b_slots)
-        # 效率维度：每百万 token 换来的有效评分点（Succ/Mtok），越高越省。
+        # 效率维度：每百万 token 换来的综合指数点（Succ/Mtok），越高越省。
         # 与综合指数并列展示——前者答「能不能做对」，后者答「多贵的代价做对」。
         _tok = int(entry["total_tokens"] or 0)
-        entry["succ_per_mtok"] = round(eff_p / (_tok / 1_000_000.0), 2) if _tok else 0.0
-        entry["tokens_per_point"] = int(_tok / eff_p) if eff_p else 0
+        cap = float(entry["capability_index"] or 0.0)
+        entry["succ_per_mtok"] = round(cap / (_tok / 1_000_000.0), 2) if _tok else 0.0
+        entry["tokens_per_point"] = int(_tok / cap) if cap else 0
         entry["run_count_total"] = sum(int(s.get("run_count", 1) or 1) for s in a_slots + b_slots)
         entry["a_scoring_points_passed"] = a_p
         entry["a_scoring_points_total"] = a_t
+        # Family fields become suite percentages (1 decimal, "%" implied by
+        # the table header); "-" when the model never ran that suite.
         for family, field in cls.SUITE_SCORE_FIELDS.items():
-            task_ids = list(cls.SUITE_TASKS.get(family, ()))
-            if family == "critic":
-                critic = next((s for s in a_slots if s.get("task_id") in task_ids), None)
-                entry[field] = f"{float(critic.get('reward', 0.0)):.1f}" if critic else "-"
-            else:
-                entry[field] = _total(a_slots, task_ids)
+            p = a_pcts.get(family)
+            entry[field] = f"{p:.1f}" if p is not None else "-"
         for family, field in cls.SUITE_B_SCORE_FIELDS.items():
-            entry[field] = _total(b_slots, list(cls.SUITE_B_TASKS.get(family, ())))
-        entry["b_scoring_points_passed"] = sum(int(s.get("milestones_passed", 0)) for s in b_slots)
-        entry["b_scoring_points_total"] = sum(int(s.get("milestones_total", 0)) for s in b_slots)
-        b_t = entry["b_scoring_points_total"]
-        b_p = entry["b_scoring_points_passed"]
+            p = b_pcts.get(family)
+            entry[field] = f"{p:.1f}" if p is not None else "-"
+        entry["b_scoring_points_passed"] = b_p
+        entry["b_scoring_points_total"] = b_t
         entry["b_scoring_points_pct"] = round(b_p / b_t * 100.0, 1) if b_t else 0.0
         # 遵循增益：同时持有 A/B 槽的任务上 (B−A) 奖励均值；无成对槽位记 None。
         a_by_task = {s.get("task_id"): s for s in a_slots}
@@ -456,9 +481,17 @@ class MasterLeaderboard:
         for s in b_slots:
             a_slot = a_by_task.get(s.get("task_id"))
             if isinstance(a_slot, dict):
-                gains.append(float(s.get("reward", 0.0)) - float(a_slot.get("reward", 0.0)))
+                gains.append(_norm(s) - _norm(a_slot))
         entry["follow_gain"] = round(sum(gains) / len(gains), 2) if gains else None
         entry["follow_gain_n"] = len(gains)
+        # Coverage: "full" holds every canonical slot; anything less is
+        # ranked off-board so missing hard suites can't flatter a row.
+        have_a = {s.get("task_id") for s in a_slots}
+        have_b = {s.get("task_id") for s in b_slots}
+        missing = [t for t in cls.CANONICAL_TASKS if t not in have_a]
+        missing += [f"{t}@b" for t in cls.CANONICAL_B_TASKS if t not in have_b]
+        entry["coverage_full"] = not missing
+        entry["coverage_missing"] = missing
         n_a = len(cls.CANONICAL_TASKS)
         n_b = len(cls.CANONICAL_B_TASKS)
         entry["tasks_covered"] = f"A {len(a_slots)}/{n_a} · B {len(b_slots)}/{n_b}"
@@ -574,11 +607,19 @@ class MasterLeaderboard:
         return f"{float(reward):.2f} / 1.00"
 
     @classmethod
-    def sorted_entries(cls, data: dict[str, Any] | None = None) -> list[dict[str, Any]]:
-        """Master ranking over the stored rows (no second scoring pass)."""
+    def sorted_entries(cls, data: dict[str, Any] | None = None, *,
+                       full_only: bool = False) -> list[dict[str, Any]]:
+        """Master ranking over the stored rows (no second scoring pass).
+
+        ``full_only`` keeps just rows holding every canonical A and B slot
+        (``coverage_full``) — the fair-comparison board; partial rows are
+        listed separately so missing hard suites can't flatter a ranking.
+        """
         cls._bind_catalog()
         data = data if data is not None else cls.load_data()
         entries = [e for e in data.values() if isinstance(e, dict)]
+        if full_only:
+            entries = [e for e in entries if e.get("coverage_full")]
         return sorted(
             entries,
             key=lambda x: (
@@ -660,7 +701,9 @@ class MasterLeaderboard:
         """Build LEADERBOARD.md text from one JSON snapshot (no extra scoring)."""
         cls._bind_catalog()
         data = data if data is not None else cls.load_data()
-        sorted_entries = cls.sorted_entries(data)
+        ranked = cls.sorted_entries(data)
+        full_rows = [e for e in ranked if e.get("coverage_full")]
+        partial_rows = [e for e in ranked if not e.get("coverage_full")]
 
         medals = ["👑 1", "🥈 2", "🥉 3"]
         now_str = _utc_now_iso()
@@ -669,36 +712,27 @@ class MasterLeaderboard:
             "# 🏆 Benchmark v3 全维度权威榜单 (Master Leaderboard)",
             "",
             f"> **最新更新**: `{now_str}`  ",
-            "> **评分点**: A 里程碑全额，B 里程碑按权重 `0.2` 折算；A 最多 66（short 30 · long 20 · reviewer 12 · critic 4），B 最多 50×0.2=10，满测 **76** 有效分  ",
-            "> **综合指数**: `有效得分 / 有效总数 × 100`（和通过率同一口径）  ",
+            "> **综合指数**: 四套件等权——short / reviewer / long / critic 各取**任务均分**，B 套件（short_b / long_b）按权重 `0.2` 掺入：`(A + 0.2·B) / 1.2`；critic 已折算到 0~1  ",
+            "> **入榜条件**: 9 个 A 槽 + 5 个 B 槽全部齐全（`coverage_full`）；缺槽模型见文末附表，**不参与综合排名**  ",
+            "> **效率维度**: `Succ/Mtok` = 综合指数点 / 百万 Token，越高越省；与综合指数并列阅读  ",
             "> **遵循增益**: 同任务 `(B−A)` 奖励均值；正值=吃到脚手架红利，零/负=给菜谱也白给  ",
             "> **总榜排序**: 综合指数降序 ➔ 评分点通过率降序 ➔ Token 消耗升序  ",
             "> **合并口径**: 每模型每档 effort 的各任务槽位记录**全部运行历史**，榜单展示**均值**（非最好分）  ",
-            "> **效率维度**: `Succ/Mtok` = 有效评分点 / 百万 Token，越高越省；与综合指数并列阅读  ",
             "> **分任务榜**: 同源 `leaderboard.json`，按该任务槽位重排；**不是**独立计分表  ",
             "",
-            "| 排名 | 模型标识 (Model ID) | 驱动 / 思考强度 | 综合指数 | 评分点 | 覆盖 | 运行数 | 遵循增益 | critic (/100) | reviewer (/3) | short A (/3) | short B (/3) | long A (/2) | long B (/2) | Token | Succ/Mtok | 耗时 | 制品 |",
-            "| :---: | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | ---: | ---: | ---: | :---: |",
+            "| 排名 | 模型标识 (Model ID) | 驱动 / 思考强度 | 综合指数 | short | short_b | reviewer | long | long_b | critic | 遵循增益 | 覆盖 | 运行数 | Token | Succ/Mtok | 耗时 | 制品 |",
+            "| :---: | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | ---: | ---: | ---: | :---: |",
         ]
 
-        for i, item in enumerate(sorted_entries):
+        for i, item in enumerate(full_rows):
             rank_str = medals[i] if i < len(medals) else str(i + 1)
             m_id = item.get("model_id", "unknown")
             drv = item.get("driver", "openai")
             eff = item.get("effort", "default")
             cap = float(item.get("capability_index", 0.0) or 0.0)
-            pts_p = item.get("scoring_points_passed", 0)
-            pts_t = item.get("scoring_points_total", 66)
-            pts_pct = item.get("scoring_points_pct", 0.0)
             covered = item.get("tasks_covered", "-")
             gain = item.get("follow_gain")
             gain_s = f"{gain:+.2f} (n={item.get('follow_gain_n', 0)})" if gain is not None else "-"
-            c_sc = item.get("critic_score", "-")
-            rev_sc = item.get("reviewer_score", "-")
-            sh_sc = item.get("short_score", "-")
-            sh_b = item.get("short_b_score", "-")
-            lg_sc = item.get("long_score", "-")
-            lg_b = item.get("long_b_score", "-")
             tokens = item.get("total_tokens", 0)
             succ = item.get("succ_per_mtok", 0.0)
             runs_n = item.get("run_count_total", 0)
@@ -708,12 +742,42 @@ class MasterLeaderboard:
 
             lines.append(
                 f"| {rank_str} | **`{m_id}`** | `{drv}` · `{eff}` | **`{cap:.1f} / 100`** | "
-                f"**`{pts_p}/{pts_t}`** (`{pts_pct:.1f}%`) | `{covered}` | `{runs_n}` | `{gain_s}` | "
-                f"`{c_sc}` | `{rev_sc}` | `{sh_sc}` | `{sh_b}` | `{lg_sc}` | `{lg_b}` | "
+                f"`{item.get('short_score', '-')}` | `{item.get('short_b_score', '-')}` | "
+                f"`{item.get('reviewer_score', '-')}` | `{item.get('long_score', '-')}` | "
+                f"`{item.get('long_b_score', '-')}` | `{item.get('critic_score', '-')}` | "
+                f"`{gain_s}` | `{covered}` | `{runs_n}` | "
                 f"`{tokens:,}` | **`{succ:.2f}`** | `{wt:.1f}s` | {link} |"
             )
 
-        lines.append("")
+        if partial_rows:
+            lines.append("")
+            lines.append("### ⚠️ 未完成模型（缺槽，暂不参与综合排名）")
+            lines.append("")
+            lines.append(
+                "> 以下模型尚未跑齐 canonical 槽位。缺跑的往往是难题套件，"
+                "按均分掺入综合指数会系统性虚高，故单列；跑齐后自动进入上方总榜。"
+            )
+            lines.append("")
+            lines.append(
+                "| 模型标识 (Model ID) | 驱动 / 思考强度 | short | short_b | reviewer | long | long_b | critic | 缺失槽位 | Token |"
+            )
+            lines.append(
+                "| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :--- | ---: |"
+            )
+            for item in partial_rows:
+                missing = item.get("coverage_missing") or []
+                miss_s = "、".join(f"`{m}`" for m in missing[:6])
+                if len(missing) > 6:
+                    miss_s += f" 等 {len(missing)} 项"
+                lines.append(
+                    f"| **`{item.get('model_id', 'unknown')}`** | "
+                    f"`{item.get('driver', 'openai')}` · `{item.get('effort', 'default')}` | "
+                    f"`{item.get('short_score', '-')}` | `{item.get('short_b_score', '-')}` | "
+                    f"`{item.get('reviewer_score', '-')}` | `{item.get('long_score', '-')}` | "
+                    f"`{item.get('long_b_score', '-')}` | `{item.get('critic_score', '-')}` | "
+                    f"{miss_s or '-'} | `{item.get('total_tokens', 0):,}` |"
+                )
+
         lines.extend(cls._task_board_markdown_sections(data))
         lines.append("---")
         lines.append("*由 Benchmark v3 自动化轻量 Harness 驱动，每次评测完成自动增量对齐落盘。*")
@@ -852,7 +916,9 @@ class MasterLeaderboard:
     def suite_board(cls, suite: str, data: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         """Suite drill-down: same JSON, primary key = stored slot sum for that family.
 
-        Not a second scoring pipeline. Legacy rows without ``tasks`` are tagged
+        Also exposes ``suite_pct`` — the suite's mean task reward on a 0~100
+        scale (critic normalised), the same number the composite blends. Not
+        a second scoring pipeline. Legacy rows without ``tasks`` are tagged
         ``legacy=True`` and fall back to the last stored suite field.
         """
         cls._bind_catalog()
@@ -867,12 +933,21 @@ class MasterLeaderboard:
                      if t in task_ids and isinstance(s, dict)]
             if slots:
                 total = round(sum(float(s.get("reward", 0.0)) for s in slots), 2)
+                _critic = any(
+                    str(s.get("suite") or cls.TASK_SUITES.get(str(s.get("task_id")))) == "critic"
+                    for s in slots
+                )
+                _vals = [float(s.get("reward", 0.0)) for s in slots]
+                if _critic and _vals:
+                    _vals = [v / 100.0 for v in _vals]
+                suite_pct = round(sum(_vals) / len(_vals) * 100.0, 1) if _vals else None
                 rows.append({
                     "entry_key": key,
                     "model_id": entry.get("model_id", "?"),
                     "driver": entry.get("driver", "?"),
                     "effort": entry.get("effort", "default"),
                     "reward": total,
+                    "suite_pct": suite_pct,
                     "passed": all(bool(s.get("passed", False)) for s in slots),
                     "milestones": f"{sum(int(s.get('milestones_passed', 0)) for s in slots)}"
                                   f"/{sum(int(s.get('milestones_total', 0)) for s in slots)}",
@@ -894,6 +969,7 @@ class MasterLeaderboard:
                 "driver": entry.get("driver", "?"),
                 "effort": entry.get("effort", "default"),
                 "reward": legacy_total,
+                "suite_pct": None,
                 "passed": False,
                 "milestones": "-",
                 "total_tokens": None,
@@ -1041,14 +1117,59 @@ def self_test() -> tuple[int, int]:
         },
     }
     MasterLeaderboard._recompute_aggregates(mixed)
-    # A 4/10 全额 + B 10/10 按 0.2 折算 → 有效 6.0/12.0 = 50.0；增益 +0.60
+    # 套件等权：short A 均分 40.0、short_b 均分 100.0 → (40+0.2×100)/1.2 = 50.0
     check("points_weighted_b", mixed["scoring_points_passed"] == 6.0)
     check("points_total_weighted", mixed["scoring_points_total"] == 12.0)
     check("capability_is_weighted", abs(float(mixed["capability_index"]) - 50.0) < 0.15)
     check("b_points_still_tracked", mixed["b_scoring_points_passed"] == 10)
     check("follow_gain_is_b_minus_a", abs(float(mixed["follow_gain"]) - 0.6) < 1e-9)
     check("coverage_splits_ab", "A 1/" in mixed["tasks_covered"] and "B 1/" in mixed["tasks_covered"])
-    check("md_explains_ratio", "有效得分" in md and "76" in md)
+    check("suite_fields_are_pct",
+          mixed["short_score"] == "40.0" and mixed["short_b_score"] == "100.0")
+    check("partial_row_not_full", mixed["coverage_full"] is False)
+    check("coverage_missing_lists_slots", "timing_wheel" in mixed["coverage_missing"])
+    check("md_explains_ratio", "套件等权" in md and "0.2" in md)
+
+    # Full-coverage row: composite blends four A suite means with two B
+    # suite means at B_WEIGHT; critic's 0~100 reward normalises to 0~1.
+    def _full_slot(task_id: str, suite: str, reward: float,
+                   condition: str = "a") -> dict:
+        critic = suite == "critic"
+        return {
+            "task_id": task_id, "suite": suite, "condition": condition,
+            "reward": reward, "passed": reward >= (100.0 if critic else 1.0),
+            "milestones_passed": 1 if critic else int(reward * 10),
+            "milestones_total": 1 if critic else 10,
+            "total_tokens": 10, "updated_at": "2026-01-01T00:00:00Z",
+            "run_count": 1, "run_dir": "",
+        }
+
+    full_entry = {"model_id": "full", "driver": "openai", "effort": "high", "tasks": {}}
+    for tid, rew in (("varint_parser", 1.0), ("timing_wheel", 0.5),
+                     ("lexer_state_machine", 0.0)):
+        full_entry["tasks"][tid] = _full_slot(tid, "short", rew)
+        full_entry["tasks"][MasterLeaderboard.slot_key(tid, "b")] = _full_slot(
+            tid, "short", rew, condition="b")
+    for tid, rew in (("lock_ordering", 0.5), ("api_drift", 1.0),
+                     ("bait_guard", 1.0)):
+        full_entry["tasks"][tid] = _full_slot(tid, "reviewer", rew)
+    for tid, rew in (("raft_cluster", 0.5), ("saga_coordinator", 0.5)):
+        full_entry["tasks"][tid] = _full_slot(tid, "long", rew)
+        full_entry["tasks"][MasterLeaderboard.slot_key(tid, "b")] = _full_slot(
+            tid, "long", rew, condition="b")
+    full_entry["tasks"]["audit_bundle"] = _full_slot("audit_bundle", "critic", 100.0)
+    MasterLeaderboard._recompute_aggregates(full_entry)
+    # A: short 50.0, reviewer 83.33, long 50.0, critic 100 → 70.83
+    # B: short_b 50.0, long_b 50.0 → 50.0；composite = (70.83+0.2×50)/1.2 = 67.36
+    check("suite_equal_composite",
+          abs(float(full_entry["capability_index"]) - 67.36) < 0.15)
+    check("full_row_flagged", full_entry["coverage_full"] is True)
+    check("full_row_no_missing", full_entry["coverage_missing"] == [])
+    check("critic_normalised", full_entry["critic_score"] == "100.0")
+    check("full_only_filters_partial",
+          [e.get("model_id") for e in MasterLeaderboard.sorted_entries(
+              {"full@high": full_entry, "mix@high": mixed}, full_only=True)]
+          == ["full"])
 
     # ---- persistence: locked partial-merge save (uses tmp CWD) ----------
     import contextlib
