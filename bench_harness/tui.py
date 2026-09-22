@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -35,7 +36,6 @@ from rich.text import Text
 from benchmark_v3.bench_harness.suites.catalog import (
     DEFAULT_ALL_KEYS,
     DEFAULT_TUI_KEYS,
-    RUNNABLES,
     SELECTABLE_KEYS,
     SUITE_LABELS,
 )
@@ -54,6 +54,9 @@ if sys.platform == "win32":
             pass
 
 console = Console()
+
+#: rich markup 标签（用于 _shorten 的纯文本测量）
+_MARKUP_RE = re.compile(r"\[/?[a-z#][a-z0-9_ .#,/]*\]")
 
 PROFILES_FILE = Path(".bench_profiles.json")
 JUDGE_CONFIG_FILE = Path(".bench_judge.json")
@@ -830,16 +833,37 @@ def profile_picker() -> dict[str, Any] | None:
             continue
 
         # action == "new"
-        created = configure_wizard()
+        created = edit_config_table(None, _seed_new_config(), create_mode=True)
         if created:
+            profiles = load_profiles()
+            default_name = "%s_%s" % (
+                created.get("driver", "openai"),
+                str(created.get("model", "model")).replace(":", "_").replace("/", "_"),
+            )
+            saved_name = questionary.text(
+                "输入预设名称（保存后可一键载入；Esc 跳过保存直接启动）:",
+                default=default_name,
+                style=CUSTOM_STYLE,
+            ).ask()
+            if saved_name and saved_name.strip():
+                saved_name = saved_name.strip()
+                if saved_name in profiles:
+                    overwrite = questionary.confirm(
+                        f"预设 [{saved_name}] 已存在，覆盖它吗？",
+                        default=False,
+                        style=CUSTOM_STYLE,
+                    ).ask()
+                    if not overwrite:
+                        console.print("[yellow]已取消覆盖；本次配置不落盘，直接进入启动卡。[/yellow]")
+                        return created
+                profiles[saved_name] = created
+                save_profiles(profiles)
+                console.print(f"[green]✔ 已保存预设配置: {saved_name}（安全存储于 .bench_profiles.json）[/green]")
             return created
         continue
 
 
 #: 新建向导中"放弃本次配置"哨兵值（select/checkbox 无取消键，用显式选项实现返回）。
-WIZARD_ABORT = "__abort__"
-WIZARD_ABORT_CHOICE = Choice("↩ 放弃本次配置，返回主菜单", value="__abort__")
-
 
 #: 表格编辑器字段定义：(key, 显示名, 编辑器类型, 补充说明)
 #: kind: driver|text|password|effort|suites|bool|path_opt|judge_driver|judge_model
@@ -853,6 +877,7 @@ _CONFIG_FIELDS: tuple[tuple[str, str, str, str], ...] = (
     ("suites", "评测套件", "suites", "空格多选：" + "/".join(SELECTABLE_KEYS)),
     ("tasks", "限定任务", "task_subset", "留空=所选套件全跑；选中后只跑这些题（部分运行）"),
     ("resume", "断点续跑", "bool", "崩溃时从单轮快照原地恢复"),
+    ("on_upstream_error", "上游故障策略", "upstream", "pause=暂停队列可续跑 / continue=跳过记 ABORTED"),
     ("export_sft", "SFT 导出", "path_opt", "选中后可开关 + 修改导出路径"),
     ("export_dpo", "DPO 导出", "path_opt", "选中后可开关 + 修改导出路径"),
     ("judge_model", "裁判模型", "judge_model", "可选用全局专家裁判，或为本预设单独填写"),
@@ -880,10 +905,92 @@ _EFFORT_LABELS = {
 _SUITE_LABELS = dict(SUITE_LABELS)
 
 
+def _default_model_for(driver: str) -> str:
+    """Per-driver default model id (create-mode seeding)."""
+    return {
+        "openai": "deepseek-chat",
+        "response": "gpt-5-mini",
+        "google": "gemini-2.0-flash",
+        "anthropic": "claude-3-7-sonnet-20250219",
+        "mock": "mock-model",
+        "cli": "local-agent",
+    }.get(driver, "deepseek-chat")
+
+
+def _driver_env_defaults(driver: str) -> dict[str, str]:
+    """Per-driver connection defaults (env-aware): base_url / api_key / proxy."""
+    base_url = ""
+    if driver in ("openai", "response"):
+        base_url = os.environ.get("OPENAI_BASE_URL", "https://api.deepseek.com/v1")
+    elif driver == "anthropic":
+        base_url = os.environ.get("ANTHROPIC_BASE_URL", "")
+    elif driver == "google":
+        base_url = os.environ.get("GEMINI_BASE_URL", "")
+    api_key = ""
+    if driver in ("openai", "response"):
+        api_key = os.environ.get("OPENAI_API_KEY", "")
+    elif driver == "google":
+        api_key = os.environ.get("GEMINI_API_KEY", "")
+    elif driver == "anthropic":
+        api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    proxy = "http://127.0.0.1:10808" if driver in ("google", "anthropic") else ""
+    return {"base_url": base_url, "api_key": api_key, "proxy": proxy}
+
+
+def _seed_new_config() -> dict[str, Any]:
+    """Create-mode starting config: openai driver + env-aware defaults."""
+    driver = "openai"
+    cfg: dict[str, Any] = {
+        "driver": driver,
+        "model": _default_model_for(driver),
+        "proxy": "",
+        "effort": None,
+        "suites": list(DEFAULT_TUI_KEYS),
+        "tasks": [],
+        "resume": True,
+        "on_upstream_error": "pause",
+        "export_sft": f"./datasets/sft_{_default_model_for(driver)}.jsonl",
+        "export_dpo": "",
+        "judge_model": "",
+        "judge_driver": "",
+        "judge_base_url": "",
+        "judge_api_key": "",
+        "judge_effort": None,
+    }
+    cfg.update(_driver_env_defaults(driver))
+    return cfg
+
+
+def _swap_driver_defaults(cfg: dict[str, Any], old_driver: str, new_driver: str) -> None:
+    """Create-mode convenience: after a driver change, refresh connection
+    fields that still hold the OLD driver's untouched defaults."""
+    if not old_driver or old_driver == new_driver:
+        return
+    old_def = _driver_env_defaults(old_driver)
+    new_def = _driver_env_defaults(new_driver)
+    for k in ("base_url", "api_key", "proxy"):
+        if str(cfg.get(k) or "") == str(old_def.get(k) or ""):
+            cfg[k] = new_def.get(k, "")
+    if str(cfg.get("model") or "") == _default_model_for(old_driver):
+        cfg["model"] = _default_model_for(new_driver)
+        old_sft = f"./datasets/sft_{_default_model_for(old_driver)}.jsonl"
+        if str(cfg.get("export_sft") or "") in (old_sft, ""):
+            cfg["export_sft"] = f"./datasets/sft_{cfg['model']}.jsonl"
+
+
 def _shorten(value: str, width: int = 44) -> str:
-    """表格单元格截断（完整值在详情面板展示）。"""
+    """表格单元格截断（完整值在详情面板展示）。
+
+    markup 安全：超宽时先剥掉 rich 标签再截断，避免把 ``[/dim]`` 之类
+    的闭合标签截一半导致终端里漏出裸标记。
+    """
     text = str(value)
-    return text if len(text) <= width else text[: width - 1] + "…"
+    if len(text) <= width:
+        return text
+    plain = _MARKUP_RE.sub("", text)
+    if len(plain) <= width:
+        return plain  # 长度都来自标签：展示纯文本但内容完整
+    return plain[: width - 1] + "…"
 
 
 def _field_display(config: dict[str, Any], key: str, kind: str) -> str:
@@ -900,9 +1007,12 @@ def _field_display(config: dict[str, Any], key: str, kind: str) -> str:
         return "[dim cyan](未配置/启发式)[/dim cyan]"
     if val is None or val == "" or val == []:
         if key.startswith("judge_"):
-            g_tag = global_judge_summary()
-            if g_tag:
-                return f"[dim cyan](沿用全局: {g_tag})[/dim cyan]"
+            if key == "judge_model":
+                g_tag = global_judge_summary()
+                if g_tag:
+                    return f"[dim cyan](沿用全局专家裁判: {g_tag})[/dim cyan]"
+            elif global_judge_summary():
+                return "[dim cyan](沿用全局)[/dim cyan]"
         return "[dim cyan](未配置/默认)[/dim cyan]"
     if kind == "driver":
         return f"{val} [dim]({_DRIVER_LABELS.get(str(val), '')})[/dim]"
@@ -918,6 +1028,10 @@ def _field_display(config: dict[str, Any], key: str, kind: str) -> str:
         return ("[yellow]" + ", ".join(tasks) + "[/yellow] [dim](部分运行)[/dim]") if tasks else "[dim](全部任务)[/dim]"
     if kind == "bool":
         return "[green]✔ 开启[/green]" if val else "[dim]✖ 关闭[/dim]"
+    if kind == "upstream":
+        if str(val) == "continue":
+            return "[yellow]跳过继续[/yellow] [dim](中断题记 ABORTED，不记 0 分)[/dim]"
+        return "[green]暂停队列[/green] [dim](中断题不计分，可 --continue-run 续跑)[/dim]"
     if kind == "path_opt":
         return str(val)
     return str(val)
@@ -941,14 +1055,19 @@ def _field_plain(config: dict[str, Any], key: str, kind: str) -> str:
         return ",".join(tasks) if tasks else "(全部任务)"
     if val is None or val == "" or val == []:
         if key.startswith("judge_"):
-            g_tag = global_judge_summary()
-            if g_tag:
-                return f"(沿用全局: {g_tag})"
+            if key == "judge_model":
+                g_tag = global_judge_summary()
+                if g_tag:
+                    return f"(沿用全局专家裁判: {g_tag})"
+            elif global_judge_summary():
+                return "(沿用全局)"
         return "(未配置/默认)"
     if kind == "suites":
         return ",".join(str(s) for s in val)
     if kind == "bool":
         return "开启" if val else "关闭"
+    if kind == "upstream":
+        return "跳过继续 (continue)" if str(val) == "continue" else "暂停队列 (pause)"
     return str(val)
 
 
@@ -1068,7 +1187,23 @@ def _edit_field_value(config: dict[str, Any], key: str, kind: str, label: str,
         return True
     if kind == "bool":
         new = questionary.confirm(f"是否开启 [{label}]?", default=bool(current), style=CUSTOM_STYLE).ask()
+        if new is None:
+            return False
         config[key] = bool(new)
+        return True
+    if kind == "upstream":
+        new = questionary.select(
+            "上游故障（5xx / 密钥冷却 / 超时）中断任务时如何处理?",
+            choices=[
+                Choice("暂停整个队列（推荐：中断题不计分，可 --continue-run 续跑）", value="pause"),
+                Choice("跳过继续跑后续任务（中断题记入 ABORTED，不记 0 分）", value="continue"),
+            ],
+            default=str(current or "pause"),
+            style=CUSTOM_STYLE,
+        ).ask()
+        if new is None:
+            return False
+        config[key] = new
         return True
     if kind == "path_opt":
         enable = questionary.confirm(f"是否启用 [{label}]?", default=bool(current), style=CUSTOM_STYLE).ask()
@@ -1099,18 +1234,28 @@ def _edit_field_value(config: dict[str, Any], key: str, kind: str, label: str,
     return True
 
 
-def edit_config_table(profile_name: str, config: dict[str, Any]) -> dict[str, Any] | None:
-    """表格化 master-detail 预设编辑器。
+def edit_config_table(
+    profile_name: str | None,
+    config: dict[str, Any],
+    *,
+    create_mode: bool = False,
+) -> dict[str, Any] | None:
+    """表格化 master-detail 配置编辑器（新建与编辑共用同一入口）。
 
     总览表 + 选中行展开详情面板 + 原地修改，替代逐项 wizard 重走。
-    返回更新后的 config；放弃修改返回 None。
+    返回更新后的 config；放弃修改返回 None。create_mode 下驱动切换会
+    联动刷新仍处于旧驱动默认值的连接字段；预设命名与落盘由调用方负责。
     """
-    nav_push(f"编辑预设:{profile_name}")
+    nav_push("新建配置" if create_mode else f"编辑配置:{profile_name}")
     try:
         working = json.loads(json.dumps(config))  # 深拷贝，放弃时不污染原配置
         while True:
-            table = Table(title=f"[bold green]⚙️ 预设 [{profile_name}] · 表格化编辑[/bold green]",
-                          border_style="cyan", show_lines=False)
+            title = (
+                "[bold green]🆕 新建运行配置 · 表格化编辑[/bold green]"
+                if create_mode else
+                f"[bold green]⚙️ 预设 [{profile_name}] · 表格化编辑[/bold green]"
+            )
+            table = Table(title=title, border_style="cyan", show_lines=False)
             table.add_column("#", style="dim", width=4, justify="right")
             table.add_column("属性", style="bold white", width=14)
             table.add_column("当前值", style="cyan", overflow="fold")
@@ -1138,382 +1283,14 @@ def edit_config_table(profile_name: str, config: dict[str, Any]) -> dict[str, An
                 return working
             # field
             spec = next(s for s in _CONFIG_FIELDS if s[0] == target)
+            prev_driver = working.get("driver")
             _edit_field_value(working, spec[0], spec[2], spec[1])
+            if create_mode and spec[0] == "driver":
+                _swap_driver_defaults(working, str(prev_driver or ""), str(working.get("driver") or ""))
     finally:
         nav_pop()
 
 
-def configure_wizard(
-    initial_config: dict[str, Any] | None = None,
-    profile_name: str | None = None,
-) -> dict[str, Any] | None:
-    """交互向导：配置厂商协议、密钥、套件、专家裁判和运行参数。
-
-    每个 select/checkbox 步骤都提供"放弃本次配置"返回项；
-    文本输入步骤回车保留默认；全程可 Ctrl+C 安全回主菜单。
-    放弃时返回 None（调用方负责落回上级菜单）。
-    """
-    init = initial_config or {}
-    is_editing = initial_config is not None
-
-    if is_editing:
-        console.print(f"\n[bold yellow]>>> 正在编辑预设: {profile_name} (直接回车保留原有值)[/bold yellow]")
-    else:
-        console.print("\n[dim]💡 新建向导：每个选择步骤都可随时放弃返回主菜单；文本输入回车保留默认值；全程可 Ctrl+C 安全回主菜单。[/dim]")
-
-    console.print("\n[bold cyan]>>> 第 1 步：选择模型协议驱动[/bold cyan]")
-
-    driver_choices = [
-        Choice("OpenAI 兼容协议 (DeepSeek / Qwen / Moonshot / OpenAI / vLLM)", value="openai"),
-        Choice("OpenAI Responses 协议 (仅 Response 接口的推理模型)", value="response"),
-        Choice("Google Gemini (官方 google-genai 2.x SDK 原生协议)", value="google"),
-        Choice("Anthropic Claude (官方 anthropic SDK 原生协议)", value="anthropic"),
-        Choice("本地 Agent CLI (调起本地命令行 Subagent 子进程)", value="cli"),
-        Choice("本地离线 Mock (无需网络和密钥，用于流水线校验)", value="mock"),
-        WIZARD_ABORT_CHOICE,
-    ]
-
-    default_driver = init.get("driver", "openai")
-    driver = questionary.select(
-        "请选择被测协议驱动 (Protocol Driver):",
-        choices=driver_choices,
-        default=default_driver,
-        style=CUSTOM_STYLE,
-    ).ask()
-    if driver == WIZARD_ABORT or driver is None:
-        return None
-
-    console.print("\n[bold cyan]>>> 第 2 步：配置模型标识与网络连接[/bold cyan]")
-
-    default_model = init.get("model")
-    if not default_model:
-        if driver == "openai":
-            default_model = "deepseek-chat"
-        elif driver == "response":
-            default_model = "gpt-5-mini"
-        elif driver == "google":
-            default_model = "gemini-2.0-flash"
-        elif driver == "anthropic":
-            default_model = "claude-3-7-sonnet-20250219"
-        elif driver == "mock":
-            default_model = "mock-model"
-        elif driver == "cli":
-            default_model = "local-agent"
-
-    model_id = questionary.text(
-        "输入模型唯一标识 (Model ID):",
-        default=default_model,
-        style=CUSTOM_STYLE,
-    ).ask().strip()
-
-    base_url = ""
-    api_key = ""
-    proxy = ""
-
-    default_base_url = init.get("base_url")
-    if default_base_url is None:
-        if driver in ("openai", "response"):
-            default_base_url = os.environ.get("OPENAI_BASE_URL", "https://api.deepseek.com/v1")
-        elif driver == "anthropic":
-            default_base_url = os.environ.get("ANTHROPIC_BASE_URL", "")
-        elif driver == "google":
-            default_base_url = os.environ.get("GEMINI_BASE_URL", "")
-
-    if driver in ("openai", "response", "google", "anthropic"):
-        base_url = questionary.text(
-            "API Base URL (留空使用官方默认，支持自定义反代/中转):",
-            default=default_base_url or "",
-            style=CUSTOM_STYLE,
-        ).ask().strip()
-
-    if driver in ("openai", "response", "google", "anthropic"):
-        current_env_key = init.get("api_key") or ""
-        if not current_env_key:
-            if driver in ("openai", "response"):
-                current_env_key = os.environ.get("OPENAI_API_KEY", "")
-            elif driver == "google":
-                current_env_key = os.environ.get("GEMINI_API_KEY", "")
-            elif driver == "anthropic":
-                current_env_key = os.environ.get("ANTHROPIC_API_KEY", "")
-
-        key_prompt = "输入 API Key (输入时隐藏):"
-        if current_env_key:
-            key_prompt = f"输入 API Key (已检测到现有密钥，回车沿用 {mask_key(current_env_key)}):"
-
-        entered_key = questionary.password(
-            key_prompt,
-            style=CUSTOM_STYLE,
-        ).ask()
-
-        api_key = entered_key.strip() if entered_key.strip() else current_env_key
-
-        default_proxy = init.get("proxy")
-        if default_proxy is None:
-            default_proxy = "http://127.0.0.1:10808" if driver in ("google", "anthropic") else ""
-
-        proxy = questionary.text(
-            "HTTP 网络代理 (留空不走代理，如本地科学上网):",
-            default=default_proxy or "",
-            style=CUSTOM_STYLE,
-        ).ask().strip()
-
-    # 推理思考强度选择 (Reasoning Effort / Thinking Budget)
-    default_effort = init.get("effort")
-    effort = questionary.select(
-        "思考链推理强度 (Reasoning Effort / Thinking Budget):",
-        choices=[
-            Choice("默认 / 厂商默认 (omit, vendor default)", value=None),
-            Choice("关闭 (none)", value="none"),
-            Choice("最小 (minimal · 部分网关不支持，将自动降至 low)", value="minimal"),
-            Choice("低 (low)", value="low"),
-            Choice("中 (medium)", value="medium"),
-            Choice("高 (high)", value="high"),
-            Choice("超高 (xhigh)", value="xhigh"),
-            Choice("极限 (max)", value="max"),
-            WIZARD_ABORT_CHOICE,
-        ],
-        default=default_effort,
-        style=CUSTOM_STYLE,
-    ).ask()
-    if effort == WIZARD_ABORT:
-        return None
-
-    console.print("\n[bold cyan]>>> 第 3 步：勾选本次运行的评测套件[/bold cyan]")
-
-    default_suites = set(init.get("suites", list(DEFAULT_TUI_KEYS)))
-    selected_suites = questionary.checkbox(
-        "选择要评测的维度 (空格选择，Enter 确认):",
-        choices=[
-            Choice(item.title, value=item.key, checked=item.key in default_suites)
-            for item in RUNNABLES
-        ] + [WIZARD_ABORT_CHOICE],
-        style=CUSTOM_STYLE,
-    ).ask()
-
-    if selected_suites and WIZARD_ABORT in selected_suites:
-        return None
-    if not selected_suites:
-        selected_suites = [DEFAULT_ALL_KEYS[0]]
-
-    # 第 3.5 步：可选的任务级细化（只跑套件内的部分题目）
-    selected_tasks: list[str] = []
-    scoped_suites = [s for s in selected_suites if s in ("short", "short_b", "long", "long_b", "reviewer", "critic")]
-    if scoped_suites:
-        narrowed = questionary.confirm(
-            "是否只跑选定套件内的部分题目 (任务级细化)?",
-            default=False,
-            style=CUSTOM_STYLE,
-        ).ask()
-        if narrowed:
-            from benchmark_v3.bench_harness.core.run_manifest import known_task_ids
-
-            _available = known_task_ids()
-            task_choices = []
-            for s in scoped_suites:
-                for t in _available.get(s, []):
-                    task_choices.append(Choice(f"{s} / {t}", value=t))
-            picked_tasks = questionary.checkbox(
-                "选择要运行的任务 (空格多选；留空=该套件全跑):",
-                choices=task_choices,
-                style=CUSTOM_STYLE,
-            ).ask() or []
-            selected_tasks = sorted(set(picked_tasks))
-            if selected_tasks:
-                console.print(
-                    "[yellow]✔ 已限定任务: %s（仅这些题会被执行，其余保留旧分）[/yellow]"
-                    % ", ".join(selected_tasks)
-                )
-
-    console.print("\n[bold cyan]>>> 第 4 步：运行容灾与微调数据集导出[/bold cyan]")
-
-    enable_resume = questionary.confirm(
-        "是否启用断点续跑 (--resume，崩溃时从单轮快照原地恢复)?",
-        default=init.get("resume", True),
-        style=CUSTOM_STYLE,
-    ).ask()
-
-    on_upstream_error = questionary.select(
-        "上游故障（5xx / 密钥冷却 / 超时）导致任务中断时如何处理?",
-        choices=[
-            Choice("暂停整个队列（推荐：中断的任务不计分，可用 --continue-run 续跑）", value="pause"),
-            Choice("跳过继续跑后续任务（每道中断题记入 ABORTED，不会记 0 分）", value="continue"),
-        ],
-        default=init.get("on_upstream_error", "pause"),
-        style=CUSTOM_STYLE,
-    ).ask()
-    if on_upstream_error is None:
-        return None
-    on_upstream_error = on_upstream_error or "pause"
-
-    export_sft = questionary.confirm(
-        "是否自动导出 SFT 黄金微调数据集 (Pass@1 满分样本)?",
-        default=bool(init.get("export_sft", True)),
-        style=CUSTOM_STYLE,
-    ).ask()
-
-    sft_path = ""
-    if export_sft:
-        sft_path = questionary.text(
-            "SFT 数据集导出路径:",
-            default=init.get("export_sft") or f"./datasets/sft_{model_id}.jsonl",
-            style=CUSTOM_STYLE,
-        ).ask().strip()
-
-    export_dpo = questionary.confirm(
-        "是否导出 RL/DPO 偏好对数据集 (含失败里程碑归因)?",
-        default=bool(init.get("export_dpo", False)),
-        style=CUSTOM_STYLE,
-    ).ask()
-
-    dpo_path = ""
-    if export_dpo:
-        dpo_path = questionary.text(
-            "DPO 偏好对数据集导出路径:",
-            default=init.get("export_dpo") or f"./datasets/dpo_{model_id}.jsonl",
-            style=CUSTOM_STYLE,
-        ).ask().strip()
-
-    console.print("\n[bold cyan]>>> 第 5 步：配置独立专家裁判模型 (Judge Model for Critic)[/bold cyan]")
-    global_judge_cfg = load_judge_config() or {}
-    global_judge_model = str(global_judge_cfg.get("model") or "").strip()
-    g_tag = global_judge_summary()
-
-    judge_mode_choices: list[Choice] = []
-    if g_tag:
-        judge_mode_choices.append(
-            Choice(f"🌐 使用当前全局专家裁判 ({g_tag})", value="global")
-        )
-    judge_mode_choices.extend([
-        Choice("为本配置单独填写裁判模型", value="custom"),
-        Choice("不单独配置（运行时若有全局裁判则自动沿用，否则启发式）", value="inherit"),
-        WIZARD_ABORT_CHOICE,
-    ])
-    if init.get("judge_model"):
-        default_judge_mode = "custom"
-    elif global_judge_model:
-        default_judge_mode = "global"
-    else:
-        default_judge_mode = "inherit"
-
-    judge_mode = questionary.select(
-        "裁判模型来源:",
-        choices=judge_mode_choices,
-        default=default_judge_mode,
-        style=CUSTOM_STYLE,
-    ).ask()
-    if judge_mode == WIZARD_ABORT or judge_mode is None:
-        return None
-
-    judge_model = ""
-    judge_driver = ""
-    judge_base_url = ""
-    judge_api_key = ""
-    judge_effort = None
-
-    if judge_mode == "global":
-        console.print(f"[dim]✔ 本次运行将沿用全局专家裁判: {g_tag}[/dim]")
-    elif judge_mode == "custom":
-        judge_driver = questionary.select(
-            "裁判模型协议驱动 (Judge Protocol Driver):",
-            choices=[
-                Choice("沿用当前被测驱动 (Same as Tested Driver)", value=driver),
-                Choice("OpenAI 兼容协议 (DeepSeek / Qwen / OpenAI / Kimi)", value="openai"),
-                Choice("OpenAI Responses 协议 (仅 Response 接口)", value="response"),
-                Choice("Google Gemini (Gemini 2.0 Flash / Pro)", value="google"),
-                Choice("Anthropic Claude (Claude 3.7 Sonnet)", value="anthropic"),
-                WIZARD_ABORT_CHOICE,
-            ],
-            default=init.get("judge_driver", driver),
-            style=CUSTOM_STYLE,
-        ).ask()
-        if judge_driver == WIZARD_ABORT:
-            return None
-
-        judge_model = questionary.text(
-            "裁判模型标识 (Judge Model ID, 建议使用强推理模型如 k3-max / o3-mini / claude-3-7-sonnet):",
-            default=init.get("judge_model", "k3-max"),
-            style=CUSTOM_STYLE,
-        ).ask().strip()
-
-        diff_creds = questionary.confirm(
-            "裁判模型是否使用独立的 Base URL / API Key (回车默认沿用主配置)?",
-            default=bool(init.get("judge_base_url") or init.get("judge_api_key")),
-            style=CUSTOM_STYLE,
-        ).ask()
-
-        if diff_creds:
-            judge_base_url = questionary.text(
-                "裁判模型 Base URL:",
-                default=init.get("judge_base_url", ""),
-                style=CUSTOM_STYLE,
-            ).ask().strip()
-            judge_api_key = questionary.password(
-                "裁判模型 API Key:",
-                style=CUSTOM_STYLE,
-            ).ask().strip()
-
-        judge_effort = questionary.select(
-            "裁判模型思考强度 (Judge Reasoning Effort):",
-            choices=[
-                Choice("高 (high)", value="high"),
-                Choice("超高 (xhigh)", value="xhigh"),
-                Choice("极限 (max)", value="max"),
-                Choice("中 (medium)", value="medium"),
-                Choice("最小 (minimal)", value="minimal"),
-                Choice("关闭 (none)", value="none"),
-                Choice("默认 (omit / vendor default)", value=None),
-                WIZARD_ABORT_CHOICE,
-            ],
-            default=init.get("judge_effort", "high"),
-            style=CUSTOM_STYLE,
-        ).ask()
-        if judge_effort == WIZARD_ABORT:
-            return None
-    else:
-        console.print("[dim]✔ 未单独配置裁判；有全局专家裁判时运行将自动沿用。[/dim]")
-
-    config = {
-        "driver": driver,
-        "model": model_id,
-        "base_url": base_url,
-        "api_key": api_key,
-        "proxy": proxy,
-        "effort": effort,
-        "suites": selected_suites,
-        "tasks": selected_tasks,
-        "on_upstream_error": on_upstream_error,
-        "resume": enable_resume,
-        "export_sft": sft_path,
-        "export_dpo": dpo_path,
-        "judge_model": judge_model,
-        "judge_driver": judge_driver,
-        "judge_base_url": judge_base_url,
-        "judge_api_key": judge_api_key,
-        "judge_effort": judge_effort,
-    }
-
-    # 询问是否保存或更新预设
-    save_prompt = "是否将本次配置更新保存到预设?" if is_editing else "是否将本次配置保存为本地预设 (下次可直接一键载入)?"
-    save_it = questionary.confirm(
-        save_prompt,
-        default=True,
-        style=CUSTOM_STYLE,
-    ).ask()
-
-    if save_it:
-        default_pname = profile_name or f"{driver}_{model_id.replace(':', '_')}"
-        saved_name = questionary.text(
-            "输入预设名称 (例如 deepseek_official / gemini_local):",
-            default=default_pname,
-            style=CUSTOM_STYLE,
-        ).ask().strip()
-        if saved_name:
-            profiles = load_profiles()
-            profiles[saved_name] = config
-            save_profiles(profiles)
-            console.print(f"[green]✔ 已更新保存预设配置: {saved_name} (安全存储于 .bench_profiles.json)[/green]")
-
-    return config
 
 
 def display_launch_card(config: dict[str, Any]) -> bool:
