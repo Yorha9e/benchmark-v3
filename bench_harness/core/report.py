@@ -635,6 +635,11 @@ class MasterLeaderboard:
                         f"/{int(slot.get('milestones_total', 0))}"
                     ),
                     "total_tokens": tokens_i,
+                    "run_count": int(slot.get("run_count", 1) or 1),
+                    "best_reward": (
+                        float(slot["best_reward"])
+                        if slot.get("best_reward") is not None else None
+                    ),
                     "capability_index": float(entry.get("capability_index", 0.0) or 0.0),
                     "run_dir": str(slot.get("run_dir", "")),
                     "updated_at": str(slot.get("updated_at", "")),

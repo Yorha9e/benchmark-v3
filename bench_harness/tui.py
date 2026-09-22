@@ -352,7 +352,8 @@ def render_master_board() -> None:
     table = Table(
         title=(
             "[bold gold1]🏆 全维度权威总榜[/bold gold1]\n"
-            "[dim]综合指数 = 已得评分点 / 总数；B 里程碑加进同一池（满测 116）[/dim]"
+            "[dim]综合指数 = 已得评分点 / 总数；B 里程碑按 0.2 权重折算（满测 76 有效分）[/dim]\n"
+            "[dim]Succ/Mtok = 每百万 Token 换来的有效评分点，越高越省；同一槽位多次运行取均值[/dim]"
         ),
         border_style="yellow",
     )
@@ -362,12 +363,16 @@ def render_master_board() -> None:
     table.add_column("综合指数", justify="right")
     table.add_column("评分点", justify="center")
     table.add_column("覆盖", justify="center")
+    table.add_column("运行数", justify="center")
     table.add_column("Token", justify="right")
+    table.add_column("Succ/Mtok", justify="right", style="green")
     for i, item in enumerate(entries):
         cap = float(item.get("capability_index", 0.0) or 0.0)
         pts_p = item.get("scoring_points_passed", 0)
         pts_t = item.get("scoring_points_total", 66)
         tokens = item.get("total_tokens", 0)
+        succ = float(item.get("succ_per_mtok", 0.0) or 0.0)
+        runs_n = item.get("run_count_total", 0)
         table.add_row(
             medals[i] if i < 3 else str(i + 1),
             str(item.get("model_id", "?")),
@@ -375,7 +380,9 @@ def render_master_board() -> None:
             f"{cap:.1f} / 100",
             f"{pts_p}/{pts_t}",
             str(item.get("tasks_covered", "-")),
+            str(runs_n) if runs_n else "-",
             f"{tokens:,}",
+            f"{succ:.2f}" if succ else "-",
         )
     console.print(table)
     console.print("[dim]完整 Markdown（含各任务重排表）见 LEADERBOARD.md[/dim]\n")
@@ -404,18 +411,21 @@ def render_task_board(task_id: str, condition: str = "a") -> None:
             table.add_column("驱动·强度", style="cyan")
             table.add_column("该任务得分", justify="right")
             table.add_column("通过", justify="center")
+            table.add_column("运行数", justify="center")
             table.add_column("综合指数(同行)", justify="right")
             table.add_column("Token", justify="right")
             table.add_column("更新时间", style="dim")
             medals = _board_medals()
             for i, r in enumerate(rows):
                 tokens = r["total_tokens"]
+                rc = r.get("run_count", 1) or 1
                 table.add_row(
                     medals[i] if i < 3 else str(i + 1),
                     str(r["model_id"]),
                     f"{r['driver']}·{r['effort']}",
                     MasterLeaderboard.format_slot_reward(task_id, r["reward"]),
                     "✔" if r["passed"] else "✖",
+                    str(rc) if rc > 1 else "-",
                     f"{r['capability_index']:.1f}",
                     f"{tokens:,}" if tokens is not None else "-",
                     str(r.get("updated_at") or "")[:10],
