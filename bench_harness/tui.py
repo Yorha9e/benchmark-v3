@@ -345,9 +345,13 @@ def _board_medals() -> list[str]:
 
 def _fmt_tokens_short(value: Any) -> str:
     """Compact token count for dense tables (mirrors report._fmt_tokens_short)."""
+    if value is None:
+        return "-"
     try:
         v = float(value or 0)
     except (TypeError, ValueError):
+        return "-"
+    if v <= 0:
         return "-"
     if v >= 1_000_000:
         return f"{v / 1_000_000:.1f}M"
@@ -456,7 +460,7 @@ def render_task_board(task_id: str, condition: str = "a") -> None:
     MasterLeaderboard = _load_master_board()
     rows = MasterLeaderboard.task_board(task_id, condition=condition)
     label = task_id if condition == "a" else f"{task_id}@{condition}"
-    nav_push(f"task:{label}")
+    nav_push(f"任务榜 · {label}")
     try:
         console.print()
         if not rows:
@@ -508,7 +512,7 @@ def render_suite_board(suite: str) -> None:
     MasterLeaderboard = _load_master_board()
     rows = MasterLeaderboard.suite_board(suite)
     scale = "/100" if suite == "critic" else f"/{len(MasterLeaderboard.SUITE_TASKS.get(suite, ()))}"
-    nav_push(f"suite:{suite}")
+    nav_push(f"套件榜 · {suite}")
     try:
         console.print()
         if not rows:
@@ -744,33 +748,36 @@ def profile_picker() -> dict[str, Any] | None:
         profiles = load_profiles()
         choices: list[Choice | questionary.Separator] = []
 
+        choices.append(questionary.Separator("── 🚀 发起评测 ──"))
         if profiles:
-            choices.append(questionary.Separator("── 已保存的模型预设 ──"))
             for name, cfg in profiles.items():
                 driver = cfg.get("driver", "openai")
                 model = cfg.get("model", "unknown")
                 effort_tag = f" | effort={cfg['effort']}" if cfg.get("effort") else ""
                 choices.append(Choice(f"[Preset] {name}  [{driver} -> {model}{effort_tag}]", value=("load", name)))
-            choices.append(questionary.Separator("── 任务与操作 ──"))
-
         choices.append(Choice("[+] 新建运行配置 (Create New Configuration)", value=("new", None)))
-        if profiles:
-            choices.append(Choice("[E] 编辑已有预设 (Edit Existing Profile)", value=("edit", None)))
 
         from benchmark_v3.bench_harness.core.run_manifest import list_incomplete_runs
 
         incomplete_n = len(list_incomplete_runs())
         cont_tag = f" [{incomplete_n} 个未完成]" if incomplete_n else ""
+
+        choices.append(questionary.Separator("── 📊 查看与继续 ──"))
         choices.append(Choice(f"[C] 继续未完成的测评 (Continue Paused Run){cont_tag}", value=("continue", None)))
+        choices.append(Choice("[L] 查看全局权威总榜 (Master Leaderboard)", value=("leaderboard", None)))
+        choices.append(Choice("[V] 查看最近一次评测汇总报告 (Latest Report)", value=("view", None)))
 
         global_judge = load_judge_config()
         j_tag = f" [当前: {global_judge['model']} ({global_judge.get('driver')})]" if global_judge.get("model") else " [未配置/默认启发式]"
-        choices.append(Choice(f"[J] 配置全局专家裁判模型 (Default Judge){j_tag}", value=("judge", None)))
 
-        choices.append(Choice("[V] 查看最近一次评测汇总报告 (View Latest Report)", value=("view", None)))
-        choices.append(Choice("[L] 查看全局权威总榜 (View Master Leaderboard)", value=("leaderboard", None)))
+        choices.append(questionary.Separator("── ⚙️ 配置管理 ──"))
+        if profiles:
+            choices.append(Choice("[E] 编辑已有预设 (Edit Existing Profile)", value=("edit", None)))
+        choices.append(Choice(f"[J] 配置全局专家裁判模型 (Default Judge){j_tag}", value=("judge", None)))
         if profiles:
             choices.append(Choice("[-] 管理/删除已有预设 (Manage Profiles)", value=("manage", None)))
+
+        choices.append(questionary.Separator("── ──"))
         choices.append(Choice("[Q] 退出评测应用 (Exit Application)", value=("exit", None)))
 
         picked_action = questionary.select(
@@ -1145,7 +1152,7 @@ def _edit_field_value(config: dict[str, Any], key: str, kind: str, label: str,
         return True
     if kind == "effort":
         opts = [("", "默认 (厂商默认)")] + [
-            (v, _EFFORT_LABELS[v])
+            (v, _EFFORT_LABELS[v] + ("（部分网关不支持，将自动降至 low）" if v == "minimal" else ""))
             for v in ("none", "minimal", "low", "medium", "high", "xhigh", "max")
         ]
         new = questionary.select("思考强度:", choices=[Choice(t, value=v) for v, t in opts],
@@ -1246,7 +1253,7 @@ def edit_config_table(
     返回更新后的 config；放弃修改返回 None。create_mode 下驱动切换会
     联动刷新仍处于旧驱动默认值的连接字段；预设命名与落盘由调用方负责。
     """
-    nav_push("新建配置" if create_mode else f"编辑配置:{profile_name}")
+    nav_push("新建配置" if create_mode else f"预设配置 · {profile_name}")
     try:
         working = json.loads(json.dumps(config))  # 深拷贝，放弃时不污染原配置
         while True:
@@ -1521,5 +1528,89 @@ def run_tui() -> int:
                 return 0
 
 
+def self_test() -> tuple[int, int]:
+    """Headless TUI checks: markup safety, seed/swap, table shells, menus.
+
+    Stubs ``questionary.select`` so the interactive editors run end-to-end
+    without a TTY; never touches ``.bench_profiles.json`` / ``.bench_judge.json``
+    (the table editors return configs without saving — callers persist).
+    """
+    counts = [0, 0]
+
+    def check(name: str, cond: bool) -> None:
+        counts[0 if cond else 1] += 1
+        print(f"{'PASS' if cond else 'FAIL'} tui::{name}", flush=True)
+
+    # --- markup-safe cell truncation (regression: literal [/dim] leak) ---
+    long_upstream = _field_display({"on_upstream_error": "pause"},
+                                   "on_upstream_error", "upstream")
+    check("shorten_strips_markup_when_truncating",
+          "[/dim]" not in _shorten(long_upstream, 20)
+          and "[" not in _shorten(long_upstream, 20) or _shorten(long_upstream, 20).startswith("暂停"))
+    check("shorten_keeps_short_values",
+          _shorten("abc", 10) == "abc" and _shorten("abcdefghijk", 6).endswith("…"))
+
+    # --- create-mode seed + driver swap ---
+    seed = _seed_new_config()
+    check("seed_defaults_openai",
+          seed["driver"] == "openai" and seed["model"] == "deepseek-chat"
+          and seed["on_upstream_error"] == "pause" and seed["resume"] is True)
+    g = json.loads(json.dumps(seed))
+    _swap_driver_defaults(g, "openai", "google")
+    check("swap_to_google_seeds_connection",
+          g["model"] == "gemini-2.0-flash" and g["proxy"] == "http://127.0.0.1:10808"
+          and g["export_sft"].endswith("sft_gemini-2.0-flash.jsonl"))
+    m = json.loads(json.dumps(seed))
+    _swap_driver_defaults(m, "openai", "mock")
+    check("swap_to_mock_clears_connection",
+          m["model"] == "mock-model" and m["base_url"] == "" and m["proxy"] == "")
+    m2 = json.loads(json.dumps(seed))
+    m2["base_url"] = "http://my-gateway/v1"  # user-edited: must survive a swap
+    _swap_driver_defaults(m2, "openai", "google")
+    check("swap_keeps_user_edited_base_url", m2["base_url"] == "http://my-gateway/v1")
+
+    # --- display helpers ---
+    check("fmt_tokens_short",
+          _fmt_tokens_short(1_234_567) == "1.2M" and _fmt_tokens_short(45_600) == "46k"
+          and _fmt_tokens_short(None) == "-")
+    check("field_display_upstream",
+          "暂停" in long_upstream and "跳过" in _field_display(
+              {"on_upstream_error": "continue"}, "on_upstream_error", "upstream"))
+
+    # --- table shell driven headless: open driver field, switch, abort ---
+    real_select = questionary.select
+    steps = iter([("field", "driver"), "google", ("abort", None)])
+
+    class _Ans:
+        def __init__(self, v: Any) -> None:
+            self.v = v
+
+        def ask(self) -> Any:
+            return self.v
+
+    def _fake_select(prompt: str, choices: Any = None, **_: Any) -> Any:
+        return _Ans(next(steps))
+
+    try:
+        questionary.select = _fake_select
+        out = edit_config_table(None, _seed_new_config(), create_mode=True)
+        check("create_mode_abort_returns_none", out is None)
+    finally:
+        questionary.select = real_select
+
+    # --- grouped main menu builds and exits ---
+    try:
+        questionary.select = lambda prompt, choices=None, **kw: _Ans(("exit", None))
+        check("profile_picker_exit_returns_none", profile_picker() is None)
+    finally:
+        questionary.select = real_select
+
+    return counts[0], counts[1]
+
+
 if __name__ == "__main__":
+    if "--self-test" in sys.argv:
+        _p, _f = self_test()
+        print(f"tui self-test: {_p} passed, {_f} failed", flush=True)
+        raise SystemExit(0 if _f == 0 else 1)
     sys.exit(run_tui())
