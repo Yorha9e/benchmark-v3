@@ -935,10 +935,11 @@ def _print_post_run_board(reports: list[Any], quiet: bool = False) -> None:
         return
 
     entries = MasterLeaderboard.sorted_entries()
+    entries = [e for e in entries if e.get("coverage_full")]
     table = Table(
         title=(
-            "[bold green]🏆 全维度权威总榜[/bold green]\n"
-            "[dim]综合指数 = 已得评分点 / 总数；B 里程碑加进同一池（满测 116）[/dim]"
+            "[bold green]🏆 全维度权威总榜（仅列全量模型）[/bold green]\n"
+            "[dim]综合指数 = 四套件等权任务均分，B 套件按 0.2 掺入：(A+0.2·B)/1.2[/dim]"
         ),
         border_style="yellow",
     )
@@ -946,23 +947,19 @@ def _print_post_run_board(reports: list[Any], quiet: bool = False) -> None:
     table.add_column("模型", style="bold white")
     table.add_column("驱动·强度", style="cyan")
     table.add_column("综合指数", justify="right")
-    table.add_column("评分点", justify="center")
     table.add_column("覆盖", justify="center")
     table.add_column("Token", justify="right")
     if not entries:
-        console.print("\n[yellow]总榜暂无数据。[/yellow]\n")
+        console.print("\n[yellow]总榜暂无全量模型数据。[/yellow]\n")
         return
     for i, item in enumerate(entries):
         cap = float(item.get("capability_index", 0.0) or 0.0)
-        pts_p = item.get("scoring_points_passed", 0)
-        pts_t = item.get("scoring_points_total", 66)
         tokens = item.get("total_tokens", 0)
         table.add_row(
             _MEDALS[i] if i < 3 else str(i + 1),
             str(item.get("model_id", "?")),
             f"{item.get('driver', '?')}·{item.get('effort', 'default')}",
             f"{cap:.1f} / 100",
-            f"{pts_p}/{pts_t}",
             str(item.get("tasks_covered", "-")),
             f"{tokens:,}",
         )

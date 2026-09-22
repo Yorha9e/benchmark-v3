@@ -343,17 +343,25 @@ def _board_medals() -> list[str]:
 def render_master_board() -> None:
     """Render the master ranking from leaderboard.json (same source as MD)."""
     MasterLeaderboard = _load_master_board()
-    entries = MasterLeaderboard.sorted_entries()
+    ranked = MasterLeaderboard.sorted_entries()
+    entries = [e for e in ranked if e.get("coverage_full")]
+    partial = [e for e in ranked if not e.get("coverage_full")]
     console.print()
-    if not entries:
+    if not entries and not partial:
         console.print("[yellow]总榜暂无数据，请先运行一次评测。[/yellow]\n")
         return
     medals = _board_medals()
+
+    def _suite_cols(item: Any) -> tuple[str, ...]:
+        return tuple(str(item.get(f, "-")) for f in (
+            "short_score", "short_b_score", "reviewer_score",
+            "long_score", "long_b_score", "critic_score"))
+
     table = Table(
         title=(
-            "[bold gold1]🏆 全维度权威总榜[/bold gold1]\n"
-            "[dim]综合指数 = 已得评分点 / 总数；B 里程碑按 0.2 权重折算（满测 76 有效分）[/dim]\n"
-            "[dim]Succ/Mtok = 每百万 Token 换来的有效评分点，越高越省；同一槽位多次运行取均值[/dim]"
+            "[bold gold1]🏆 全维度权威总榜（仅列全量模型）[/bold gold1]\n"
+            "[dim]综合指数 = 四套件等权任务均分，B 套件按 0.2 掺入：(A+0.2·B)/1.2[/dim]\n"
+            "[dim]Succ/Mtok = 每百万 Token 换来的综合指数点，越高越省；同一槽位多次运行取均值[/dim]"
         ),
         border_style="yellow",
     )
@@ -361,30 +369,58 @@ def render_master_board() -> None:
     table.add_column("模型", style="bold white")
     table.add_column("驱动·强度", style="cyan")
     table.add_column("综合指数", justify="right")
-    table.add_column("评分点", justify="center")
-    table.add_column("覆盖", justify="center")
+    for name in ("short", "short_b", "reviewer", "long", "long_b", "critic"):
+        table.add_column(name, justify="right")
+    table.add_column("增益", justify="right")
     table.add_column("运行数", justify="center")
     table.add_column("Token", justify="right")
     table.add_column("Succ/Mtok", justify="right", style="green")
     for i, item in enumerate(entries):
         cap = float(item.get("capability_index", 0.0) or 0.0)
-        pts_p = item.get("scoring_points_passed", 0)
-        pts_t = item.get("scoring_points_total", 66)
         tokens = item.get("total_tokens", 0)
         succ = float(item.get("succ_per_mtok", 0.0) or 0.0)
         runs_n = item.get("run_count_total", 0)
+        gain = item.get("follow_gain")
+        gain_s = f"{gain:+.2f}" if gain is not None else "-"
         table.add_row(
             medals[i] if i < 3 else str(i + 1),
             str(item.get("model_id", "?")),
             f"{item.get('driver', '?')}·{item.get('effort', 'default')}",
             f"{cap:.1f} / 100",
-            f"{pts_p}/{pts_t}",
-            str(item.get("tasks_covered", "-")),
+            *_suite_cols(item),
+            gain_s,
             str(runs_n) if runs_n else "-",
             f"{tokens:,}",
             f"{succ:.2f}" if succ else "-",
         )
-    console.print(table)
+    if entries:
+        console.print(table)
+    if partial:
+        console.print()
+        ptable = Table(
+            title=(
+                "[bold yellow]⚠️ 未完成模型（缺槽，暂不参与综合排名）[/bold yellow]\n"
+                "[dim]缺跑的往往是难题套件，按均分掺入会系统性虚高；跑齐后自动进入上方总榜[/dim]"
+            ),
+            border_style="yellow",
+        )
+        ptable.add_column("模型", style="bold white")
+        ptable.add_column("驱动·强度", style="cyan")
+        for name in ("short", "short_b", "reviewer", "long", "long_b", "critic"):
+            ptable.add_column(name, justify="right")
+        ptable.add_column("缺失槽位", style="dim")
+        for item in partial:
+            missing = item.get("coverage_missing") or []
+            miss_s = "、".join(str(m) for m in missing[:4])
+            if len(missing) > 4:
+                miss_s += f" 等{len(missing)}项"
+            ptable.add_row(
+                str(item.get("model_id", "?")),
+                f"{item.get('driver', '?')}·{item.get('effort', 'default')}",
+                *_suite_cols(item),
+                miss_s or "-",
+            )
+        console.print(ptable)
     console.print("[dim]完整 Markdown（含各任务重排表）见 LEADERBOARD.md[/dim]\n")
 
 
@@ -454,7 +490,7 @@ def render_suite_board(suite: str) -> None:
             table = Table(
                 title=(
                     f"[bold green]📊 suite board · {suite}（槽位合计 {scale}）[/bold green]\n"
-                    "[dim]同源总榜，按该套件已存槽位求和后重排[/dim]"
+                    "[dim]同源总榜，按该套件已存槽位求和后重排；均分列 = 该套件任务均分（综合指数同口径）[/dim]"
                 ),
                 border_style="green",
             )
@@ -462,6 +498,7 @@ def render_suite_board(suite: str) -> None:
             table.add_column("模型", style="bold white")
             table.add_column("驱动·强度", style="cyan")
             table.add_column("槽位合计", style="bold green", justify="right")
+            table.add_column("均分", justify="right")
             table.add_column("里程碑", justify="center")
             table.add_column("综合指数(同行)", justify="right")
             table.add_column("Token", justify="right")
@@ -471,11 +508,14 @@ def render_suite_board(suite: str) -> None:
                 name = f"{r['model_id']} [dim](legacy)[/dim]" if r.get("legacy") else r["model_id"]
                 cap = r.get("capability_index")
                 cap_s = f"{float(cap):.1f}" if cap is not None else "-"
+                pct = r.get("suite_pct")
+                pct_s = f"{float(pct):.1f}" if pct is not None else "-"
                 table.add_row(
                     medals[i] if i < 3 else str(i + 1),
                     name,
                     f"{r['driver']}·{r['effort']}",
                     f"{'✔' if r['passed'] else '✖'} {r['reward']}",
+                    pct_s,
                     r["milestones"],
                     cap_s,
                     f"{r['total_tokens']:,}" if r["total_tokens"] is not None else "-",
