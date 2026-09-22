@@ -314,6 +314,7 @@ class MasterLeaderboard:
             "milestones_passed": sum(1 for m in milestones if m.passed),
             "milestones_total": len(milestones),
             "total_tokens": int(report.token_metrics.total_tokens),
+            "completion_tokens": int(report.token_metrics.completion_tokens),
             "wall_seconds": float(getattr(report.telemetry, "wall_time_seconds", 0.0) or 0.0),
             "driver": driver,
             "run_dir": str(output_dir) if output_dir else "",
@@ -360,6 +361,7 @@ class MasterLeaderboard:
                 "reward": cur.get("reward"),
                 "milestones_passed": cur.get("milestones_passed"),
                 "total_tokens": cur.get("total_tokens"),
+                "completion_tokens": cur.get("completion_tokens"),
                 "wall_seconds": cur.get("wall_seconds"),
                 "run_dir": cur.get("run_dir", ""),
                 "updated_at": cur.get("updated_at", ""),
@@ -371,6 +373,9 @@ class MasterLeaderboard:
             "total_tokens": int(
                 res["total_tokens"] if res.get("total_tokens") is not None
                 else (cur.get("total_tokens") or 0)),
+            "completion_tokens": int(
+                res["completion_tokens"] if res.get("completion_tokens") is not None
+                else (cur.get("completion_tokens") or 0)),
             "wall_seconds": float(
                 res["wall_seconds"] if res.get("wall_seconds") is not None
                 else (cur.get("wall_seconds") or 0.0)),
@@ -392,6 +397,8 @@ class MasterLeaderboard:
         cur["milestones_passed"] = mean_ms
         cur["total_tokens"] = int(round(
             sum(int(r.get("total_tokens", 0) or 0) for r in runs) / n))
+        cur["completion_tokens"] = int(round(
+            sum(int(r.get("completion_tokens", 0) or 0) for r in runs) / n))
         cur["wall_seconds"] = round(
             sum(float(r.get("wall_seconds", 0.0) or 0.0) for r in runs) / n, 1)
         # passed 随均值口径重算：里程碑均值打满才算通过
@@ -548,8 +555,15 @@ class MasterLeaderboard:
         # buys its milestones with 10M-token tasks can't hide behind a high
         # capability percentage.
         wall = sum(float(s.get("wall_seconds", 0.0) or 0.0) for s in a_slots + b_slots)
+        completion = sum(int(s.get("completion_tokens", 0) or 0) for s in a_slots + b_slots)
         entry["total_wall_seconds"] = round(wall, 1)
+        entry["completion_tokens_total"] = completion
+        # tps 是“总 token 吞吐”——agent 循环每轮重发整个对话，该值被上下文档
+        # 重发主宰，不是模型速度；gen_tps 才是真实生成速度（榜单展示用）。
         entry["tps"] = round(entry["total_tokens"] / wall, 1) if wall else 0.0
+        entry["gen_tps"] = round(completion / wall, 1) if wall else 0.0
+        entry["completion_share"] = (
+            round(completion / entry["total_tokens"] * 100.0, 1) if entry["total_tokens"] else 0.0)
         ms_p = a_p + b_p
         entry["tokens_per_assertion"] = int(entry["total_tokens"] / ms_p) if ms_p else 0
         entry["succ_per_hour"] = (
@@ -830,14 +844,14 @@ class MasterLeaderboard:
             f"> **最新更新**: `{now_str}`  ",
             "> **能力分（综合指数）**: 四套件等权——short / reviewer / long / critic 各取**任务均分**，B 套件（short_b / long_b）按权重 `0.2` 掺入：`(A + 0.2·B) / 1.2`；critic 已折算到 0~1  ",
             "> **调整指数（排名依据）**: `能力分 / clamp(成本C, 0.5, 3)^0.5`——能力与效率的几何平均。C = 各槽位 token 与耗时按跨模型中位数归一后的均值（1.0 = 中位）；clamp 到 3 倍保证再浪费也不会分数断层  ",
-            "> **成本遥测**: `TPS` = 总 token / 真实总耗时（逐槽遥测聚合，非单次运行）；`tok/断言` = 总 token / 通过断言数——力大飞砖的直接证据  ",
+            "> **成本遥测**: `生成TPS` = completion token / 真实总耗时（真实生成速度；总 token 吞吐被每轮重发的上下文档主宰，仅存 JSON 不作展示）；`tok/断言` = 总 token / 通过断言数——力大飞砖的直接证据  ",
             "> **入榜条件**: 9 个 A 槽 + 5 个 B 槽全部齐全（`coverage_full`）；缺槽模型见文末附表，**不参与综合排名**  ",
             "> **遵循增益**: 同任务 `(B−A)` 奖励均值；正值=吃到脚手架红利，零/负=给菜谱也白给  ",
             "> **合并口径**: 每模型每档 effort 的各任务槽位记录**全部运行历史**，榜单展示**均值**（非最好分）  ",
             "> **效率维度**: `Succ/Mtok` = 能力分 / 百万 Token；`Succ/h` = 能力分 / 真实小时，越高越省  ",
             "> **分任务榜**: 同源 `leaderboard.json`，按该任务槽位重排；**不是**独立计分表  ",
             "",
-            "| 排名 | 模型标识 (Model ID) | 驱动 / 思考强度 | 调整指数 | 能力分 | short | short_b | reviewer | long | long_b | critic | 成本C | TPS | tok/断言 | Token | Succ/Mtok | 耗时 | 增益 | 制品 |",
+            "| 排名 | 模型标识 (Model ID) | 驱动 / 思考强度 | 调整指数 | 能力分 | short | short_b | reviewer | long | long_b | critic | 成本C | 生成TPS | tok/断言 | Token | Succ/Mtok | 耗时 | 增益 | 制品 |",
             "| :---: | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | ---: | ---: | ---: | ---: | ---: | :---: | :---: |",
         ]
 
@@ -853,7 +867,7 @@ class MasterLeaderboard:
             tokens = item.get("total_tokens", 0)
             succ = item.get("succ_per_mtok", 0.0)
             cost = float(item.get("cost_ratio", 1.0) or 1.0)
-            tps = float(item.get("tps", 0.0) or 0.0)
+            tps = float(item.get("gen_tps", 0.0) or 0.0)
             tpa = item.get("tokens_per_assertion", 0)
             wall_h = float(item.get("total_wall_seconds", 0.0) or 0.0) / 3600.0
             r_dir = item.get("run_dir", "")
@@ -879,7 +893,7 @@ class MasterLeaderboard:
             )
             lines.append("")
             lines.append(
-                "| 模型标识 (Model ID) | 驱动 / 思考强度 | short | short_b | reviewer | long | long_b | critic | 成本C | TPS | tok/断言 | Token | 缺失槽位 |"
+                "| 模型标识 (Model ID) | 驱动 / 思考强度 | short | short_b | reviewer | long | long_b | critic | 成本C | 生成TPS | tok/断言 | Token | 缺失槽位 |"
             )
             lines.append(
                 "| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | ---: | ---: | ---: | :--- |"
@@ -896,7 +910,7 @@ class MasterLeaderboard:
                     f"`{item.get('reviewer_score', '-')}` | `{item.get('long_score', '-')}` | "
                     f"`{item.get('long_b_score', '-')}` | `{item.get('critic_score', '-')}` | "
                     f"`{float(item.get('cost_ratio', 1.0) or 1.0):.2f}` | "
-                    f"`{float(item.get('tps', 0.0) or 0.0):,.0f}` | "
+                    f"`{float(item.get('gen_tps', 0.0) or 0.0):,.0f}` | "
                     f"`{_fmt_tokens_short(item.get('tokens_per_assertion', 0))}` | "
                     f"`{item.get('total_tokens', 0):,}` | {miss_s or '-'} |"
                 )
@@ -1309,6 +1323,7 @@ def self_test() -> tuple[int, int]:
         for k, s in src["tasks"].items():
             slot = dict(s)
             slot["total_tokens"] = int(s.get("total_tokens", 10)) * factor
+            slot["completion_tokens"] = int(s.get("completion_tokens", 1)) * factor
             slot["wall_seconds"] = float(s.get("wall_seconds", 1.0)) * factor
             row["tasks"][k] = slot
         return row
@@ -1339,6 +1354,16 @@ def self_test() -> tuple[int, int]:
     check("tps_and_tokens_per_assertion",
           cheap["tokens_per_assertion"] > 0 and cheap["tps"] > 0
           and pricey["tokens_per_assertion"] > cheap["tokens_per_assertion"])
+    # gen_tps = completion / wall (real generation speed); the total-token
+    # tps is context-resend throughput and must dwarf it.
+    check("gen_tps_is_completion_over_wall",
+          abs(float(cheap["gen_tps"])
+              - cheap["completion_tokens_total"] / cheap["total_wall_seconds"]) < 0.2
+          and float(cheap["tps"]) > float(cheap["gen_tps"]))
+    check("completion_share_pct",
+          0 < float(cheap["completion_share"]) < 100
+          and abs(float(cheap["completion_share"])
+                  - cheap["completion_tokens_total"] / cheap["total_tokens"] * 100) < 0.2)
     check("fmt_tokens_short",
           _fmt_tokens_short(1_234_567) == "1.2M"
           and _fmt_tokens_short(45_600) == "46k"
@@ -1352,9 +1377,11 @@ def self_test() -> tuple[int, int]:
         "varint_parser": {
             "task_id": "varint_parser", "condition": "a", "reward": 0.5,
             "passed": False, "milestones_passed": 5, "milestones_total": 10,
-            "total_tokens": 1234, "wall_seconds": 56.7, "run_count": 1,
+            "total_tokens": 1234, "completion_tokens": 321,
+            "wall_seconds": 56.7, "run_count": 1,
             "runs": [{"reward": 0.5, "milestones_passed": 5,
-                      "total_tokens": 1234, "wall_seconds": 56.7,
+                      "total_tokens": 1234, "completion_tokens": 321,
+                      "wall_seconds": 56.7,
                       "run_dir": "r1", "updated_at": "t1"}],
             "run_dir": "r1", "updated_at": "t1"}}}}
     MasterLeaderboard.record_run(
@@ -1362,7 +1389,8 @@ def self_test() -> tuple[int, int]:
         {"reward": 0.9, "milestones_passed": 9, "milestones_total": 10}, "r1")
     slot_i = inherit["m@default"]["tasks"]["varint_parser"]
     check("record_run_inherits_telemetry",
-          slot_i["total_tokens"] == 1234 and abs(slot_i["wall_seconds"] - 56.7) < 0.01)
+          slot_i["total_tokens"] == 1234 and abs(slot_i["wall_seconds"] - 56.7) < 0.01
+          and slot_i["completion_tokens"] == 321)
 
     # ---- persistence: locked partial-merge save (uses tmp CWD) ----------
     import contextlib

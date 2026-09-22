@@ -952,7 +952,7 @@ def _print_post_run_board(reports: list[Any], quiet: bool = False) -> None:
     table.add_column("调整指数", justify="right")
     table.add_column("能力分", justify="right")
     table.add_column("成本C", justify="right")
-    table.add_column("TPS", justify="right")
+    table.add_column("生成TPS", justify="right")
     table.add_column("tok/断言", justify="right")
     table.add_column("Token", justify="right")
     if not entries:
@@ -963,7 +963,7 @@ def _print_post_run_board(reports: list[Any], quiet: bool = False) -> None:
         cap = float(item.get("capability_index", 0.0) or 0.0)
         tokens = item.get("total_tokens", 0)
         cost = float(item.get("cost_ratio", 1.0) or 1.0)
-        tps = float(item.get("tps", 0.0) or 0.0)
+        tps = float(item.get("gen_tps", 0.0) or 0.0)
         tpa = item.get("tokens_per_assertion", 0)
         table.add_row(
             _MEDALS[i] if i < 3 else str(i + 1),

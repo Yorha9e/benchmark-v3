@@ -381,7 +381,7 @@ def render_master_board() -> None:
         title=(
             "[bold gold1]🏆 全维度权威总榜（仅列全量模型）[/bold gold1]\n"
             "[dim]调整指数 = 能力分 / clamp(成本C,0.5,3)^0.5（能力×效率几何平均）；能力分为同源 v2 口径参考列[/dim]\n"
-            "[dim]TPS = 总token/真实总耗时；tok/断言 = 总token/通过断言数（力大飞砖证据）；同槽多次运行取均值[/dim]"
+            "[dim]生成TPS = completion token/真实总耗时（真实生成速度）；tok/断言 = 总token/通过断言数（力大飞砖证据）[/dim]"
         ),
         border_style="yellow",
     )
@@ -393,7 +393,7 @@ def render_master_board() -> None:
     for name in ("short", "short_b", "reviewer", "long", "long_b", "critic"):
         table.add_column(name, justify="right")
     table.add_column("成本C", justify="right")
-    table.add_column("TPS", justify="right")
+    table.add_column("生成TPS", justify="right")
     table.add_column("tok/断言", justify="right")
     table.add_column("Token", justify="right")
     table.add_column("Succ/Mtok", justify="right", style="green")
@@ -403,7 +403,7 @@ def render_master_board() -> None:
         tokens = item.get("total_tokens", 0)
         succ = float(item.get("succ_per_mtok", 0.0) or 0.0)
         cost = float(item.get("cost_ratio", 1.0) or 1.0)
-        tps = float(item.get("tps", 0.0) or 0.0)
+        tps = float(item.get("gen_tps", 0.0) or 0.0)
         tpa = item.get("tokens_per_assertion", 0)
         table.add_row(
             medals[i] if i < 3 else str(i + 1),
@@ -434,7 +434,7 @@ def render_master_board() -> None:
         for name in ("short", "short_b", "reviewer", "long", "long_b", "critic"):
             ptable.add_column(name, justify="right")
         ptable.add_column("成本C", justify="right")
-        ptable.add_column("TPS", justify="right")
+        ptable.add_column("生成TPS", justify="right")
         ptable.add_column("tok/断言", justify="right")
         ptable.add_column("缺失槽位", style="dim")
         for item in partial:
@@ -447,7 +447,7 @@ def render_master_board() -> None:
                 f"{item.get('driver', '?')}·{item.get('effort', 'default')}",
                 *_suite_cols(item),
                 f"{float(item.get('cost_ratio', 1.0) or 1.0):.2f}",
-                f"{float(item.get('tps', 0.0) or 0.0):,.0f}",
+                f"{float(item.get('gen_tps', 0.0) or 0.0):,.0f}",
                 _fmt_tokens_short(item.get("tokens_per_assertion", 0)),
                 miss_s or "-",
             )
