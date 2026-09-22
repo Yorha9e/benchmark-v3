@@ -394,8 +394,9 @@ def _run_rescore(wanted: set[str]) -> int:
             new_reward = new_res["reward"]
             if abs(new_reward - old_reward) > 0.001:
                 changes.append((model_key, slot_key, old_reward, new_reward))
-            slot.update(new_res)
-            slot["updated_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+            # 并入该 run_dir 的运行历史（就地替换同一次运行），保持均值口径
+            MasterLeaderboard.record_run(
+                data, model_key, slot_key, new_res, str(run_dir))
         MasterLeaderboard._recompute_aggregates(entry)
 
     MasterLeaderboard.save_data(data)

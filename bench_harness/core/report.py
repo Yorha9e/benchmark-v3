@@ -294,6 +294,78 @@ class MasterLeaderboard:
         }
 
     @classmethod
+    def record_run(
+        cls,
+        data: dict[str, Any],
+        model_key: str,
+        slot_key: str,
+        res: dict[str, Any],
+        run_dir: str = "",
+    ) -> None:
+        """Fold one run (or rescore) result into the slot history, in place.
+
+        v3 起槽位采用**均值口径**：同一 (模型, 任务, 条件) 的每一次运行都进入
+        ``runs`` 历史，榜单展示所有运行的**平均值**，而非最好那一次。单次跑分
+        方差可达 2~6 个百分点，取最大值会系统性高估模型能力；取均值同时天然
+        压低虚高分数、拉大模型间区分度。
+
+        ``run_dir`` 相同的记录就地替换，因此对同一次运行做离线复算不会重复
+        计数。旧槽位没有 ``runs`` 时，用当前展示值合成一条历史再并入。
+        """
+        entry = data.get(model_key)
+        if not isinstance(entry, dict):
+            entry = {"model_id": model_key.rsplit("@", 1)[0], "tasks": {}}
+            data[model_key] = entry
+        tasks = entry.get("tasks")
+        if not isinstance(tasks, dict):
+            tasks = {}
+            entry["tasks"] = tasks
+
+        cur = dict(tasks.get(slot_key)) if isinstance(tasks.get(slot_key), dict) else {}
+
+        runs = cur.get("runs")
+        if not isinstance(runs, list):
+            runs = []
+        if not runs and cur.get("reward") is not None:
+            runs = [{
+                "reward": cur.get("reward"),
+                "milestones_passed": cur.get("milestones_passed"),
+                "total_tokens": cur.get("total_tokens"),
+                "run_dir": cur.get("run_dir", ""),
+                "updated_at": cur.get("updated_at", ""),
+            }]
+
+        rec = {
+            "reward": float(res.get("reward", 0.0) or 0.0),
+            "milestones_passed": int(res.get("milestones_passed", 0) or 0),
+            "total_tokens": int(res.get("total_tokens", 0) or 0),
+            "run_dir": str(run_dir or ""),
+            "updated_at": _utc_now_iso(),
+        }
+        dedupe = str(run_dir or rec["updated_at"])
+        runs = [r for r in runs if isinstance(r, dict)
+                and str(r.get("run_dir") or r.get("updated_at") or "") != dedupe]
+        runs.append(rec)
+
+        cur.update({k: v for k, v in res.items() if k != "runs"})
+        cur["runs"] = runs
+        n = len(runs)
+        cur["run_count"] = n
+        cur["best_reward"] = round(max(float(r.get("reward", 0.0) or 0.0) for r in runs), 3)
+        cur["reward"] = round(sum(float(r.get("reward", 0.0) or 0.0) for r in runs) / n, 3)
+        mean_ms = int(round(sum(int(r.get("milestones_passed", 0) or 0) for r in runs) / n))
+        cur["milestones_passed"] = mean_ms
+        cur["total_tokens"] = int(round(
+            sum(int(r.get("total_tokens", 0) or 0) for r in runs) / n))
+        # passed 随均值口径重算：里程碑均值打满才算通过
+        mt = int(cur.get("milestones_total", 0) or 0)
+        cur["passed"] = bool(mt) and mean_ms >= mt
+        cur["run_dir"] = str(run_dir or cur.get("run_dir", ""))
+        cur["updated_at"] = rec["updated_at"]
+        tasks[slot_key] = cur
+        cls._recompute_aggregates(entry)
+
+    @classmethod
     def _recompute_aggregates(cls, entry: dict[str, Any]) -> None:
         """Recompute entry-level aggregates from stored task slots (in place).
 
@@ -356,6 +428,12 @@ class MasterLeaderboard:
         entry["scoring_points_pct"] = round(eff_p / eff_t * 100.0, 1) if eff_t else 0.0
         entry["capability_index"] = entry["scoring_points_pct"]
         entry["total_tokens"] = sum(int(s.get("total_tokens", 0)) for s in a_slots + b_slots)
+        # 效率维度：每百万 token 换来的有效评分点（Succ/Mtok），越高越省。
+        # 与综合指数并列展示——前者答「能不能做对」，后者答「多贵的代价做对」。
+        _tok = int(entry["total_tokens"] or 0)
+        entry["succ_per_mtok"] = round(eff_p / (_tok / 1_000_000.0), 2) if _tok else 0.0
+        entry["tokens_per_point"] = int(_tok / eff_p) if eff_p else 0
+        entry["run_count_total"] = sum(int(s.get("run_count", 1) or 1) for s in a_slots + b_slots)
         entry["a_scoring_points_passed"] = a_p
         entry["a_scoring_points_total"] = a_t
         for family, field in cls.SUITE_SCORE_FIELDS.items():
@@ -402,15 +480,12 @@ class MasterLeaderboard:
     ) -> Path:
         """Merge a completed run into the master leaderboard.
 
-        Reports are decomposed into per-task best slots: a slot is replaced
-        only when the new reward meets or beats the stored one, so partial
-        (single-task) reruns accumulate instead of wiping the row.
+        每次运行都会并入该槽位的 ``runs`` 历史，榜单展示**所有运行的均值**
+        （不再是历史最好分）。单次跑分方差可达 2~6 个百分点，取最大值会系统性
+        高估模型能力；均值同时压低虚高分数、拉大模型间区分度。
 
-        ``on_regress`` governs regressed slots (new reward strictly below
-        the stored best): ``"keep-best"`` (default) silently keeps the
-        stored slot, ``"overwrite"`` always replaces, ``"ask"`` delegates to
-        ``ask_fn(scope, old_slot, new_slot) -> bool`` (True = overwrite;
-        a missing/false answer keeps the best, never blocks headless runs).
+        ``run_dir`` 相同的记录就地替换，因此对同一次运行的离线复算不会重复
+        计数。``on_regress=="ask"`` 时，用户可拒绝把某次已知的坏运行计入均值。
         """
         cls._bind_catalog()
         if not reports:
@@ -464,18 +539,18 @@ class MasterLeaderboard:
                 # B slots use task@b so they never clobber the A task slot.
                 slot_key = task_id if condition == "a" else f"{task_id}@{condition}"
                 new_slot = cls._slot_from_report(report, driver, output_dir)
-                old_slot = entry["tasks"].get(slot_key)
-                if old_slot is None:
-                    entry["tasks"][slot_key] = new_slot
+                old_slot = entry.get("tasks", {}).get(slot_key)
+                # 均值口径：每次运行都并入历史。on_regress=="ask" 且用户明确
+                # 拒绝记录本次退步运行时才跳过（用于排除已知的坏运行）。
+                is_regress = (
+                    isinstance(old_slot, dict)
+                    and float(new_slot.get("reward", 0.0)) + cls.REWARD_EPS
+                    < float(old_slot.get("reward", 0.0))
+                )
+                if is_regress and decisions.get(slot_key) is False:
                     continue
-                new_r = float(new_slot.get("reward", 0.0))
-                old_r = float(old_slot.get("reward", 0.0))
-                if new_r + cls.REWARD_EPS >= old_r:
-                    entry["tasks"][slot_key] = new_slot
-                    continue
-                overwrite = on_regress == "overwrite" or decisions.get(slot_key, False)
-                if overwrite:
-                    entry["tasks"][slot_key] = new_slot
+                cls.record_run(data, entry_key, slot_key, new_slot,
+                               str(output_dir or ""))
 
             cls._recompute_aggregates(entry)
             entry["wall_time_seconds"] = round(wall_time, 1)
@@ -593,11 +668,12 @@ class MasterLeaderboard:
             "> **综合指数**: `有效得分 / 有效总数 × 100`（和通过率同一口径）  ",
             "> **遵循增益**: 同任务 `(B−A)` 奖励均值；正值=吃到脚手架红利，零/负=给菜谱也白给  ",
             "> **总榜排序**: 综合指数降序 ➔ 评分点通过率降序 ➔ Token 消耗升序  ",
-            "> **合并口径**: 每模型每档 effort 保留各分任务历史最高分；A/B 槽位互不覆盖  ",
+            "> **合并口径**: 每模型每档 effort 的各任务槽位记录**全部运行历史**，榜单展示**均值**（非最好分）  ",
+            "> **效率维度**: `Succ/Mtok` = 有效评分点 / 百万 Token，越高越省；与综合指数并列阅读  ",
             "> **分任务榜**: 同源 `leaderboard.json`，按该任务槽位重排；**不是**独立计分表  ",
             "",
-            "| 排名 | 模型标识 (Model ID) | 驱动 / 思考强度 | 综合指数 | 评分点 | 覆盖 | 遵循增益 | critic (/100) | reviewer (/3) | short A (/3) | short B (/3) | long A (/2) | long B (/2) | Token | 耗时 | 制品 |",
-            "| :---: | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | ---: | ---: | :---: |",
+            "| 排名 | 模型标识 (Model ID) | 驱动 / 思考强度 | 综合指数 | 评分点 | 覆盖 | 运行数 | 遵循增益 | critic (/100) | reviewer (/3) | short A (/3) | short B (/3) | long A (/2) | long B (/2) | Token | Succ/Mtok | 耗时 | 制品 |",
+            "| :---: | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | ---: | ---: | ---: | :---: |",
         ]
 
         for i, item in enumerate(sorted_entries):
@@ -619,15 +695,17 @@ class MasterLeaderboard:
             lg_sc = item.get("long_score", "-")
             lg_b = item.get("long_b_score", "-")
             tokens = item.get("total_tokens", 0)
+            succ = item.get("succ_per_mtok", 0.0)
+            runs_n = item.get("run_count_total", 0)
             wt = item.get("wall_time_seconds", 0.0)
             r_dir = item.get("run_dir", "")
             link = f"[查看日志]({r_dir})" if r_dir else "-"
 
             lines.append(
                 f"| {rank_str} | **`{m_id}`** | `{drv}` · `{eff}` | **`{cap:.1f} / 100`** | "
-                f"**`{pts_p}/{pts_t}`** (`{pts_pct:.1f}%`) | `{covered}` | `{gain_s}` | "
+                f"**`{pts_p}/{pts_t}`** (`{pts_pct:.1f}%`) | `{covered}` | `{runs_n}` | `{gain_s}` | "
                 f"`{c_sc}` | `{rev_sc}` | `{sh_sc}` | `{sh_b}` | `{lg_sc}` | `{lg_b}` | "
-                f"`{tokens:,}` | `{wt:.1f}s` | {link} |"
+                f"`{tokens:,}` | **`{succ:.2f}`** | `{wt:.1f}s` | {link} |"
             )
 
         lines.append("")
