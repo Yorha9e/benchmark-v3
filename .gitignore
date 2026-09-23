@@ -6,3 +6,23 @@ bench_runs/
 datasets/
 LATEST_SUMMARY.md
 .bench_judge.json
+
+# Python bytecode & environments (inherited from the monorepo root rules)
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+env/
+.pytest_cache/
+
+# Agent session folders
+.kimi-code/
+.zcode/
+
+# Raw test execution runs & mutants / fixtures / templates (inherited)
+**/runs/
+**/mutants/
+**/evaluations/
+**/fixtures/
+**/template/
+**/supplemental/

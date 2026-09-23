@@ -17,7 +17,10 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-sys.path.insert(0, "D:/vscode/kimisubagentexplore/subagentbenchmark")
+# Repo root (parent of this package dir) — computed, never hardcoded.
+_REPO_ROOT = str(Path(__file__).resolve().parent.parent)
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 from benchmark_v3.bench_harness.core.report import MasterLeaderboard
 from benchmark_v3.bench_harness.suites.critic import (
