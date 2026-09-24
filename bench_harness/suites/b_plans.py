@@ -115,6 +115,46 @@ S5. Robustness: test unknown macro name and unclosed macro syntax (both emit
     `ERROR` tokens); test cyclic macro dependency (must raise `ValueError`),
     then `finish`.
 """,
+    "order_fulfillment": _HEADER + """
+## Order
+1. `read` `TASK.md`. The API surface, the state machine, the delivery spool
+   rules and the durability requirement there are binding. Implement exactly
+   that API in `fulfillment.py` (stdlib only) — no extra module files.
+2. Data model: keep one lock (`threading.RLock`) guarding every mutating
+   method. Hold `on_hand: {sku: qty}`, `orders: {order_id: order}`,
+   `by_idem: {idem_key: order_id}`, `payments: {pay_idem: {order_id, ok}}`,
+   `spool: {order_id: entry}`, `dlq: {order_id: entry}`. Entry shape:
+   `{"order_id", "attempts", "last_attempt_at"}`.
+3. `create_order`: validate first (empty lines / qty<=0 / unknown sku raise
+   `ValueError`), then check `by_idem` — a replay returns the stored order
+   view untouched. Assign ids from a monotonic counter, not randomness.
+4. `reserve`: compute per-sku need, check `available == on_hand - committed`
+   where committed sums the lines of every order in RESERVED/PAID/FULFILLED/
+   SHIPPED state — paid stock must stay locked. Reject atomically: check all
+   lines before mutating anything (no partial reservation).
+5. `sweep_expired(now)`: cancel RESERVED orders with
+   `now >= reserved_at + ttl`; cancelled orders release their stock
+   automatically because committed no longer counts them.
+6. `pay`: look up `payments[idem_key]` first — a replay returns the recorded
+   outcome without calling the gateway again. Otherwise require state
+   RESERVED, call `gateway.charge` exactly once, and on False cancel the
+   order (stock releases by the same committed rule).
+7. `fulfill`/`ship`: enforce the state machine — PAID before FULFILLED,
+   FULFILLED before SHIPPED; ship puts the order into `spool`.
+8. `deliver_next(now)`: pick the first spool entry with
+   `last_attempt_at is None or now >= last_attempt_at + backoff`. Increment
+   attempts, stamp `last_attempt_at = now`, call the delivery gateway once.
+   Success: mark DELIVERED and drop from spool. `attempts == max_attempts`:
+   move to `dlq`. `redrive_dlq` resets attempts and returns entries to spool.
+9. Durability: every mutating method rewrites the whole state to
+   `journal_path` via a temp file + `os.replace` (atomic). `__init__` loads
+   it when the file exists — orders, spool attempts and dlq must survive a
+   kill exactly.
+10. Self-check before `finish`: run a scripted pass over create (with replay),
+    reserve (including an insufficient one), a failing payment, ship with a
+    failing gateway until the entry dead-letters, then redrive and deliver;
+    then reopen the service from the journal and confirm the states match.
+""",
     "raft_cluster": _HEADER + """
 ## Order
 1. `read` `TASK.md`. The process command line form, mailbox envelope shape,

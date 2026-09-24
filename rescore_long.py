@@ -43,7 +43,11 @@ from benchmark_v3.bench_harness.suites.long_task import (
     run_saga_scenario,
 )
 
-CODE_FILE = {"raft_cluster": "raft.py", "saga_coordinator": "saga.py"}
+CODE_FILE = {
+    "raft_cluster": "raft.py",
+    "saga_coordinator": "saga.py",
+    "order_fulfillment": "fulfillment.py",
+}
 
 
 def find_workspace(run_dir: Path, suite: str, task_id: str) -> Path | None:
@@ -65,7 +69,13 @@ def rescore_long(task_id: str, ws_dir: Path) -> dict:
     with tempfile.TemporaryDirectory(prefix="rescore-long-") as tmp:
         isolated = Path(tmp)
         shutil.copyfile(src, isolated / fname)
-        if task_id == "raft_cluster":
+        if task_id == "order_fulfillment":
+            from benchmark_v3.bench_harness.suites.business_task import (
+                build_fulfillment_milestones, run_fulfillment_scenario,
+            )
+            data = run_fulfillment_scenario(isolated)
+            milestones = build_fulfillment_milestones(data)
+        elif task_id == "raft_cluster":
             data = run_raft_scenario(isolated, seed=7)
             milestones = build_raft_milestones(data)
         else:
