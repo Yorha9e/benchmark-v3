@@ -201,7 +201,7 @@ GROUND_TRUTH: list[dict[str, Any]] = [
     {
         "file": "pixel_blend.py",
         "marker": "dst[start_x + i] = (dst[start_x + i] + pixel) // 2",
-        "category_aliases": ("bound", "overflow", "oob", "index", "range"),
+        "category_aliases": ("bound", "overflow", "oob", "index", "range", "offbyone", "off-by-one"),
         "keywords": ("bound", "check", "index", "range", "start_x"),
         "severity": "medium",
     },

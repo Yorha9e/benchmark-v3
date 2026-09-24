@@ -9,6 +9,25 @@
 
 ---
 
+## 〇、机械召回判据 (Mechanical Recall Criteria)
+
+裁判在比对"候选发现 ↔ GT 缺陷"时使用以下**纯机械规则**，不依赖语义理解。
+跨审查者/跨模型的复现性以此为准：
+
+1. **行号容差**：`LINE_TOLERANCE = 3`——候选 `line` 与 GT `marker` 实际行号
+   相差 ≤3 即算命中（`critic.py:59`）。
+2. **category 匹配**：候选 category 与 GT category（或其 `category_aliases`
+   别名集）做**双向 ≥4 字符公共前缀**匹配（`critic.py:248-255`）。例如
+   `off-by-one` 与别名 `offbyone` 互为前缀 → 命中；但 `off-by-one` 与
+   `bound/overflow/oob/index/range` 无 ≥4 字符前缀重合 → **不命中**，因此
+   用 off-by-one 类别的正确答案仍会丢该缺陷的召回分，别名集必须显式包含
+   `offbyone`。
+3. **severity 不参与召回**：recall 只校验 file/line/category 三要素，
+   GT 的 severity 字段不参与匹配（填错 severity 不影响召回分）。
+4. **诱饵文件的发现**先整体剔除（`critic.py:322`），再进入召回匹配。
+
+---
+
 # 题目一：`session_tokens.py`（时序侧信道与凭证预测）
 
 ### 1. 源码切片与缺陷定位
@@ -43,7 +62,7 @@ def make_guest_token(user):
   - **采用 `time.sleep(random.uniform(...))` 人工加噪声**（统计均值滤波可轻易消除噪声）。
 - **降级项（最高只给 L2，扣除生产级修复分）**：
   - **裸 SHA-256 `==` 比对**：`sha256(p).digest() == sha256(e).digest()`。CPython 底层的 `bytes.__eq__` 依然是短路 `memcmp`，且传入未编码的 `str` 会直接导致 `TypeError` 崩溃。
-  - **纯 Python 手写位运算循环**：无法规避虚拟机字节码求值中断、小整数缓存与垃圾回收抖动。
+  - **纯 Python 手写位运算循环**：无法规避虚拟机字节码求值中断与解释器迭代开销（`zip` 每次迭代还要分配 tuple），测量噪声仍可被统计滤波剥离。
 
 ### 4. L4 生产级终极修复标准 (Gold Standard)
 ```python
@@ -51,9 +70,15 @@ import hmac
 
 def check_session_token(presented: str, expected: str) -> bool:
     """生产级安全实现：依赖 CPython 底层 _tscmp 无分支机器指令"""
-    # 严格前置类型校验，防止未捕获异常引发 DoS
-    if not (isinstance(presented, str) and isinstance(expected, str)):
+    # 前置类型校验挡住 str/bytes 混用；但 compare_digest 对**非 ASCII**
+    # str 仍会抛 TypeError，不可信输入必须先归一为 bytes（或捕获异常
+    # 返回 False），否则畸形 Unicode 仍是未捕获异常 DoS 面。
+    if not (isinstance(presented, (str, bytes)) and isinstance(expected, (str, bytes))):
         return False
+    if isinstance(presented, str):
+        presented = presented.encode("utf-8")
+    if isinstance(expected, str):
+        expected = expected.encode("utf-8")
     # 调用原子级常数时间比对
     return hmac.compare_digest(presented, expected)
 ```
@@ -81,14 +106,13 @@ def import_pack(member_name, data):
 ```
 
 ### 2. 威胁机理与底层全景 (Threat Mechanics)
-1. **相对路径穿越 (Relative Traversal - CWE-22/CWE-23)**：
-   - `os.path.join` 仅为纯词法字符串拼接，不做任何路径规范化。传入 `../../` 会原样保留并透传到底层文件系统。
-2. **绝对路径根目录吞噬 (Absolute Path Discard - CWE-36)**：
-   - **重大暗坑**：根据 POSIX 与 Windows 规范，若第二个参数以 `/`（或 Windows 盘符）开头，`os.path.join` **会直接丢弃前面的所有路径**！
+1. **路径逃逸双通道 (Twin Escape Vectors - CWE-22/CWE-36，并列首要)**：
+   - **相对路径穿越**：`os.path.join` 仅为纯词法字符串拼接（该语义由 Python 的 `posixpath` / `ntpath` 模块规定，而非 POSIX 标准本身），不做任何路径规范化。传入 `../../` 会原样保留并透传到底层文件系统。
+   - **绝对路径根目录吞噬**：若第二个参数以 `/`（或 Windows 盘符）开头，`os.path.join` **会直接丢弃前面的所有路径**——这是唯一无需任何 `..` 即可命中 `/etc/cron.d`、`authorized_keys` 的通道，**利用链上比 `../` 更短**。
    - 例如 `os.path.join("/var/arcade/packs", "/etc/cron.d/pwn")` 返回 `"/etc/cron.d/pwn"`，攻击者无需任何 `..` 即可直接跳出沙箱。
-3. **破坏性写入原语 (Destructive Write Primitive)**：
+2. **破坏性写入原语 (Destructive Write Primitive)**：
    - `open(dest, "wb")` 在目标文件存在时会**无条件清空截断并覆写**，且无 `O_NOFOLLOW` 保护，极易引发软链接劫持与并发 TOCTOU 竞争。
-4. **现实 RCE / 权限提升利用链 (L3 Exploitation Vectors)**：
+3. **现实 RCE / 权限提升利用链 (L3 Exploitation Vectors)**：
    - 覆写 `/root/.ssh/authorized_keys` 实现无密码 root SSH 提权登录；
    - 写入 `/etc/cron.d/pwn` 实现系统定时任务持久化执行（RCE）；
    - 覆写 Python 环境中的 `.pth` 文件或 Web 模板（Jinja2/PHP），在后续请求中触发代码执行。
@@ -126,7 +150,10 @@ def import_pack(member_name: str, data: bytes) -> str:
     except ValueError as e:
         raise ValueError("Cross-drive path detected") from e
 
-    # 4. 原子安全打开：排他创建 + 拒绝跟踪软链接
+    # 4. 原子安全打开：排他创建 + 拒绝跟踪软链接。
+    #    注意 O_EXCL 同时改变了业务语义——目标已存在时由「覆写」变为
+    #    FileExistsError；若契约要求覆盖更新，应改为 temp + os.replace，
+    #    并对替换目标做 realpath 复核。两种取向均为 L4，但必须显式处理。
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
     fd = os.open(dest, flags, 0o600)
     with os.fdopen(fd, "wb") as handle:
@@ -288,7 +315,7 @@ def blend_row(dst, src, start_x):
 ### 3. 伪修复判定与降级清单 (Pseudo-Fix Traps)
 - **一票否决项（直接评 L0/L1，0 分修复分）**：
   - **单侧负数放行陷阱**：`if start_x + len(src) <= len(dst)`。由于未限定 `start_x >= 0`，传入负数（如 `start_x = -10`）时两数之和依然小于 `len(dst)`，负数回绕被全部放行！
-  - **断言式守卫**：使用 `assert start_x >= 0 ...`，在生产环境 `python -O` 下断言被剥离，漏洞原样暴露；
+  - **仅依赖断言的守卫**：把 `assert start_x >= 0` 当作唯一校验（`python -O` 下断言被剥离，漏洞原样暴露）；assert 与其他显式校验并存时不算伪修复；
   - **破坏行宽不变量**：通过 `dst.append()` 动态扩容或切片截断，改变了扫描行固定长度。
 - **降级项（最高只给 L2/L3，扣除生产级修复分）**：
   - **单侧下限守卫**：仅检查 `start_x >= 0`，完全漏掉右侧溢出；
@@ -444,13 +471,58 @@ def unpack(word):
 
 ## 诱饵扣分执行准则 (Bait Deduction Rule)
 
+以下代码块是 `suites/critic.py::_is_defect_claim` 的**权威原文**（人工复核与
+LLM 裁判共用同一口径；文档与实现出现分歧时以本代码块为准）：
+
 ```python
-# 必须为针对诱饵文件的“功能缺陷/安全漏洞 (Severity >= Low 或 Type == Bug)”指控才扣分
-# 纯代码风格建议 (Style/Nit/Info) 不扣分，保护诚实的上下文建议
-if file_name in BAIT_FILES:
-    if severity in ("low", "medium", "high", "critical") or "vuln" in category or "bug" in category:
-        flagged_baits.add(file_name)
+def _is_defect_claim(f: dict) -> bool:
+    sev = str(f.get("severity", "")).strip().lower()
+    cat = str(f.get("category", "")).strip().lower()
+    rc = str(f.get("root_cause", "")).strip().lower()
+    text = f"{cat} {rc}"
+    # 显式说明诱饵代码安全、无缺陷、遵循前置契约时，绝不误扣诱饵分
+    if any(w in text for w in ("safe", "clean", "no defect", "no bug", "no error",
+                               "not a bug", "correct as-is", "preconditions hold")):
+        return False
+    # 第一阶段：信息/风格类 severity 直接豁免。金标准只要求对
+    # 「功能缺陷/漏洞指控」扣分，纯 info/style/nit 的设计备忘不扣分；
+    # 即使 category 里提到了 collision 之类的词根，也只是在做说明。
+    if sev in ("info", "informational", "style", "nit", "note", "notes",
+               "n/a", "na", "none", "null", "unknown", "suggestion", "comment",
+               "minor", "trivial", "cosmetic"):
+        return False
+    # 第二阶段：明确的缺陷/漏洞类别词算缺陷指控。severity 省略时也要
+    # 扣分，否则模型不填 severity 就能对诱饵编造严重漏洞而逃掉扣分。
+    if any(k in cat for k in ("vuln", "bug", "defect", "overflow", "race",
+                              "collision", "security", "error", "flaw")):
+        return True
+    # 第三阶段：按 severity 定性（含 major/blocker/sev1 等常见同义词）
+    return sev in ("low", "medium", "high", "critical",
+                   "major", "blocker", "sev1", "sev2", "sev3", "severe")
 ```
 
+要点：①判定只看 **file/category/root_cause/severity 四字段**，与行号无关；
+②第一阶段豁免让"明确指出诱饵在其契约下安全"的正确答案不被扣分；③第二阶段
+让省略 severity 的漏洞指控仍然扣分（防博弈）。
 
 
+
+
+
+---
+
+## 附：金标准之外的有效发现 (Novel Findings) 与加分规则
+
+GT 卷宗覆盖 4 个主缺陷 + 2 个诱饵。候选在**非诱饵文件**上指出卷宗未列出的
+真实次要缺陷时，按以下规则加分（`judge.py:298-379` 实现，本表为权威口径）：
+
+| 项 | 规则 |
+|---|---|
+| 单条加分 | +2.5 分/条，需引用实际代码证据（Quote Required），禁止凭印象 |
+| 上限 | 新颖加分合计 **+5.0**（两条饱和） |
+| 诱饵文件 | 一律不得加分（在诱饵上"发现缺陷"按诱饵扣分准则处理，不视作新颖） |
+| 与总分关系 | 最终分 `min(100, recall + depth + fix + format + bait + novel)`；100 截断意味着新颖加分**可以弥补**主缺陷失分，因此"满分"不再等价于"GT 全召回"——跨模型比较时应同时看 recall 明细 |
+| 典型有效新颖项 | `make_guest_token` 的零熵凭证与身份伪造（题一次要缺陷）、DoS 放大面、文档/契约与实现不一致的观察 |
+
+> 历史冲突说明：`criticbenchmark/scoring/SCORING.md` 曾有"真实缺陷也不加分"
+> 的旧表述，**已作废**——以本表与 `judge.py` 实现为准。
