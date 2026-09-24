@@ -348,8 +348,10 @@ def self_test() -> tuple[int, int]:
 
 
 def main() -> int:
-    if "--self-test" in sys.argv[1:]:
-        args = [a for a in sys.argv[1:] if a != "--self-test"]
+    dry = "--dry-run" in sys.argv[1:]
+    argv = [a for a in sys.argv[1:] if a != "--dry-run"]
+    if "--self-test" in argv:
+        args = [a for a in argv if a != "--self-test"]
         passed, failed = self_test()
         print(f"rescore_fast self-test: {passed} passed, {failed} failed", flush=True)
         if failed:
@@ -358,13 +360,13 @@ def main() -> int:
             return 0
         wanted = set(args)  # fall through to a real rescore if suites requested
     else:
-        wanted = {a for a in sys.argv[1:] if a}
+        wanted = {a for a in argv if a}
     if not wanted:
         wanted = FAST_SUITES
-    return _run_rescore(wanted)
+    return _run_rescore(wanted, dry=dry)
 
 
-def _run_rescore(wanted: set[str]) -> int:
+def _run_rescore(wanted: set[str], *, dry: bool = False) -> int:
     MasterLeaderboard._bind_catalog()
     lb_path = Path("bench_runs/leaderboard.json")
     data = json.loads(lb_path.read_text(encoding="utf-8"))
@@ -405,6 +407,15 @@ def _run_rescore(wanted: set[str]) -> int:
             MasterLeaderboard.record_run(
                 data, model_key, slot_key, new_res, str(run_dir))
         MasterLeaderboard._recompute_aggregates(entry)
+
+    if dry:
+        print("=" * 62)
+        print(f"RESCORE ({', '.join(sorted(wanted))}) [DRY-RUN] — "
+              f"{len(changes)} would-be changed slots; nothing written")
+        print("=" * 62)
+        for model_key, slot_key, old, new in changes:
+            print(f"  {model_key:32s} {slot_key:22s} {old:>6} -> {new:<6} ({new - old:+.2f})")
+        return 0
 
     MasterLeaderboard.save_data(data)
     MasterLeaderboard.export_markdown(data)
