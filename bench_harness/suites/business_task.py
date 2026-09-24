@@ -149,10 +149,12 @@ be rejected (ValueError) and must leave the order untouched.
 ## Durability
 
 `__init__(journal_path)` must load prior state from that file when it exists
-(orders, reservations, spool, dlq, stock) and every mutating call must keep
-the journal current on disk, so a fresh FulfillmentService with the same
-journal_path resumes exactly where the killed one left off - no lost
-reservations, no double deliveries, no duplicate orders.
+(orders, reservations, spool, dlq, stock, and the id counter) and every
+mutating call must keep the journal current on disk, so a fresh
+FulfillmentService with the same journal_path resumes exactly where the
+killed one left off - no lost reservations, no double deliveries, no
+duplicate orders, no reused ids. When `journal_path` is None the service
+runs purely in memory (no file writes).
 
 ## Rules
 
@@ -529,6 +531,9 @@ svc.ship(o1["order_id"], now=4.0)
 # one failed delivery attempt so the spool entry carries attempts=1
 dg.fail.add(o1["order_id"])
 svc.deliver_next(now=5.0)
+# hand the created ids back so the parent probe never hardcodes a format
+with open(out_path, "w", encoding="utf-8") as fh:
+    json.dump({"o1": o1["order_id"], "o2": o2["order_id"]}, fh)
 # kill hard: no flush hooks, no atexit — whatever is on disk is what counts
 os._exit(9)
 '''
@@ -558,8 +563,16 @@ def _run_restart_probe(workspace_dir: str | Path) -> dict[str, Any]:
             recovered["reload_error"] = repr(exc)
             return recovered
 
-        o1 = svc.order_status("ord-000001")
-        o2 = svc.order_status("ord-000002")
+        ids = {}
+        out_file = Path(tmp) / "out.json"
+        if out_file.is_file():
+            try:
+                ids = json.loads(out_file.read_text(encoding="utf-8"))
+            except Exception:  # noqa: BLE001
+                ids = {}
+        o1 = svc.order_status(str(ids.get("o1", "")))
+        o2 = svc.order_status(str(ids.get("o2", "")))
+        recovered["ids_recovered"] = bool(ids)
         recovered["o1_state"] = (o1 or {}).get("state")
         recovered["o2_state"] = (o2 or {}).get("state")
         rep = svc.stock_report()
@@ -567,8 +580,9 @@ def _run_restart_probe(workspace_dir: str | Path) -> dict[str, Any]:
         # replaying the child's idem key must not create a duplicate order
         try:
             replay = svc.create_order("k1", [{"sku": "skuA", "qty": 2}])
-            recovered["replay_same_id"] = replay["order_id"] == "ord-000001"
-            recovered["order_count"] = 1 if replay["order_id"] == "ord-000001" else 2
+            recovered["replay_same_id"] = (
+                bool(ids.get("o1")) and replay["order_id"] == ids.get("o1"))
+            recovered["order_count"] = 1 if replay["order_id"] == ids.get("o1") else 2
         except Exception as exc:  # noqa: BLE001
             recovered["replay_error"] = repr(exc)
         # spool backoff must survive: an immediate re-attempt is refused
@@ -802,7 +816,6 @@ def _scenario_worker(workspace_dir: str | Path) -> dict[str, Any]:
         svc.fulfill(s1["order_id"], now=3.0)
         svc.set_delivery_gateway(_DeliveryGateway(fail_ids=(s1["order_id"],)))
         svc.ship(s1["order_id"], now=4.0)
-        dg = svc._delivery_gateway
         e1 = svc.deliver_next(now=5.0)
         p6["first_attempt"] = bool(e1) and e1["attempts"] == 1
         early = svc.deliver_next(now=5.02)
@@ -839,6 +852,7 @@ def _scenario_worker(workspace_dir: str | Path) -> dict[str, Any]:
 
         def _grab(i: int) -> None:
             try:
+                barrier.wait(timeout=5)
                 o = svc2.create_order("cc-%d" % i, [{"sku": "hot", "qty": 1}])
                 svc2.reserve(o["order_id"], 100.0, now=1.0)
                 with res_lock:
@@ -931,6 +945,11 @@ def build_fulfillment_milestones(data: dict[str, Any]) -> list[Any]:
         # fail closed: untrusted code crashed / hung / missing
         return [_fm(i + 1, name, [(False, "fatal: %s" % str(data["fatal"])[:120])])
                 for i, name in enumerate(_MILESTONE_NAMES)]
+    # A probe phase that recorded an ERROR (the model's code raised where it
+    # should not) marks its milestone as ERROR rather than plain FAIL — an
+    # exception is not the same evidence as a wrong value.
+    _errored = {k for k, v in data.items()
+                if isinstance(v, dict) and v.get("error")}
     p1 = data.get("p1") or {}
     p2 = data.get("p2") or {}
     p3 = data.get("p3") or {}
@@ -1015,6 +1034,7 @@ def build_fulfillment_milestones(data: dict[str, Any]) -> list[Any]:
         (ok(p6, "spool_drained"), "成功后 spool 清空"),
     ]))
     ms.append(_fm(11, _MILESTONE_NAMES[10], [
+        (p8.get("ids_recovered") is True, "子进程回传 id"),
         (p8.get("o1_state") == "SHIPPED" and p8.get("o2_state") == "RESERVED",
          "订单状态恢复"),
         (ok(p8, "replay_same_id"), "恢复后幂等键仍有效"),
@@ -1022,6 +1042,16 @@ def build_fulfillment_milestones(data: dict[str, Any]) -> list[Any]:
         (ok(p8, "spool_attempt_after_backoff"), "恢复后可继续投递"),
         (ok(p8, "recovered_report_ok"), "恢复后报表精确"),
     ]))
+    # Probe-phase exceptions are ERROR evidence, not model failures: surface
+    # them on the milestone so a judge can tell "crashed" from "wrong".
+    _phase_of = {"m1": "p1", "m2": "p1", "m3": "p2", "m4": "p7", "m5": "p3",
+                 "m6": "p4", "m7": "p4", "m8": "p5", "m9": "p6", "m10": "p6",
+                 "m11": "p8"}
+    for m in ms:
+        phase = _phase_of.get(m.milestone_id.rsplit("_", 1)[-1])
+        if phase in _errored:
+            m.failure_reason = (
+                "PROBE-ERROR: %s" % str(data[phase].get("error"))[:160])
     return ms
 
 

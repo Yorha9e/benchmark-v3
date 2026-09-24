@@ -432,8 +432,19 @@ class CriticJudgeEvaluator:
         combined = f"{root_cause}\n{fix}".lower()
 
         if flaw_file == "session_tokens.py":
-            # 伪修复一票否决检测：提出 zip 循环且未提及长度保护
-            if "zip(" in combined and "diff |=" in combined and not any(k in combined for k in ("len(", "length", "guard")):
+            # 伪修复一票否决检测：提出 zip 循环且未提及长度保护。
+            # 否定豁免：答案引用该陷阱作为反例不算提出伪修复。
+            _zip_negated = any(
+                k in combined
+                for k in (
+                    "not use zip", "do not use zip", "don't use zip",
+                    "never use zip", "avoid zip", "instead of zip",
+                    "zip truncation", "zip is insufficient",
+                )
+            )
+            if ("zip(" in combined and "diff |=" in combined
+                    and not any(k in combined for k in ("len(", "length", "guard"))
+                    and not _zip_negated):
                 return {
                     "level": "L1",
                     "score": 1.0,
@@ -474,8 +485,20 @@ class CriticJudgeEvaluator:
             }
 
         elif flaw_file == "archive_import.py":
-            # 伪修复一票否决检测：匹配单次 replace 剥离
-            if re.search(r"replace\(\s*['\"](?:\.\./|\.\.)['\"]\s*,\s*['\"]['\"]\s*\)", combined):
+            # 伪修复一票否决检测：匹配单次 replace 剥离。
+            # 否定豁免（与 basename/startswith 一致）：答案引用该陷阱作为
+            # 反例（"不要用 replace，....// 可绕过"）不算提出伪修复。
+            _replace_pseudo = re.search(
+                r"replace\(\s*['\"](?:\.\./|\.\.)['\"]\s*,\s*['\"]['\"]\s*\)", combined)
+            _replace_negated = any(
+                k in combined
+                for k in (
+                    "not use replace", "do not use replace", "don't use replace",
+                    "never use replace", "avoid replace", "instead of replace",
+                    "replace is insufficient", "replace alone",
+                )
+            )
+            if _replace_pseudo and not _replace_negated:
                 return {
                     "level": "L1",
                     "score": 1.0,
@@ -496,9 +519,18 @@ class CriticJudgeEvaluator:
                     "reasoning": "伪修复陷阱：盲目 basename 未检验空串与 ..，在部分系统上依然逃逸（一票否决）。",
                 }
 
-            # 排除明确否定 startswith 的优秀答案（如 'do not use startswith'）
-            has_startswith_pseudo = "startswith" in combined and not any(
+            # 排除明确否定 startswith 的优秀答案（如 'do not use startswith'）；
+            # 带路径分隔符的前缀校验（ROOT + os.sep）是生产级做法，不算伪修复。
+            _startswith_negated = any(
                 k in combined for k in ("not use startswith", "avoid startswith", "never startswith", "do not use startswith")
+            )
+            _startswith_with_sep = any(
+                k in combined for k in ("os.sep", "+ os.sep", "+ '/", 'sep +', "separator", "with a trailing separator", "path separator")
+            )
+            has_startswith_pseudo = (
+                "startswith" in combined
+                and not _startswith_negated
+                and not _startswith_with_sep
             )
             has_production_fix = any(k in combined for k in ("commonpath", "is_relative_to", "realpath", "o_nofollow")) and not has_startswith_pseudo
             has_attack_vector = any(k in combined for k in ("../", "..\\", "traversal", "escape", "overwrite", "authorized_keys", "cron", "rce"))

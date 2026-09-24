@@ -478,11 +478,21 @@ class CriticSuite(SuiteAdapter):
         format_ok = False
         try:
             parsed = json.loads(raw) if raw.strip() else None
+            # 格式闸门：每条必须是带齐字段的 dict（file/line/severity）。
+            # severity 只需是合法严重级或其信息级同义词——金标准明确
+            # style/info 备忘不扣分，一条 info 附注不应让整份卷宗作废
+            # （旧行为：任一条 severity 非法 → recall+depth+format 全归零）。
+            _INFO_SEVERITIES = (
+                "info", "informational", "style", "nit", "note", "notes",
+                "n/a", "na", "none", "null", "unknown", "suggestion",
+                "comment", "minor", "trivial", "cosmetic",
+            )
             if isinstance(parsed, list) and len(parsed) > 0 and all(
                 isinstance(f, dict)
                 and all(k in f for k in AUDIT_SCHEMA_KEYS)
                 and isinstance(f.get("line"), int)
-                and str(f.get("severity", "")).lower() in SEVERITIES
+                and (str(f.get("severity", "")).lower() in SEVERITIES
+                     or str(f.get("severity", "")).lower() in _INFO_SEVERITIES)
                 and str(f.get("file", "")).endswith(".py")
                 for f in parsed
             ):
@@ -602,7 +612,10 @@ def _good_audit() -> list[dict[str, Any]]:
          "severity": "medium", "category": "early-exit timing compare",
          "root_cause": "Loop returns early on the first mismatch, leaking "
                        "prefix length via timing; needs a constant-time compare.",
-         "fix": "Accumulate mismatches with XOR and compare once at the end."},
+         "fix": "Use hmac.compare_digest on both values (encode to bytes "
+                "first); never hand-roll a loop, and do NOT accumulate with "
+                "XOR over zip() — zip truncates on the shorter input and an "
+                "empty presented token would pass any diff==0 check."},
         {"file": "archive_import.py", "line": lines["archive_import.py"] + 2,
          "severity": "high", "category": "path traversal",
          "root_cause": "member_name is joined without normalization, so '..' "
