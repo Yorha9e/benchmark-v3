@@ -597,6 +597,77 @@ class MasterLeaderboard:
         tid = str(slot.get("task_id") or "")
         return tid if cond == "a" else f"{tid}@{cond}"
 
+    @staticmethod
+    def run_telemetry(run_dir: str, task_id: str, condition: str,
+                      suite: str) -> dict[str, float] | None:
+        """Read one run's telemetry from its own ``evaluation.json``.
+
+        Returns ``{"wall_seconds": float, "completion_tokens": int,
+        "total_tokens": int}`` or None. Condition-aware: a B slot's
+        ``suite`` field is the family name (``long``), so candidates are
+        validated against the payload's own ``task_id``/``condition`` —
+        otherwise the A-condition file would satisfy a B slot.
+
+        Rescore paths MUST use this (not the slot's mean) when folding a
+        run back into ``runs[]``: writing the mean onto one entry poisons
+        every multi-run slot.
+        """
+        import json
+        if not run_dir or not task_id:
+            return None
+        base = Path(str(run_dir))
+        cond = (condition or "a").lower()
+        fam = str(suite or "")
+        ordered: list[Path] = []
+        if cond == "a":
+            ordered.append(base / fam / task_id)
+        else:
+            ordered += [base / f"{fam}_b" / task_id, base / fam / task_id]
+        ordered += [base / f"{fam}_b" / task_id, base / fam / task_id,
+                    base / "long_b" / task_id, base / "short_b" / task_id]
+        seen: set[Path] = set()
+        for cand in ordered:
+            p = cand / "evaluation.json"
+            if p in seen or not p.is_file():
+                continue
+            seen.add(p)
+            try:
+                payload = json.loads(p.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if str(payload.get("task_id")) != task_id:
+                continue
+            if cond == "b" and str(payload.get("condition", "a")).lower() != "b":
+                continue
+            if cond == "a" and str(payload.get("condition", "a")).lower() == "b":
+                continue
+            tel = payload.get("telemetry") or {}
+            tm = payload.get("token_metrics") or {}
+            wall = float(tel.get("wall_time_seconds", 0.0) or 0.0)
+            return {
+                "wall_seconds": wall,
+                "completion_tokens": int(tm.get("completion_tokens", 0) or 0),
+                "total_tokens": int(tm.get("total_tokens", 0) or 0),
+            }
+        return None
+
+    @classmethod
+    def slot_run_telemetry(cls, slot: dict[str, Any], run_dir: str) -> dict[str, float]:
+        """Per-run telemetry for a rescore fold, slot value as fallback."""
+        tel = cls.run_telemetry(
+            run_dir, str(slot.get("task_id") or ""),
+            str(slot.get("condition") or "a"), str(slot.get("suite") or ""))
+        if tel is None:
+            tel = {}
+        return {
+            "wall_seconds": float(
+                tel.get("wall_seconds") or slot.get("wall_seconds") or 0.0),
+            "completion_tokens": int(
+                tel.get("completion_tokens") or slot.get("completion_tokens") or 0),
+            "total_tokens": int(
+                tel.get("total_tokens") or slot.get("total_tokens") or 0),
+        }
+
     @classmethod
     def _cost_medians(cls, data: dict[str, Any]) -> dict[str, tuple[float, float]]:
         """Per-slot cross-model medians of (tokens, wall seconds).
