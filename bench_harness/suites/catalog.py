@@ -24,7 +24,7 @@ class Runnable:
 
 
 _SHORT_TASKS = ("varint_parser", "timing_wheel", "lexer_state_machine")
-_LONG_TASKS = ("order_fulfillment",)  # business axis (raft/saga archived)
+_LONG_TASKS = ("order_fulfillment", "payment_ledger")  # business axis (raft/saga archived)
 _REVIEWER_TASKS = ("lock_ordering", "api_drift", "bait_guard")
 _CRITIC_TASKS = ("audit_bundle",)
 
@@ -147,7 +147,7 @@ def self_test() -> tuple[int, int]:
     check("cli_choices_end_with_all", CLI_SUITE_CHOICES[-1] == "all")
     check("cli_choices_cover_selectable", set(SELECTABLE_KEYS) <= set(CLI_SUITE_CHOICES))
     check("family_keys_from_a", FAMILY_KEYS == ("short", "long", "reviewer", "critic"))
-    check("canonical_a_count", len(canonical_a_tasks()) == 8)
+    check("canonical_a_count", len(canonical_a_tasks()) == 9)
     check("canonical_b_count", len(canonical_b_tasks()) == 5)
     check("canonical_b_short_long", set(canonical_b_tasks()) == set(_SHORT_TASKS + _LONG_TASKS))
     check("summary_follows_runnables", [row[0] for row in summary_sections()] == list(SELECTABLE_KEYS))

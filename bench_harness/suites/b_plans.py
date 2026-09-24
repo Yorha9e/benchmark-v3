@@ -169,6 +169,67 @@ S5. Robustness: test unknown macro name and unclosed macro syntax (both emit
     and deliver; then reopen the service from the journal and confirm the
     states match.
 """,
+    "payment_ledger": _HEADER + """
+## Order
+1. `read` `TASK.md`. The API surface, the double-entry invariants, the
+   settlement rules, the reconciliation contract and the durability
+   requirement there are binding. Implement exactly that API in
+   `ledger.py` (stdlib only) — no extra module files.
+2. Concurrency: one re-entrant lock (`threading.RLock`) guarding EVERY
+   public method — reads (`balance`, `trial_balance`) included. Internal
+   structure is yours; the state that must survive a restart is: accounts,
+   journal entries, the idem-key index, the reversed set, the settled-day
+   calendar, and the entry counter (a reopened service must never reuse an
+   entry id).
+3. `post`: validate first (empty / zero or negative amounts / unknown
+   account / unbalanced legs / mixed currencies all raise `ValueError`),
+   then append one balanced entry whose legs sum to zero. A replay of the
+   same idem key returns the recorded entry without posting anything
+   again.
+4. `transfer`: perform the balance check, the two legs and the idem
+   recording inside ONE critical section — splitting the check from the
+   posting lets concurrent transfers overdraw (the grader drives up to 16
+   threads at one account). from pays to: from loses `amount` (a credit
+   leg), to gains (a debit leg); balance is decoded as sum(debits) −
+   sum(credits), so the payer's balance decreases. Insufficient funds
+   reject atomically — no partial effect.
+5. `reverse`: look the original up by idem key and append a NEW entry with
+   every leg's debit and credit swapped — history is never rewritten or
+   deleted. Replaying a reversal key returns the recorded reversal.
+   Reversing an unknown key, reversing an already-reversed posting, or
+   reversing a reversal are all `ValueError`s.
+6. `settle(day)`: net each account over the entries stamped with that day
+   (debit − credit), then emit exactly ONE settlement batch — a balanced
+   posting that carries those nets (positive nets as debit legs, negative
+   as credit legs; they always cancel). The batch is itself a journal
+   entry, so balances after settlement equal prior + net; that is normal
+   double-entry bookkeeping, not an error. Re-running settle for the same
+   day is a no-op returning the recorded batch (no second entry); each
+   day settles independently.
+7. `reconcile(stream)`: compare the incoming legs against this ledger's
+   own postings and report ONLY these three kinds:
+   - `duplicate_posting` — the same (batch, seq, account) leg appears
+     more than once in the stream;
+   - `unbalanced_batch` — a batch's stream legs do not balance;
+   - `missing_entry` — a leg this ledger holds that the stream lacks.
+   Matching is by `seq` (and amounts), NEVER by list position: a stream
+   that faithfully mirrors the ledger's postings must report nothing even
+   when shuffled, and a clean stream must report nothing at all (no
+   crying wolf). A stream-only leg is caught by its batch's imbalance,
+   not reported as missing — the direction of truth is ledger → stream.
+8. Durability: when `journal_path` is set, every mutating call rewrites
+   the whole state atomically (temp file + `os.replace`); when it is None
+   nothing is written. `__init__` loads the file when it exists —
+   balances, entries, idem keys, the reversed set, the settled calendar
+   and the counter all survive a kill exactly.
+9. Self-check before `finish`: scripted pass over a balanced posting (and
+   its unbalanced rejection), an overdrawn transfer rejection, concurrent
+   transfers on one hot account (exactly the affordable count succeeds),
+   a replayed idem key, a reversal, settle + re-settle, and reconcile
+   against a clean stream, a shuffled stream and one planted discrepancy
+   of each kind; then reopen the service from the journal and confirm the
+   states match.
+""",
     "raft_cluster": _HEADER + """
 ## Order
 1. `read` `TASK.md`. The process command line form, mailbox envelope shape,

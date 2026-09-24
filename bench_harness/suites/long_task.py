@@ -2272,46 +2272,57 @@ class LongTaskSuite(SuiteAdapter):
     suite_name = "long"
     # Business axis (order_fulfillment / payment_ledger); raft_cluster and
     # saga_coordinator stay in this module as the archived algorithmic axis.
-    TASK_IDS = ("order_fulfillment",)
+    TASK_IDS = ("order_fulfillment", "payment_ledger")
 
     def describe_task(self, task_id: str) -> dict[str, Any]:
-        if task_id == "order_fulfillment":
+        if task_id in ("order_fulfillment", "payment_ledger"):
             from benchmark_v3.bench_harness.suites.business_task import (
-                FULFILLMENT_TITLE,
+                FULFILLMENT_TITLE, LEDGER_TITLE,
             )
-            return {"task_id": task_id, "title": FULFILLMENT_TITLE}
+            title = (FULFILLMENT_TITLE if task_id == "order_fulfillment"
+                     else LEDGER_TITLE)
+            return {"task_id": task_id, "title": title}
         title, _ = LONG_BRIEFS[task_id]
         return {"task_id": task_id, "title": title}
 
     def prepare_task(self, task_id: str, workspace_dir: Path) -> None:
-        if task_id == "order_fulfillment":
+        if task_id in ("order_fulfillment", "payment_ledger"):
             from benchmark_v3.bench_harness.suites.business_task import (
                 FULFILLMENT_CONTRACT, FULFILLMENT_TITLE,
+                LEDGER_CONTRACT, LEDGER_TITLE,
             )
+            title, contract = (
+                (FULFILLMENT_TITLE, FULFILLMENT_CONTRACT)
+                if task_id == "order_fulfillment"
+                else (LEDGER_TITLE, LEDGER_CONTRACT))
             (workspace_dir / "TASK.md").write_text(
-                "# %s\n\n%s\n" % (FULFILLMENT_TITLE, FULFILLMENT_CONTRACT),
-                encoding="utf-8")
+                "# %s\n\n%s\n" % (title, contract), encoding="utf-8")
             return
         title, contract = LONG_BRIEFS[task_id]
         (workspace_dir / "TASK.md").write_text(
             "# %s\n\n%s\n" % (title, contract), encoding="utf-8")
 
     def build_prompt(self, task_id: str, workspace_dir: Path) -> str:
-        if task_id == "order_fulfillment":
+        if task_id in ("order_fulfillment", "payment_ledger"):
             from benchmark_v3.bench_harness.suites.business_task import (
                 FULFILLMENT_CONTRACT, FULFILLMENT_TITLE,
+                LEDGER_CONTRACT, LEDGER_TITLE,
             )
+            title, contract, target = (
+                (FULFILLMENT_TITLE, FULFILLMENT_CONTRACT, "fulfillment.py")
+                if task_id == "order_fulfillment"
+                else (LEDGER_TITLE, LEDGER_CONTRACT, "ledger.py"))
             return (
                 "You are implementing a business-systems benchmark task: %s.\n\n"
                 "%s\n\nRules: use the `write` or `edit` tool to create ONLY "
-                "`fulfillment.py` in the workspace (stdlib only, no network) — "
+                "`%s` in the workspace (stdlib only, no network) — "
                 "bash/`python -c` prototypes are not scored; honour every line "
-                "of the contract above, including the state machine, the spool "
-                "rules and the durability requirement. When the file on disk "
-                "is ready, call the `finish` tool with a non-empty summary of "
-                "what you changed and how you checked it; a reply with no tool "
-                "calls does not end the task."
-                % (FULFILLMENT_TITLE, FULFILLMENT_CONTRACT))
+                "of the contract above, including the state machine, the "
+                "durability requirement and the reconciliation rules. When the "
+                "file on disk is ready, call the `finish` tool with a non-empty "
+                "summary of what you changed and how you checked it; a reply "
+                "with no tool calls does not end the task."
+                % (title, contract, target))
 
         title, contract = LONG_BRIEFS[task_id]
         target = "raft.py" if task_id == "raft_cluster" else "saga.py"
@@ -2339,6 +2350,12 @@ class LongTaskSuite(SuiteAdapter):
             )
             data = run_fulfillment_scenario(workspace_dir)
             return build_fulfillment_milestones(data), {}
+        if task_id == "payment_ledger":
+            from benchmark_v3.bench_harness.suites.business_task import (
+                build_ledger_milestones, run_ledger_scenario_isolated,
+            )
+            data = run_ledger_scenario_isolated(workspace_dir)
+            return build_ledger_milestones(data), {}
         if task_id == "raft_cluster":
             data = run_raft_scenario(workspace_dir)
             return build_raft_milestones(data), {}
@@ -2379,7 +2396,7 @@ def self_test() -> tuple[int, int]:
         print(f"{'PASS' if cond else 'FAIL'} long::{name}", flush=True)
 
     suite = LongTaskSuite()
-    check("task_ids", suite.task_ids() == ["order_fulfillment"])
+    check("task_ids", suite.task_ids() == ["order_fulfillment", "payment_ledger"])
 
     # -- reference Raft: 10/10 milestones, 20 sub-assertions --
     with tempfile.TemporaryDirectory(prefix="long-raft-") as tmp:

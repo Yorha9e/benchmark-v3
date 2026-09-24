@@ -47,6 +47,7 @@ CODE_FILE = {
     "raft_cluster": "raft.py",
     "saga_coordinator": "saga.py",
     "order_fulfillment": "fulfillment.py",
+    "payment_ledger": "ledger.py",
 }
 
 
@@ -75,6 +76,12 @@ def rescore_long(task_id: str, ws_dir: Path) -> dict:
             )
             data = run_fulfillment_scenario(isolated)
             milestones = build_fulfillment_milestones(data)
+        elif task_id == "payment_ledger":
+            from benchmark_v3.bench_harness.suites.business_task import (
+                build_ledger_milestones, run_ledger_scenario_isolated,
+            )
+            data = run_ledger_scenario_isolated(isolated)
+            milestones = build_ledger_milestones(data)
         elif task_id == "raft_cluster":
             data = run_raft_scenario(isolated, seed=7)
             milestones = build_raft_milestones(data)
