@@ -12,6 +12,7 @@ Usage::
 
     python rescore_long.py               # all long slots
     python rescore_long.py k3@max        # one model only
+    python rescore_long.py k3@max grok-4.7@xhigh  # several models
     python rescore_long.py --dry-run     # report only, write nothing
 
 Reconstructed 2026-09-21 after the original untracked copy was lost. Same
@@ -84,7 +85,7 @@ def rescore_long(task_id: str, ws_dir: Path) -> dict:
 def main() -> int:
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     dry = "--dry-run" in sys.argv
-    only = args[0] if args else None
+    only = set(args) if args else None
     MasterLeaderboard._bind_catalog()
     lb_path = Path("bench_runs/leaderboard.json")
     data = json.loads(lb_path.read_text(encoding="utf-8"))
@@ -93,7 +94,7 @@ def main() -> int:
     skipped: list[str] = []
 
     for model_key, entry in sorted(data.items()):
-        if only and model_key != only:
+        if only and model_key not in only:
             continue
         tasks = entry.get("tasks") or {}
         for slot_key, slot in sorted(tasks.items()):
