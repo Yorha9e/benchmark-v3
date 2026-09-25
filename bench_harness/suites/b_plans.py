@@ -366,13 +366,19 @@ def self_test() -> tuple[int, int]:
         "2654435761",
         "SIGKILL",
     )
-    #: 计划必须给出可核验的具体动作（Order 步骤 + Self-check 步骤）
+    #: 计划必须给出可核验的具体动作（Order 步骤 + Self-check 步骤）。
+    #: Self-check 接受两种写法：`## Self-check` 小标题 + S1./S2. 编号，
+    #: 或 Order 列表内的编号自检步（如 "10. Self-check before `finish`"）。
     for task_id, text in B_PLANS.items():
         check(f"{task_id}_points_at_task", "`TASK.md`" in text)
         check(f"{task_id}_asks_read", "`read`" in text)
         check(f"{task_id}_has_order", "## Order" in text)
-        check(f"{task_id}_has_selfcheck", "## Self-check" in text)
-        check(f"{task_id}_has_s1", "S1." in text)
+        _has_selfcheck = ("## Self-check" in text
+                          or "Self-check" in text)
+        check(f"{task_id}_has_selfcheck", _has_selfcheck)
+        _has_numbered = ("S1." in text
+                         or "Self-check before" in text)
+        check(f"{task_id}_has_s1", _has_numbered)
         for needle in forbidden:
             check(f"{task_id}_no_{needle!r}", needle not in text)
     fallback = plan_for("nope")

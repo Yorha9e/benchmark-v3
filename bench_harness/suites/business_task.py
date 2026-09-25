@@ -1169,6 +1169,15 @@ _LEDGER_MUTANTS: dict[str, tuple[str, str]] = {
         """    def _flush(self):
         if True:
             return"""),
+    "no_reverse_replay_guard": (
+        """    def reverse(self, idem_key, original_idem_key, now, day=None):
+        with self._lock:
+            prior = self._by_idem.get(idem_key)
+            if prior is not None:
+                return self._view(prior)""",
+        """    def reverse(self, idem_key, original_idem_key, now, day=None):
+        with self._lock:
+            prior = None"""),
     # NOTE: a check-then-act transfer (balance check outside the lock) is a
     # real bug but is NOT reliably observable here — CPython's GIL gives the
     # window between the inner balance() lock release and the re-acquire no
@@ -1189,6 +1198,7 @@ _LEDGER_MUTANT_EXPECT: dict[str, str] = {
     "no_duplicate_detect": "m7",
     "order_sensitive_reconcile": "m8",
     "no_journal": "m9",
+    "no_reverse_replay_guard": "m5",
 }
 def self_test() -> tuple[int, int]:
     counts = [0, 0]
@@ -1323,12 +1333,16 @@ class LedgerService:
         # Register an account. Unknown accounts must be rejected everywhere.
 
     def balance(self, account_id: str) -> int
-        # Current balance in minor units (cents). Negative balances are
-        # impossible: transfers that would overdraw are rejected atomically.
+        # Current balance in minor units, decoded as
+        # sum(debits) − sum(credits) over all entries touching the account.
+        # Pure credit accounts therefore go NEGATIVE — that is normal
+        # double-entry bookkeeping, not an error. The only non-negativity
+        # rule is on transfers: a transfer that would overdraw its source
+        # is rejected atomically (post and reverse may balance to any sign).
 
     def trial_balance(self) -> dict[str, tuple[int, int]]
-        # {currency: (total_debits, total_cents)} — the two totals of each
-        # currency must ALWAYS be equal (the core double-entry invariant).
+        # {currency: (total_debits, total_credits)} — the two totals of
+        # each currency must ALWAYS be equal (the core double-entry invariant).
 
     # -- postings -----------------------------------------------------------
     def post(self, idem_key: str, entries: list[dict], now: float,
@@ -1336,16 +1350,19 @@ class LedgerService:
         # entries: [{"account": str, "debit": int}, ...] and/or
         #          [{"account": str, "credit": int}, ...]
         # Reject (ValueError) when: entries is empty, any amount <= 0, any
-        # account is unknown, or the posting is unbalanced
-        # (sum(debits) != sum(credits)). A replay of the SAME idem_key
-        # returns the recorded result without posting anything again.
+        # account is unknown, the posting mixes currencies in one entry,
+        # or the posting is unbalanced (sum(debits) != sum(credits)).
+        # A replay of the SAME idem_key returns the recorded result
+        # (regardless of the arguments passed) without posting anything
+        # again; the key is reserved once used.
 
     def transfer(self, idem_key: str, from_account: str, to_account: str,
                  amount: int, now: float, day: str) -> dict
-        # Atomic two-leg posting (debit source, credit destination).
-        # Reject when amount <= 0, accounts differ in currency, the source
-        # would overdraw, or the idem_key was already used. Replays return
-        # the recorded outcome.
+        # Atomic two-leg posting (credit source, debit destination): the
+        # source LOSES `amount`, the destination GAINS it. Reject when
+        # amount <= 0, accounts differ in currency, the source would
+        # overdraw, or the idem_key was already used by another operation.
+        # Replays of the same idem_key return the recorded outcome.
 
     def reverse(self, idem_key: str, original_idem_key: str, now: float,
                 day: str) -> dict
@@ -1358,11 +1375,15 @@ class LedgerService:
     # -- settlement ----------------------------------------------------------
     def settle(self, day: str, now: float) -> dict
         # Close the books for `day`: compute each account's net movement
-        # for entries stamped with that day, emit ONE settlement batch
-        # (a balanced posting carrying the per-account nets), and mark the
-        # day settled. Re-running settle for the same day is a no-op that
-        # returns the recorded batch. Returns
-        # {"day": str, "batch_id": str, "nets": {account: int}}.
+        # for entries stamped with that day (net = Σdebits − Σcredits),
+        # emit ONE settlement batch — a NEW balanced journal entry with
+        # positive nets as debit legs and negative nets as credit legs
+        # (they always cancel) — and mark the day settled. Because the
+        # batch is itself an entry, each account's balance after
+        # settlement equals its balance before plus its net for the day.
+        # `nets` contains only accounts with a non-zero net. Re-running
+        # settle for the same day is a no-op that returns the recorded
+        # batch. Returns {"day": str, "batch_id": str, "nets": {account: int}}.
 
     # -- reconciliation --------------------------------------------------------
     def reconcile(self, stream: list[dict]) -> list[dict]
@@ -1370,16 +1391,25 @@ class LedgerService:
         # postings and report discrepancies. Each stream item:
         #   {"seq": int, "account": str, "debit": int, "credit": int,
         #    "batch": str}
-        # Items may arrive OUT OF ORDER (seq is the truth, not list order).
-        # Report a list of discrepancy dicts:
+        # `batch` is the idem_key of the posting that produced the leg,
+        # and `seq` is that posting's sequence number; `seq` is unique per
+        # leg within a batch, so a repeated (batch, seq, account, debit,
+        # credit) tuple is a duplicate. Items may arrive OUT OF ORDER
+        # (seq is the truth, not list order). Report a list of discrepancy
+        # dicts:
         #   {"kind": "missing_entry", "seq": int, "account": str, ...}
         #   {"kind": "unbalanced_batch", "batch": str, ...}
         #   {"kind": "duplicate_posting", "seq": int, ...}
+        # missing_entry is reported per leg; the three kinds are reported
+        # independently (a planted discrepancy may trigger more than one).
         # A stream that faithfully mirrors this ledger's postings (even
         # shuffled) must produce ZERO reports.
 ```
 
-## Journal entry dict (your internal shape)
+## Journal entry dict (the required return shape)
+
+`post`, `transfer` and `reverse` all return exactly this dict (fresh copies,
+not references into internal state):
 
 ```python
 {"entry_id": str, "idem_key": str, "day": str, "seq": int,
@@ -1431,6 +1461,7 @@ class LedgerService:
         self._by_idem = {}         # idem_key -> entry_id
         self._batch_of = {}        # entry_id -> batch (idem_key of the posting)
         self._reversed = set()     # idem_keys that have been reversed
+        self._reversals = set()    # idem_keys that ARE reversal entries
         self._settled = {}         # day -> batch entry_id (or None if empty)
         self._counter = 0
         if journal_path:
@@ -1444,8 +1475,9 @@ class LedgerService:
     def _snapshot(self):
         return {"accounts": self._accounts, "entries": self._entries,
                 "by_idem": self._by_idem, "batch_of": self._batch_of,
-                "reversed": sorted(self._reversed), "settled": self._settled,
-                "counter": self._counter}
+                "reversed": sorted(self._reversed),
+                "reversals": sorted(self._reversals),
+                "settled": self._settled, "counter": self._counter}
 
     def _load(self, state):
         self._accounts = dict(state.get("accounts") or {})
@@ -1453,6 +1485,7 @@ class LedgerService:
         self._by_idem = dict(state.get("by_idem") or {})
         self._batch_of = dict(state.get("batch_of") or {})
         self._reversed = set(state.get("reversed") or [])
+        self._reversals = set(state.get("reversals") or [])
         self._settled = dict(state.get("settled") or {})
         self._counter = int(state.get("counter") or 0)
 
@@ -1578,12 +1611,15 @@ class LedgerService:
                 raise ValueError("unknown original key")
             if original_idem_key in self._reversed:
                 raise ValueError("already reversed")
+            if original_idem_key in self._reversals:
+                raise ValueError("cannot reverse a reversal")
             orig = self._view(self._by_idem[original_idem_key])
             legs = [{"account": l["account"], "debit": l["credit"],
                      "credit": l["debit"]} for l in orig["legs"]]
             entry = self._apply_legs(legs, day, now)
             self._record(entry, idem_key)
             self._reversed.add(original_idem_key)
+            self._reversals.add(idem_key)
             return self._view(entry["entry_id"])
 
     # -- settlement ---------------------------------------------------------------
@@ -1965,7 +2001,16 @@ def run_ledger_scenario(workspace_dir: str | Path) -> dict[str, Any]:
         p5["partial_refund"] = (svc5.balance("A") == 70 and svc5.balance("B") == -70)
         tb = svc5.trial_balance().get("USD", (0, 1))
         p5["trial_balanced"] = tb[0] == tb[1]
-        p5["replay_reverse"] = None
+        # replaying a reversal key must return the recorded reversal: the
+        # inverse legs must NOT be posted twice.
+        before_a, before_b = svc5.balance("A"), svc5.balance("B")
+        try:
+            rv_replay = svc5.reverse("rv1", "r0", now=6.0, day="D1")
+            p5["replay_reverse_no_double"] = (
+                svc5.balance("A") == before_a and svc5.balance("B") == before_b
+                and bool(rv_replay))
+        except Exception as exc:  # noqa: BLE001
+            p5["replay_reverse_error"] = repr(exc)
     except Exception as exc:  # noqa: BLE001
         p5["error"] = repr(exc)
     out["p5"] = p5
@@ -1979,7 +2024,11 @@ def run_ledger_scenario(workspace_dir: str | Path) -> dict[str, Any]:
         svc6.post("s1", [{"account": "A", "credit": 100},
                          {"account": "B", "debit": 100}], now=1.0, day="D1")
         svc6.transfer("s2", "B", "C", 30, now=2.0, day="D1")
+        _pre = {a: svc6.balance(a) for a in ("A", "B", "C")}
         b1 = svc6.settle("D1", now=3.0)
+        p6["batch_posted"] = all(
+            svc6.balance(a) == _pre[a] + b1.get("nets", {}).get(a, 0)
+            for a in ("A", "B", "C"))
         p6["nets_correct"] = b1.get("nets") == {"A": -100, "B": 70, "C": 30}
         p6["batch_id_present"] = bool(b1.get("batch_id"))
         tb = svc6.trial_balance().get("USD", (0, 1))
@@ -2009,9 +2058,9 @@ def run_ledger_scenario(workspace_dir: str | Path) -> dict[str, Any]:
             items = []
             for e in entries:
                 batch = e.get("idem_key")
-                for leg in e["legs"]:
-                    items.append({"seq": e["seq"], "account": leg["account"],
-                                  "debit": leg["debit"], "credit": leg["credit"],
+                for leg in e.get("legs") or []:
+                    items.append({"seq": e.get("seq"), "account": leg.get("account"),
+                                  "debit": leg.get("debit"), "credit": leg.get("credit"),
                                   "batch": batch})
             return items
 
@@ -2089,6 +2138,11 @@ def build_ledger_milestones(data: dict[str, Any]) -> list[Any]:
     if data.get("fatal"):
         return [_lm(i + 1, name, [(False, "fatal: %s" % str(data["fatal"])[:120])])
                 for i, name in enumerate(_LEDGER_MILESTONE_NAMES)]
+    # A probe phase that recorded an ERROR (the model raised where it should
+    # not, or a probe field was absent) marks its milestone as ERROR rather
+    # than plain FAIL — an exception is not the same evidence as a wrong value.
+    _errored = {k for k, v in data.items()
+                if isinstance(v, dict) and v.get("error")}
     p1 = data.get("p1") or {}
     p2 = data.get("p2") or {}
     p3 = data.get("p3") or {}
@@ -2147,6 +2201,7 @@ def build_ledger_milestones(data: dict[str, Any]) -> list[Any]:
         (ok(p5, "unknown_original_rejected"), "未知原键冲正拒绝"),
         (ok(p5, "partial_refund"), "部分退款余额正确"),
         (ok(p5, "trial_balanced"), "冲正后仍平衡"),
+        (ok(p5, "replay_reverse_no_double"), "冲正重放不双记"),
     ]))
     ms.append(_lm(6, _LEDGER_MILESTONE_NAMES[5], [
         (p6.get("nets_correct") is True, "净额计算正确"),
@@ -2155,6 +2210,7 @@ def build_ledger_milestones(data: dict[str, Any]) -> list[Any]:
         (ok(p6, "resettle_same_batch"), "重复结算同批次"),
         (ok(p6, "resettle_same_nets"), "重复结算同净额"),
         (p6.get("second_day_nets") is True, "次日独立结算"),
+        (ok(p6, "batch_posted"), "结算批次真实入账"),
     ]))
     ms.append(_lm(7, _LEDGER_MILESTONE_NAMES[6], [
         (ok(p7, "missing_detected"), "缺失 entry 检出"),
@@ -2173,6 +2229,15 @@ def build_ledger_milestones(data: dict[str, Any]) -> list[Any]:
         (ok(p9, "replay_ok"), "恢复后幂等键仍有效"),
         (ok(p9, "settle_not_doubled"), "恢复后不重复结算"),
     ]))
+    # Probe-phase exceptions are ERROR evidence, not model failures: surface
+    # them on the milestone so a judge can tell "crashed" from "wrong".
+    _phase_of = {"m1": "p1", "m2": "p2", "m3": "p3", "m4": "p4", "m5": "p5",
+                 "m6": "p6", "m7": "p7", "m8": "p7", "m9": "p9"}
+    for m in ms:
+        phase = _phase_of.get(m.milestone_id.rsplit("_", 1)[-1])
+        if phase in _errored:
+            m.failure_reason = (
+                "PROBE-ERROR: %s" % str(data[phase].get("error"))[:160])
     return ms
 
 
