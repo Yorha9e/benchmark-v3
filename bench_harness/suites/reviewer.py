@@ -78,6 +78,155 @@ def probe_parser_contracts(workspace: Path, timeout: float = PROBE_TIMEOUT) -> t
 # Fixtures: (target_buggy, bait, brief)
 # ---------------------------------------------------------------------------
 
+_FULFILL_BUGGY = '''"""Warehouse inventory with TTL reservations.
+
+BUGGY: release() reads the reservation outside the lock and has no
+idempotency guard, so an expiry sweep racing an order cancel credits the
+same units back to on-hand twice and stock drifts upward.
+"""
+import threading
+
+
+class InventoryService:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._on_hand = {}
+        self._reservations = {}
+
+    def add_stock(self, sku, qty):
+        if qty <= 0:
+            raise ValueError("qty must be positive")
+        with self._lock:
+            self._on_hand[sku] = self._on_hand.get(sku, 0) + qty
+
+    def reserve(self, order_id, sku, qty, ttl_seconds, now, _barrier=None):
+        if qty <= 0:
+            raise ValueError("qty must be positive")
+        if order_id in self._reservations:
+            raise ValueError("order already reserved")
+        with self._lock:
+            if self._on_hand.get(sku, 0) < qty:
+                raise ValueError("insufficient stock")
+            self._on_hand[sku] = self._on_hand.get(sku, 0) - qty
+            self._reservations[order_id] = {
+                "sku": sku, "qty": qty, "expires_at": now + ttl_seconds}
+
+    def available(self, sku):
+        with self._lock:
+            return self._on_hand.get(sku, 0)
+
+    def release(self, order_id, now, _barrier=None):
+        # Test-only forcing point mirrors the production race: an expiry
+        # sweep and an order cancel both reach here for the same order.
+        r = self._reservations.get(order_id)
+        if r is None:
+            return False
+        if _barrier is not None:
+            try:
+                _barrier.wait(timeout=3)
+            except threading.BrokenBarrierError:
+                pass
+        self._reservations.pop(order_id, None)
+        with self._lock:
+            self._on_hand[r["sku"]] = self._on_hand.get(r["sku"], 0) + r["qty"]
+        return True
+
+    def sweep_expired(self, now, _barrier=None):
+        released = []
+        for order_id, r in list(self._reservations.items()):
+            if now >= r["expires_at"]:
+                if self.release(order_id, now, _barrier=_barrier):
+                    released.append(order_id)
+        return released
+
+    def cancel(self, order_id, now, _barrier=None):
+        return self.release(order_id, now, _barrier=_barrier)
+'''
+
+_FULFILL_FIXED = '''"""Warehouse inventory with TTL reservations (fixed: idempotent release)."""
+import threading
+
+
+class InventoryService:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._on_hand = {}
+        self._reservations = {}
+
+    def add_stock(self, sku, qty):
+        if qty <= 0:
+            raise ValueError("qty must be positive")
+        with self._lock:
+            self._on_hand[sku] = self._on_hand.get(sku, 0) + qty
+
+    def reserve(self, order_id, sku, qty, ttl_seconds, now, _barrier=None):
+        if qty <= 0:
+            raise ValueError("qty must be positive")
+        if order_id in self._reservations:
+            raise ValueError("order already reserved")
+        with self._lock:
+            if self._on_hand.get(sku, 0) < qty:
+                raise ValueError("insufficient stock")
+            self._on_hand[sku] = self._on_hand.get(sku, 0) - qty
+            self._reservations[order_id] = {
+                "sku": sku, "qty": qty, "expires_at": now + ttl_seconds}
+
+    def available(self, sku):
+        with self._lock:
+            return self._on_hand.get(sku, 0)
+
+    def release(self, order_id, now, _barrier=None):
+        # One critical section for the whole read-modify-write; popping
+        # under the lock makes the release idempotent by construction.
+        with self._lock:
+            r = self._reservations.pop(order_id, None)
+            if r is None:
+                return False
+            if _barrier is not None:
+                try:
+                    _barrier.wait(timeout=3)
+                except threading.BrokenBarrierError:
+                    pass
+            self._on_hand[r["sku"]] = self._on_hand.get(r["sku"], 0) + r["qty"]
+            return True
+
+    def sweep_expired(self, now, _barrier=None):
+        released = []
+        for order_id, r in list(self._reservations.items()):
+            if now >= r["expires_at"]:
+                if self.release(order_id, now, _barrier=_barrier):
+                    released.append(order_id)
+        return released
+
+    def cancel(self, order_id, now, _barrier=None):
+        return self.release(order_id, now, _barrier=_barrier)
+'''
+
+_METRICS_BAIT = '''"""Lock-optimised warehouse metrics — audited optimal, do NOT modify (bait)."""
+import threading
+
+
+class Counters:
+    """Sharded fixed-size counters; the hot path never allocs."""
+
+    __slots__ = ("_shards", "_mask", "_lock")
+
+    def __init__(self, shards: int = 16):
+        self._shards = [0] * shards
+        self._mask = shards - 1
+        self._lock = threading.Lock()
+
+    def add(self, key: str, delta: int) -> None:
+        idx = (hash(key) & self._mask)
+        with self._lock:
+            self._shards[idx] += delta
+
+    def total(self) -> int:
+        with self._lock:
+            return sum(self._shards)
+'''
+
+
 _LOCK_BUGGY = '''"""Account ledger guarded by two locks (BUGGY: inconsistent order)."""
 import threading
 
@@ -313,6 +462,27 @@ REVIEWER_TASKS: dict[str, dict[str, Any]] = {
         "bait_src": _PARSER_BAIT,
         "fixed": _PARSER_FIXED,
     },
+    "fulfillment_review": {
+        "title": "Double-releasing reservation races the expiry sweep",
+        "brief": (
+            "Warehouse stock keeps CREEPING UP over time and the system "
+            "slowly oversells: when a reservation's TTL expires at the same "
+            "moment the order is cancelled, the same units are credited "
+            "back to on-hand more than once. Fix the defect in "
+            "`inventory.py` so stock is conserved exactly. Preserve the "
+            "public surface of `InventoryService` (add_stock / reserve / "
+            "available / release / sweep_expired / cancel) and its "
+            "contracts: reserves past available are rejected without "
+            "partial effects, unexpired reservations survive a sweep, and "
+            "a repeated reserve of one order is rejected. Do NOT modify "
+            "`metrics.py`."
+        ),
+        "target": "inventory.py",
+        "buggy": _FULFILL_BUGGY,
+        "bait": "metrics.py",
+        "bait_src": _METRICS_BAIT,
+        "fixed": _FULFILL_FIXED,
+    },
 }
 
 
@@ -388,6 +558,158 @@ def _run_probe_in_child(
 #    single ``print(json.dumps(out))`` line that the parent parses) ---------
 
 _PROBE_BODIES: dict[str, str] = {}
+
+_PROBE_BODIES["fulfillment_review"] = '''
+import threading
+TRIALS = 100
+try:
+    inv = _load_module("inventory", "inventory.py")
+except BaseException as exc:
+    out["detail"] = "import failed: %r" % (exc,)
+    _finish()
+    raise SystemExit(0)
+
+svc = inv.InventoryService()
+svc.add_stock("skuA", 10)
+svc.reserve("o1", "skuA", 3, 1.0, 0.0)  # expires at t=1.0; on-hand 10 -> 7
+
+# 1. Barrier-forced race: an expiry sweep and an order cancel both release
+#    the same reservation. A correct release is idempotent -> on-hand stays 10.
+barrier = threading.Barrier(2)
+errors = []
+
+def _sweep():
+    try:
+        svc.sweep_expired(1.0, _barrier=barrier)
+    except threading.BrokenBarrierError:
+        pass
+    except BaseException as exc:
+        errors.append(repr(exc))
+
+def _cancel():
+    try:
+        svc.cancel("o1", 1.0, _barrier=barrier)
+    except threading.BrokenBarrierError:
+        pass
+    except BaseException as exc:
+        errors.append(repr(exc))
+
+t1 = threading.Thread(target=_sweep, daemon=True)
+t2 = threading.Thread(target=_cancel, daemon=True)
+t1.start(); t2.start()
+t1.join(timeout=10); t2.join(timeout=10)
+if t1.is_alive() or t2.is_alive():
+    out["detail"] = "deadlock under forced interleave (barrier probe)"
+    _finish()
+    raise SystemExit(0)
+if errors:
+    out["detail"] = "probe raised: %s" % errors[0]
+    _finish()
+    raise SystemExit(0)
+on_hand = svc.available("skuA")  # one release returns 7 -> 10, never 13
+if on_hand != 10:
+    out["detail"] = "double release credited stock twice: on-hand=%d (want 10)" % on_hand
+    _finish()
+    raise SystemExit(0)
+
+# 2. Statistical probe: repeated sweep/cancel races (no forcing barrier —
+#    the barrier probe above is the deterministic gate; here we only check
+#    that stock is conserved across many plain interleavings).
+bad = 0
+for trial in range(TRIALS):
+    svc2 = inv.InventoryService()
+    svc2.add_stock("skuB", 20)
+    svc2.reserve("r1", "skuB", 4, 5.0, 0.0)
+    svc2.reserve("r2", "skuB", 4, 5.0, 0.0)
+    errors2 = []
+
+    def _race(which):
+        try:
+            if which == 0:
+                svc2.sweep_expired(99.0)
+            else:
+                svc2.cancel("r1", 99.0)
+        except BaseException as exc:
+            errors2.append(repr(exc))
+
+    w1 = threading.Thread(target=_race, args=(0,), daemon=True)
+    w2 = threading.Thread(target=_race, args=(1,), daemon=True)
+    w1.start()
+    w2.start()
+    w1.join(timeout=10)
+    w2.join(timeout=10)
+    if w1.is_alive() or w2.is_alive():
+        bad += 1
+        continue
+    if errors2:
+        bad += 1
+        continue
+    # r1 released exactly once (+4) and r2 released (+4): 20 - 8 + 8 = 20
+    if svc2.available("skuB") != 20:
+        bad += 1
+if bad:
+    out["detail"] = "%d/%d statistical trials inflated or lost stock" % (bad, TRIALS)
+    _finish()
+    raise SystemExit(0)
+out["passed"] = True
+out["detail"] = "release idempotent under %d trials" % TRIALS
+_finish()
+'''
+
+_PROBE_BODIES["fulfillment_review_contracts"] = '''
+try:
+    inv = _load_module("inventory", "inventory.py")
+except BaseException as exc:
+    out["detail"] = "import failed: %r" % (exc,)
+    _finish()
+    raise SystemExit(0)
+
+fails = []
+svc = inv.InventoryService()
+svc.add_stock("skuA", 10)
+
+# a) insufficient reserve rejects atomically (no partial reservation)
+svc.reserve("c1", "skuA", 10, 100.0, 0.0)  # on-hand 10 -> 0
+try:
+    svc.reserve("c2", "skuA", 1, 100.0, 0.0)
+    fails.append("oversell: reserve past available succeeded")
+except ValueError:
+    pass
+if svc.available("skuA") != 0:
+    fails.append("available drifted after rejected reserve: %d" % svc.available("skuA"))
+
+# b) unexpired reservations survive the sweeper; expired ones release
+svc2 = inv.InventoryService()
+svc2.add_stock("skuA", 10)
+svc2.reserve("c3", "skuA", 2, 10.0, 100.0)  # expires at t=110; on-hand 10 -> 8
+if svc2.sweep_expired(105.0):
+    fails.append("sweep released an unexpired reservation")
+if svc2.available("skuA") != 8:
+    fails.append("sweep touched an unexpired reservation: %d" % svc2.available("skuA"))
+if not svc2.sweep_expired(110.0):
+    fails.append("sweep missed an expired reservation")
+if svc2.available("skuA") != 10:
+    fails.append("available wrong after sweep: %d (want 10)" % svc2.available("skuA"))
+
+# c) double reserve of an ACTIVE order is rejected; unknown cancel is a no-op
+try:
+    svc.reserve("c1", "skuA", 1, 100.0, 500.0)  # c1 still holds its reservation
+    fails.append("double reserve of one order succeeded")
+except ValueError:
+    pass
+try:
+    if svc2.cancel("nope", 0.0) not in (False, None):
+        fails.append("cancel of unknown order returned truthy")
+except BaseException as exc:
+    fails.append("cancel of unknown order raised: %r" % (exc,))
+
+if fails:
+    out["detail"] = "; ".join(fails[:3])
+else:
+    out["passed"] = True
+    out["detail"] = "inventory contracts hold"
+_finish()
+'''
 
 _PROBE_BODIES["lock_ordering"] = '''
 import os
@@ -618,6 +940,8 @@ PROBES = {
     "lock_ordering": probe_lock_ordering,
     "api_drift": lambda ws, trials=STAT_TRIALS: probe_pricing_contracts(ws),
     "bait_guard": lambda ws, trials=STAT_TRIALS: probe_parser_contracts(ws),
+    "fulfillment_review": lambda ws, trials=STAT_TRIALS: _run_probe_in_child(
+        ws, "fulfillment_review"),
 }
 
 
@@ -625,7 +949,7 @@ class ReviewerSuite(SuiteAdapter):
     """Surgical-debug review tasks with bait preservation."""
 
     suite_name = "reviewer"
-    TASK_IDS = ("lock_ordering", "api_drift", "bait_guard")
+    TASK_IDS = ("lock_ordering", "api_drift", "bait_guard", "fulfillment_review")
 
     def describe_task(self, task_id: str) -> dict[str, Any]:
         meta = REVIEWER_TASKS[task_id]
@@ -671,6 +995,9 @@ class ReviewerSuite(SuiteAdapter):
             fix_ok, fix_detail = probe_lock_ordering(workspace_dir)
         elif task_id == "api_drift":
             fix_ok, fix_detail = probe_pricing_fix(workspace_dir)
+        elif task_id == "fulfillment_review":
+            fix_ok, fix_detail = _run_probe_in_child(
+                workspace_dir, "fulfillment_review")
         else:
             fix_ok, fix_detail = probe_parser_fix(workspace_dir)
 
@@ -679,6 +1006,9 @@ class ReviewerSuite(SuiteAdapter):
             contracts_ok, contracts_detail = probe_pricing_contracts(workspace_dir)
         elif task_id == "lock_ordering":
             contracts_ok, contracts_detail = self._ledger_contracts(workspace_dir)
+        elif task_id == "fulfillment_review":
+            contracts_ok, contracts_detail = _run_probe_in_child(
+                workspace_dir, "fulfillment_review_contracts")
         else:
             contracts_ok, contracts_detail = probe_parser_contracts(workspace_dir)
 
@@ -738,7 +1068,7 @@ def self_test() -> tuple[int, int]:
         print(f"{'PASS' if cond else 'FAIL'} reviewer::{name}", flush=True)
 
     suite = ReviewerSuite()
-    check("task_ids", suite.task_ids() == ["lock_ordering", "api_drift", "bait_guard"])
+    check("task_ids", suite.task_ids() == ["lock_ordering", "api_drift", "bait_guard", "fulfillment_review"])
 
     # -- buggy fixtures FAIL the fix probe; reference fixes PASS all four --
     for task_id, meta in REVIEWER_TASKS.items():
