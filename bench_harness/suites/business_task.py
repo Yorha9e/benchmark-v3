@@ -1131,7 +1131,9 @@ _LEDGER_MUTANTS: dict[str, tuple[str, str]] = {
             legs = self._validate_legs(entries)""",
         """            legs = self._validate_legs(entries)"""),
     "no_unbalanced_check": (
-        """        if sum(l["debit"] for l in legs) != sum(l["credit"] for l in legs):
+        """        if len({l["account"] for l in legs}) != len(legs):
+            raise ValueError("one account may appear at most once per posting")
+        if sum(l["debit"] for l in legs) != sum(l["credit"] for l in legs):
             raise ValueError("unbalanced posting")""",
         """        pass"""),
     "no_currency_check": (
@@ -1350,8 +1352,9 @@ class LedgerService:
         # entries: [{"account": str, "debit": int}, ...] and/or
         #          [{"account": str, "credit": int}, ...]
         # Reject (ValueError) when: entries is empty, any amount <= 0, any
-        # account is unknown, the posting mixes currencies in one entry,
-        # or the posting is unbalanced (sum(debits) != sum(credits)).
+        # account is unknown, the posting mixes currencies across its legs,
+        # one account appears twice in the same posting, or the posting is
+        # unbalanced (sum(debits) != sum(credits)).
         # A replay of the SAME idem_key returns the recorded result
         # (regardless of the arguments passed) without posting anything
         # again; the key is reserved once used.
@@ -1360,9 +1363,8 @@ class LedgerService:
                  amount: int, now: float, day: str) -> dict
         # Atomic two-leg posting (credit source, debit destination): the
         # source LOSES `amount`, the destination GAINS it. Reject when
-        # amount <= 0, accounts differ in currency, the source would
-        # overdraw, or the idem_key was already used by another operation.
-        # Replays of the same idem_key return the recorded outcome.
+        # amount <= 0, accounts differ in currency, or the source would
+        # overdraw. The idem-key replay check below always comes first.
 
     def reverse(self, idem_key: str, original_idem_key: str, now: float,
                 day: str) -> dict
@@ -1381,9 +1383,13 @@ class LedgerService:
         # (they always cancel) — and mark the day settled. Because the
         # batch is itself an entry, each account's balance after
         # settlement equals its balance before plus its net for the day.
-        # `nets` contains only accounts with a non-zero net. Re-running
-        # settle for the same day is a no-op that returns the recorded
-        # batch. Returns {"day": str, "batch_id": str, "nets": {account: int}}.
+        # The batch is stamped with the settled day and does NOT participate
+        # in that day's netting (netting is a snapshot taken before the
+        # batch is appended). `nets` contains only accounts with a non-zero
+        # net; a day with no net movement settles to an empty batch (no
+        # entry appended). Re-running settle for the same day is a no-op
+        # that returns the recorded batch. Returns
+        # {"day": str, "batch_id": str, "nets": {account: int}}.
 
     # -- reconciliation --------------------------------------------------------
     def reconcile(self, stream: list[dict]) -> list[dict]
@@ -1392,11 +1398,12 @@ class LedgerService:
         #   {"seq": int, "account": str, "debit": int, "credit": int,
         #    "batch": str}
         # `batch` is the idem_key of the posting that produced the leg,
-        # and `seq` is that posting's sequence number; `seq` is unique per
-        # leg within a batch, so a repeated (batch, seq, account, debit,
-        # credit) tuple is a duplicate. Items may arrive OUT OF ORDER
-        # (seq is the truth, not list order). Report a list of discrepancy
-        # dicts:
+        # and `seq` is that posting's sequence number — all legs of one
+        # posting share its seq, and a posting puts at most one leg on any
+        # account, so a leg is addressed by (batch, seq, account). A
+        # repeated (batch, seq, account) tuple is a duplicate posting.
+        # Items may arrive OUT OF ORDER (seq is the truth, not list order).
+        # Report a list of discrepancy dicts:
         #   {"kind": "missing_entry", "seq": int, "account": str, ...}
         #   {"kind": "unbalanced_batch", "batch": str, ...}
         #   {"kind": "duplicate_posting", "seq": int, ...}
@@ -1427,6 +1434,10 @@ runs purely in memory.
 
 ## Rules
 
+- The idem-key replay check happens FIRST in post/transfer/reverse, before
+  any validation: a replayed key returns the recorded result even when its
+  arguments would otherwise be rejected (a different amount, an already
+  reversed original, and so on). The key is reserved once used.
 - Standard library only; the grader calls the API from up to 16 threads at
   once (concurrent transfers on shared accounts must be safe and conserve
   value exactly) and drives the clock explicitly via `now`.
@@ -1552,6 +1563,8 @@ class LedgerService:
             if account not in self._accounts:
                 raise ValueError("unknown account: %s" % account)
             legs.append({"account": account, "debit": debit, "credit": credit})
+        if len({l["account"] for l in legs}) != len(legs):
+            raise ValueError("one account may appear at most once per posting")
         if sum(l["debit"] for l in legs) != sum(l["credit"] for l in legs):
             raise ValueError("unbalanced posting")
         if len({self._accounts[l["account"]] for l in legs}) > 1:
@@ -1629,8 +1642,8 @@ class LedgerService:
                 return self._settlement_batch(self._settled[day])
             nets = {}
             for e in self._entries:
-                if e.get("day") != day:
-                    continue
+                if e.get("day") != day or e.get("is_settlement"):
+                    continue  # settlement batches never participate in netting
                 for leg in e["legs"]:
                     nets[leg["account"]] = (nets.get(leg["account"], 0)
                                             + int(leg["debit"]) - int(leg["credit"]))
@@ -1643,6 +1656,7 @@ class LedgerService:
                     legs.append({"account": account, "debit": 0, "credit": -net})
             if legs:
                 entry = self._apply_legs(legs, day, now)
+                entry["is_settlement"] = True
                 self._record(entry, "settle-%s" % day)
                 self._settled[day] = entry["entry_id"]
             else:

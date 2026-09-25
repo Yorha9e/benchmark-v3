@@ -3,7 +3,9 @@
 Injected as ``PLAN.md`` plus a short prompt appendix for ``short_b`` /
 ``long_b``. Hard constraints live in ``TASK.md``; these texts are a
 suggested order of work. No reference code, no hidden assertion names,
-no seeds, no paraphrased spec.
+no seeds, no grader internals. Semantic restatements of ``TASK.md`` are
+allowed (and expected) as scaffolding — they carry no information beyond
+the contract itself.
 """
 
 from __future__ import annotations
